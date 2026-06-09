@@ -341,6 +341,25 @@ ipcMain.handle('ollama:pull', async (evt, tag) => {
 
 // Abort a pull. removeFiles=true also calls DELETE /api/delete to wipe the
 // model entry (best effort — partial blobs may remain until `ollama prune`).
+// Uninstall a model. Frees its disk blobs via Ollama's /api/delete.
+ipcMain.handle('ollama:delete', async (_e, tag) => {
+  if (!tag) return { error: 'no tag specified' };
+  try {
+    const res = await fetch(`${OLLAMA_URL}/api/delete`, {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: tag, name: tag })
+    });
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      return { error: `Ollama delete ${res.status}: ${body.slice(0, 200)}` };
+    }
+    return { ok: true };
+  } catch (e) {
+    return { error: e.message || String(e) };
+  }
+});
+
 ipcMain.handle('ollama:pull-abort', async (_e, { channelId, removeFiles }) => {
   const entry = activePulls.get(channelId);
   if (entry) {

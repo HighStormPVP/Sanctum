@@ -1610,6 +1610,29 @@ button { font-family: inherit; }
 .cat-tag { display: inline-flex; align-items: center; gap: 6px; background: var(--surface-2); color: var(--text-3); padding: 3px 10px; border-radius: 999px; font-family: 'JetBrains Mono', monospace; font-size: 11px; border: 1px solid var(--border-1); margin-bottom: 10px; }
 .cat-tag.installed { border-color: rgba(52,211,153,0.4); color: var(--ok); background: rgba(52,211,153,0.08); }
 .cat-tag.installed::before { content: ''; width: 5px; height: 5px; border-radius: 50%; background: var(--ok); box-shadow: 0 0 6px rgba(52,211,153,0.6); }
+.cat-tag-row { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+.cat-tag-row .cat-tag { margin-bottom: 0; }
+.cat-uninstall {
+  font-size: 11px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-3);
+  border: 1px solid var(--border-1);
+  cursor: pointer;
+}
+.cat-uninstall:hover { border-color: #f87171; color: #f87171; }
+.cat-uninstall:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* Per-message token-count footer under assistant bubbles */
+.msg-tokens {
+  margin-top: 6px;
+  font-size: 10.5px;
+  color: var(--text-4);
+  letter-spacing: 0.02em;
+  font-family: 'JetBrains Mono', monospace;
+}
+.msg-tokens strong { color: var(--text-3); font-weight: 600; }
 .cat-why { color: var(--text-2); font-size: 13.5px; line-height: 1.55; }
 .cat-meta { display: flex; flex-wrap: wrap; gap: 14px; margin-top: 12px; font-size: 11.5px; color: var(--text-4); }
 .cat-meta strong { color: var(--text-2); font-weight: 500; margin-left: 4px; font-family: 'JetBrains Mono', monospace; font-size: 11.5px; font-feature-settings: 'tnum'; }

@@ -36,6 +36,7 @@ contextBridge.exposeInMainWorld('api', {
     },
     pullAbort: (channelId, removeFiles) =>
       ipcRenderer.invoke('ollama:pull-abort', { channelId, removeFiles }),
+    delete: (tag) => ipcRenderer.invoke('ollama:delete', tag),
     chat: async ({ model, messages, images, tools, options }, onChunk) => {
       const { channelId } = await ipcRenderer.invoke('ollama:chat', { model, messages, images, tools, options });
       return new Promise((resolve) => {

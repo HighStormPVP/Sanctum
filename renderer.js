@@ -11,7 +11,8 @@ const state = {
   order: [],
   activeId: null,
   pulling: new Set(),
-  pullProgress: {},       // tag → { received, total }
+  pullProgress: {},       // tag → { received, total } (aggregated across all layers)
+  pullDigests:  {},       // tag → { digestKey → { received, total } } — per-layer raw progress; summed into pullProgress so % doesn't drop when Ollama starts a new layer
   pullChannels: new Map(),// tag → channelId (so we can abort)
   paused: new Set(),      // tags whose pull was paused (partial download exists)
   cancelled: new Set(),   // tags currently being cancelled (transient — for cleanup branch)
@@ -169,6 +170,9 @@ function createChat(modelOverride, modalityOverride, extraFields) {
     id, title: '', model: defaultModel, modality,
     createdAt: Date.now(), updatedAt: Date.now(),
     messages: [],
+    // Default web search ON; updateUIForChat() flips it off if the chosen
+    // model isn't tools-capable. extraFields can still override.
+    webEnabled: true,
     ...(extraFields || {})
   };
   state.order.unshift(id);
@@ -1017,11 +1021,23 @@ async function refreshOllama() {
     pill.classList.remove('up'); val.textContent = 'offline';
     state.installed = new Set();
     state.ollamaRunning = false;
+    // If we haven't proven Ollama is installed yet, re-probe — picks up an
+    // install that happened while Sanctum was already open.
+    if (!state.ollamaDetected) {
+      try {
+        const det = await window.api.ollama.detect();
+        state.ollamaDetected = !!det.installed;
+      } catch {}
+    }
   } else {
     pill.classList.add('up');
     state.installed = new Set((res.models || []).map(m => m.name));
     val.textContent = `${state.installed.size} ready`;
     state.ollamaRunning = true;
+    // A live `/api/tags` response means Ollama is installed AND running.
+    // This bumps the banner from "Install Ollama" to gone, immediately, if
+    // the user installed it from outside the app.
+    state.ollamaDetected = true;
   }
   populateModelPicker();
   renderInstallBanner();
@@ -1416,9 +1432,10 @@ function wireModelPicker() {
     e.stopPropagation();
     const opening = menu.hidden;
     setOpen(opening);
-    // Refresh the Video Analysis install status whenever the picker opens —
-    // ffmpeg/whisper can be installed/uninstalled outside the app.
-    if (opening) refreshVideoDeps();
+    // We deliberately do NOT probe Whisper here — that spawn of python3 fires
+    // a "restricted by your administrator" popup on managed Macs every time
+    // the picker opens. ensureVideoDeps() still probes when the user actually
+    // attaches a video, which is the only point the status matters.
   });
 
   document.addEventListener('click', (e) => {
@@ -1779,6 +1796,12 @@ function renderActiveChat() {
     c.webEnabled = false;
     saveToStorage();
   }
+  // Default web search ON for tools-capable models. Covers new chats and
+  // older chats from before this default existed (webEnabled === undefined).
+  if (supportsTools && c.webEnabled === undefined) {
+    c.webEnabled = true;
+    saveToStorage();
+  }
 
   const wb = $('#toggle-web');
   if (wb) wb.setAttribute('aria-pressed', c.webEnabled === true ? 'true' : 'false');
@@ -2038,6 +2061,18 @@ function renderMessage(m) {
 
   if (m.toolEvents?.length) {
     for (const ev of m.toolEvents) el.appendChild(renderToolEvent(ev));
+  }
+
+  // Token-count footer for assistant turns. prompt_eval_count / eval_count come
+  // back from Ollama in the final stream chunk. Only show once the turn is done
+  // (some value present) to avoid flicker mid-stream.
+  if (m.role === 'assistant' && m.tokenStats && (m.tokenStats.prompt || m.tokenStats.completion)) {
+    const t = document.createElement('div');
+    t.className = 'msg-tokens';
+    const pr = m.tokenStats.prompt || 0;
+    const co = m.tokenStats.completion || 0;
+    t.innerHTML = `<strong>${pr.toLocaleString()}</strong> in · <strong>${co.toLocaleString()}</strong> out · <strong>${(pr + co).toLocaleString()}</strong> total tokens`;
+    el.appendChild(t);
   }
 
   // Video Analysis status card — appears inside the placeholder assistant
@@ -2319,6 +2354,9 @@ async function pullModel(tag /* banner is read fresh via DOM */) {
   state.paused.delete(tag);
   state.cancelled.delete(tag);
   if (!state.pullProgress[tag]) state.pullProgress[tag] = { received: 0, total: 0 };
+  // Reset the per-digest accumulator on each fresh pull so paused/resumed
+  // pulls don't double-count layers that re-stream from byte 0.
+  state.pullDigests[tag] = {};
   renderInstallBanner();
   populateModelPicker();
 
@@ -2341,7 +2379,16 @@ async function pullModel(tag /* banner is read fresh via DOM */) {
       if (chunk.aborted) return;
       if (chunk.total && chunk.completed != null) {
         receivedAnyProgress = true;
-        state.pullProgress[tag] = { received: chunk.completed, total: chunk.total };
+        // Ollama pulls multiple layers sequentially, each reporting its own
+        // total/completed. Naively overwriting state.pullProgress made the
+        // percentage drop whenever a new (smaller-but-not-yet-complete) layer
+        // started. Track per-digest progress and sum them so % grows monotonic.
+        const digestKey = chunk.digest || chunk.status || '_default';
+        const per = state.pullDigests[tag] || (state.pullDigests[tag] = {});
+        per[digestKey] = { received: chunk.completed || 0, total: chunk.total };
+        let received = 0, total = 0;
+        for (const d of Object.values(per)) { received += d.received; total += d.total; }
+        state.pullProgress[tag] = { received, total };
         patchPullProgress(tag);
         patchInstallBannerProgress(tag);
       }
@@ -2365,6 +2412,7 @@ async function pullModel(tag /* banner is read fresh via DOM */) {
   if (state.cancelled.has(tag)) {
     state.cancelled.delete(tag);
     delete state.pullProgress[tag];
+    delete state.pullDigests[tag];
     await refreshOllama();
     return;
   }
@@ -2438,6 +2486,7 @@ async function cancelPull(tag) {
     } catch {}
     state.cancelled.delete(tag);
     delete state.pullProgress[tag];
+    delete state.pullDigests[tag];
     state.pullChannels.delete(tag);
     await refreshOllama();
     populateModelPicker();
@@ -3077,6 +3126,17 @@ ollama pull qwen2.5vl:7b
         if (assistantMsg.thinking) assistantMsg.thinking = false;
         collectedToolCalls.push(...chunk.message.tool_calls);
       }
+      // Final stream chunk carries Ollama's tokenizer counts. In multi-round
+      // tool loops we want the SUM across rounds, not just the last round —
+      // so accumulate per round here.
+      if (chunk.done) {
+        const prevStats = assistantMsg.tokenStats || { prompt: 0, completion: 0 };
+        assistantMsg.tokenStats = {
+          prompt: prevStats.prompt + (chunk.prompt_eval_count || 0),
+          completion: prevStats.completion + (chunk.eval_count || 0)
+        };
+        patchLastMessage(assistantMsg);
+      }
     });
 
     if (aborted) break;
@@ -3180,6 +3240,9 @@ const TOOL_DEFS = {
   task_status: { type: 'function', function: { name: 'task_status', description: 'Check on a background task started with run_command_async. Returns {status, exitCode, stdout, stderr, runtime_seconds}. Status is "running" | "done" | "killed" | "error".', parameters: { type: 'object', properties: { task_id: { type: 'string' } }, required: ['task_id'] } } },
   task_list: { type: 'function', function: { name: 'task_list', description: 'List all background tasks in this session with their current status.', parameters: { type: 'object', properties: {} } } },
   task_kill: { type: 'function', function: { name: 'task_kill', description: 'Kill a running background task by id. No-op if already done.', parameters: { type: 'object', properties: { task_id: { type: 'string' } }, required: ['task_id'] } } },
+  mcp_list_servers: { type: 'function', function: { name: 'mcp_list_servers', description: 'List all configured Model Context Protocol (MCP) servers and their status (ready / starting / error / stopped) along with the tools each exposes. Useful to see what external integrations (Blender, Playwright, etc.) are currently available.', parameters: { type: 'object', properties: {} } } },
+  mcp_add_server:   { type: 'function', function: { name: 'mcp_add_server', description: 'Register and start a new MCP server. Pass `name` (your label), `command` (the executable e.g. "npx", "uvx", "python"), optional `args` (array of arguments), and optional `env` (object of env vars). The server spawns immediately and its tools become available to you on the next turn. REQUIRES USER APPROVAL since it executes a local subprocess.', parameters: { type: 'object', properties: { name: { type: 'string', description: 'Server name (used for tool prefix mcp__<name>__<tool>).' }, command: { type: 'string', description: 'Executable to run, e.g. "npx" or "uvx".' }, args: { type: 'array', items: { type: 'string' }, description: 'Args array, e.g. ["-y", "@playwright/mcp@latest"].' }, env: { type: 'object', description: 'Extra environment variables {KEY: VALUE}.' } }, required: ['name', 'command'] } } },
+  mcp_remove_server: { type: 'function', function: { name: 'mcp_remove_server', description: 'Stop and delete a configured MCP server by name. Frees its config slot; its tools will no longer appear. REQUIRES USER APPROVAL.', parameters: { type: 'object', properties: { name: { type: 'string' } }, required: ['name'] } } },
 };
 
 const APPROVAL_MODE_PROMPT = `APPROVAL MODE IS ACTIVE.
@@ -3274,6 +3337,11 @@ function buildTools(modality, webEnabled, modelId, chat) {
     if (!readOnly) {
       tools.push(TOOL_DEFS.write_file, TOOL_DEFS.run_command);
       tools.push(TOOL_DEFS.run_command_async, TOOL_DEFS.task_status, TOOL_DEFS.task_list, TOOL_DEFS.task_kill);
+      // MCP server management. mcp_list_servers is always safe; add/remove
+      // run a subprocess so they go through the approval modal.
+      tools.push(TOOL_DEFS.mcp_list_servers, TOOL_DEFS.mcp_add_server, TOOL_DEFS.mcp_remove_server);
+    } else {
+      tools.push(TOOL_DEFS.mcp_list_servers);
     }
     // Tools exposed by user-configured MCP servers (Blender, Playwright, etc.)
     // appear here too. The cache is refreshed from main on every status/tools
@@ -3338,7 +3406,7 @@ async function executeTool(name, args) {
 
 async function executeToolImpl(name, args) {
   const c = currentChat();
-  const alwaysGated = ['write_file', 'apply_patch', 'run_command', 'run_command_async'].includes(name);
+  const alwaysGated = ['write_file', 'apply_patch', 'run_command', 'run_command_async', 'mcp_add_server', 'mcp_remove_server'].includes(name);
   const forceApproval = c?.approvalMode === true;
   let approvalDecision = 'none';
 
@@ -3474,6 +3542,45 @@ async function executeToolImpl(name, args) {
       const res = await window.api.shell.taskKill(toStringArg(args?.task_id));
       if (res.error) return { result: { error: res.error }, summary: 'failed', ok: false };
       return { result: { ok: true }, summary: 'killed', ok: true };
+    }
+    if (name === 'mcp_list_servers') {
+      const servers = await window.api.mcp.list();
+      const compact = servers.map(s => ({
+        name: s.name,
+        command: s.command,
+        args: s.args,
+        status: s.status,
+        error: s.error,
+        tools: (s.tools || []).map(t => ({ name: t.name, description: t.description }))
+      }));
+      return { result: { servers: compact }, summary: `${servers.length} server${servers.length === 1 ? '' : 's'}`, ok: true };
+    }
+    if (name === 'mcp_add_server') {
+      const sname = toStringArg(args?.name);
+      const command = toStringArg(args?.command);
+      if (!sname || !command) return { result: { error: 'name and command required' }, summary: 'bad args', ok: false };
+      const cfg = {
+        command,
+        args: Array.isArray(args?.args) ? args.args.map(toStringArg) : [],
+        env: (args?.env && typeof args.env === 'object') ? args.env : {}
+      };
+      try {
+        const updated = await window.api.mcp.add(sname, cfg);
+        state.mcpServers = updated;
+        state.mcpTools = await window.api.mcp.getTools();
+        const entry = updated.find(s => s.name === sname);
+        return { result: { server: entry }, summary: `${sname}: ${entry?.status || 'added'}`, ok: entry?.status !== 'error' };
+      } catch (e) { return { result: { error: e.message }, summary: 'failed', ok: false }; }
+    }
+    if (name === 'mcp_remove_server') {
+      const sname = toStringArg(args?.name);
+      if (!sname) return { result: { error: 'name required' }, summary: 'bad args', ok: false };
+      try {
+        const updated = await window.api.mcp.remove(sname);
+        state.mcpServers = updated;
+        state.mcpTools = await window.api.mcp.getTools();
+        return { result: { ok: true, remaining: updated.length }, summary: `removed ${sname}`, ok: true };
+      } catch (e) { return { result: { error: e.message }, summary: 'failed', ok: false }; }
     }
     if (name.startsWith('mcp__')) {
       const res = await window.api.mcp.callTool(name, args || {});
@@ -3765,6 +3872,9 @@ function renderCatalog() {
         const ranks = ['i.', 'ii.', 'iii.', 'iv.', 'v.'];
         const rank = ranks[i] || `${i + 1}.`;
         const mmBadge = p.multimodal ? `<span class="cat-badge router">vision · auto</span>` : '';
+        const uninstallBtn = installed
+          ? `<button type="button" class="cat-uninstall" data-cat-uninstall="${escapeAttr(p.tag)}" title="Uninstall this model (frees disk)">Uninstall</button>`
+          : '';
         return `
           <div class="cat-pick">
             <div class="cat-pick-head">
@@ -3772,7 +3882,10 @@ function renderCatalog() {
               <span class="cat-name">${escapeHtml(p.name)}</span>
               ${mmBadge}
             </div>
-            <span class="${tagClass}">${escapeHtml(tagText)}</span>
+            <div class="cat-tag-row">
+              <span class="${tagClass}">${escapeHtml(tagText)}</span>
+              ${uninstallBtn}
+            </div>
             <p class="cat-why">${escapeHtml(p.why)}</p>
             <div class="cat-meta">
               ${p.ram_gb ? `<span>RAM <strong>${p.ram_gb} GB</strong></span>` : ''}
@@ -3785,6 +3898,24 @@ function renderCatalog() {
     `;
     c.appendChild(card);
   }
+  // Wire uninstall buttons (delegated would be cleaner, but the catalog
+  // re-renders rarely enough that this is fine).
+  c.querySelectorAll('[data-cat-uninstall]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const tag = btn.dataset.catUninstall;
+      if (!confirm(`Uninstall ${tag}?\n\nThis frees the disk blobs Ollama is keeping for this model. You can reinstall it any time from the model picker.`)) return;
+      btn.disabled = true;
+      const orig = btn.textContent;
+      btn.textContent = 'Uninstalling…';
+      try {
+        const res = await window.api.ollama.delete(tag);
+        if (res.error) { alert(`Uninstall failed: ${res.error}`); }
+      } catch (e) { alert(`Uninstall failed: ${e.message}`); }
+      await refreshOllama();
+      renderCatalog();
+      populateModelPicker();
+    });
+  });
 }
 
 // Delegated click handler for video-bubble actions: dep installer, retry,
