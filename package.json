@@ -25,6 +25,7 @@
   "build": {
     "appId": "com.aiden.sanctum",
     "productName": "Sanctum",
+    "publish": null,
     "directories": {
       "output": "dist"
     },
@@ -51,14 +52,12 @@
           "arch": ["arm64", "x64"]
         }
       ],
-      "icon": "assets/icon.icns",
       "hardenedRuntime": false,
       "gatekeeperAssess": false,
       "identity": null
     },
     "dmg": {
       "title": "Sanctum ${version}",
-      "icon": "assets/icon.icns",
       "contents": [
         { "x": 130, "y": 220 },
         { "x": 410, "y": 220, "type": "link", "path": "/Applications" }
@@ -70,8 +69,7 @@
           "target": "nsis",
           "arch": ["x64"]
         }
-      ],
-      "icon": "assets/icon.ico"
+      ]
     },
     "nsis": {
       "oneClick": false,
@@ -86,8 +84,7 @@
           "arch": ["x64"]
         }
       ],
-      "category": "Development",
-      "icon": "assets/icon.png"
+      "category": "Development"
     }
   }
 }
