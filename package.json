@@ -1,0 +1,93 @@
+{
+  "name": "sanctum",
+  "productName": "Sanctum",
+  "version": "0.1.0",
+  "description": "Sanctum — a private, fully-local AI workspace. Chat, vision, code, video analysis, and agentic tasks, all running on your own machine.",
+  "main": "main.js",
+  "scripts": {
+    "start": "node launch.js",
+    "dev": "node launch.js --enable-logging",
+    "dist": "electron-builder",
+    "dist:mac": "electron-builder --mac",
+    "dist:win": "electron-builder --win",
+    "dist:linux": "electron-builder --linux"
+  },
+  "author": "Aiden",
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "^33.0.0",
+    "electron-builder": "^25.1.8"
+  },
+  "dependencies": {
+    "electron-store": "^8.2.0",
+    "pdf-parse": "^1.1.1"
+  },
+  "build": {
+    "appId": "com.aiden.sanctum",
+    "productName": "Sanctum",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "renderer.js",
+      "launch.js",
+      "index.html",
+      "style.css",
+      "models.json",
+      "assets/**/*",
+      "node_modules/**/*",
+      "package.json",
+      "!**/{.DS_Store,Thumbs.db,*.log}",
+      "!.remember/**/*",
+      "!.git/**/*"
+    ],
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "target": [
+        {
+          "target": "dmg",
+          "arch": ["arm64", "x64"]
+        }
+      ],
+      "icon": "assets/icon.icns",
+      "hardenedRuntime": false,
+      "gatekeeperAssess": false,
+      "identity": null
+    },
+    "dmg": {
+      "title": "Sanctum ${version}",
+      "icon": "assets/icon.icns",
+      "contents": [
+        { "x": 130, "y": 220 },
+        { "x": 410, "y": 220, "type": "link", "path": "/Applications" }
+      ]
+    },
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": ["x64"]
+        }
+      ],
+      "icon": "assets/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "shortcutName": "Sanctum"
+    },
+    "linux": {
+      "target": [
+        {
+          "target": "AppImage",
+          "arch": ["x64"]
+        }
+      ],
+      "category": "Development",
+      "icon": "assets/icon.png"
+    }
+  }
+}
