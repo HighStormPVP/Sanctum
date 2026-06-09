@@ -27,7 +27,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-latest
+          # macos-latest currently maps to Sequoia which has a flaky
+          # interaction with electron-builder 25.x's APFS DMG creation
+          # ("hdiutil detach" failures). Pin to Sonoma until upstream fixes.
+          - os: macos-14
             artifact_glob: dist/*.dmg
             build_cmd: dist:mac
           - os: windows-latest
