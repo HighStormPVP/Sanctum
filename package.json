@@ -26,6 +26,7 @@
     "appId": "com.aiden.sanctum",
     "productName": "Sanctum",
     "publish": null,
+    "afterPack": "build/afterPack.js",
     "directories": {
       "output": "dist"
     },
@@ -54,7 +55,7 @@
       ],
       "hardenedRuntime": false,
       "gatekeeperAssess": false,
-      "identity": "-"
+      "identity": null
     },
     "dmg": {
       "title": "Sanctum ${version}"
