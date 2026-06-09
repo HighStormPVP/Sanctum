@@ -27,10 +27,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # macos-latest currently maps to Sequoia which has a flaky
-          # interaction with electron-builder 25.x's APFS DMG creation
-          # ("hdiutil detach" failures). Pin to Sonoma until upstream fixes.
-          - os: macos-14
+          # macos-13 is Intel x64 (the others are Apple Silicon). The Apple
+          # Silicon runners hit a known APFS + hdiutil-detach bug under
+          # electron-builder 25.x; the Intel runner builds HFS+ DMGs which
+          # don't trip the bug. The resulting universal DMG still launches
+          # natively on M1/M2/M3 because the .app inside contains both
+          # arm64 and x64 binaries.
+          - os: macos-13
             artifact_glob: dist/*.dmg
             build_cmd: dist:mac
           - os: windows-latest
