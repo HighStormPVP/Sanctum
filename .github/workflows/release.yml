@@ -82,7 +82,7 @@ jobs:
       - name: Flatten artifact tree
         run: |
           mkdir -p release
-          find artifacts -type f \( -name '*.dmg' -o -name '*.exe' \) -exec cp {} release/ \;
+          find artifacts -type f \( -name '*.dmg' -o -name '*.exe' -o -name '*.zip' \) -exec cp {} release/ \;
           ls -lah release
 
       - name: Create / update GitHub Release
