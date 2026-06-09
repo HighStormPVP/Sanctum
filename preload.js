@@ -89,6 +89,20 @@ contextBridge.exposeInMainWorld('api', {
     open: () => ipcRenderer.invoke('audit:open')
   },
 
+  mcp: {
+    list:     ()             => ipcRenderer.invoke('mcp:list'),
+    add:      (name, config) => ipcRenderer.invoke('mcp:add', { name, config }),
+    remove:   (name)         => ipcRenderer.invoke('mcp:remove', { name }),
+    restart:  (name)         => ipcRenderer.invoke('mcp:restart', { name }),
+    getTools: ()             => ipcRenderer.invoke('mcp:get_tools'),
+    callTool: (name, args)   => ipcRenderer.invoke('mcp:call_tool', { name, args }),
+    onUpdate: (handler) => {
+      const wrapped = (_e, payload) => handler(payload);
+      ipcRenderer.on('mcp:updated', wrapped);
+      return () => ipcRenderer.removeListener('mcp:updated', wrapped);
+    }
+  },
+
   shell: {
     run:        (command, cwd) => ipcRenderer.invoke('shell:run', { command, cwd }),
     runAsync:   (command, cwd, allowlist) => ipcRenderer.invoke('shell:run_async', { command, cwd, allowlist }),

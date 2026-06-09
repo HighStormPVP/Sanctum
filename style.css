@@ -1682,6 +1682,116 @@ button { font-family: inherit; }
 .setting-group textarea::placeholder { color: var(--text-4); }
 .setting-meta { display: flex; justify-content: flex-end; margin-top: 8px; min-height: 18px; }
 
+/* MCP SERVERS */
+.mcp-list { display: flex; flex-direction: column; gap: 10px; }
+.mcp-empty {
+  font-size: 13px; color: var(--text-3);
+  padding: 14px 16px;
+  border: 1px dashed var(--border-1);
+  border-radius: 10px;
+}
+.mcp-card {
+  border: 1px solid var(--border-1);
+  border-radius: 10px;
+  padding: 12px 14px;
+  background: var(--surface-2);
+}
+.mcp-card-head {
+  display: flex; justify-content: space-between; align-items: flex-start; gap: 12px;
+}
+.mcp-name { font-weight: 600; font-size: 13.5px; color: var(--text-1); }
+.mcp-cmd { font-size: 12px; color: var(--text-3); margin-top: 3px; word-break: break-all; }
+.mcp-cmd code { background: transparent; padding: 0; font-size: 11.5px; }
+.mcp-status-pill {
+  font-size: 11px; font-weight: 600; text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 3px 9px; border-radius: 6px;
+  background: rgba(148,163,184,0.12); color: var(--text-3);
+  flex-shrink: 0;
+}
+.mcp-status-ready  .mcp-status-pill { background: rgba(34,197,94,0.16);  color: #4ade80; }
+.mcp-status-starting .mcp-status-pill { background: rgba(251,191,36,0.16); color: #fbbf24; }
+.mcp-status-error  .mcp-status-pill { background: rgba(239,68,68,0.16);  color: #f87171; }
+.mcp-error {
+  margin-top: 8px;
+  font-size: 11.5px; font-family: var(--font-mono, monospace);
+  color: #f87171;
+  background: rgba(239,68,68,0.08);
+  border: 1px solid rgba(239,68,68,0.2);
+  border-radius: 6px;
+  padding: 6px 9px;
+  overflow-wrap: break-word;
+  max-height: 110px; overflow-y: auto;
+}
+.mcp-tools-details { margin-top: 8px; font-size: 12px; }
+.mcp-tools-details summary { color: var(--text-3); cursor: pointer; user-select: none; }
+.mcp-tools-list {
+  margin: 6px 0 0; padding-left: 18px;
+  font-size: 11.5px; color: var(--text-3);
+  max-height: 200px; overflow-y: auto;
+}
+.mcp-tools-list li { margin: 2px 0; line-height: 1.45; }
+.mcp-tools-list code { background: transparent; padding: 0; color: var(--text-2); font-size: 11.5px; }
+.mcp-tool-count-none { margin-top: 8px; font-size: 11.5px; color: var(--text-4); font-style: italic; }
+.mcp-card-actions { display: flex; gap: 6px; margin-top: 10px; }
+.mcp-card-actions button {
+  font-size: 11.5px;
+  padding: 5px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border-1);
+  background: transparent;
+  color: var(--text-2);
+  cursor: pointer;
+}
+.mcp-card-actions button:hover { border-color: var(--accent-1); color: var(--text-1); }
+.mcp-card-actions button:disabled { opacity: 0.5; cursor: not-allowed; }
+.mcp-remove-btn:hover { border-color: #f87171; color: #f87171; }
+.mcp-actions { display: flex; justify-content: flex-end; margin-top: 12px; align-items: center; gap: 10px; }
+.mcp-config-btn {
+  font-size: 12.5px;
+  padding: 7px 14px;
+  border-radius: 8px;
+  border: 1px solid var(--border-1);
+  background: var(--surface-2);
+  color: var(--text-2);
+  cursor: pointer;
+}
+.mcp-config-btn:hover { border-color: var(--accent-1); color: var(--text-1); }
+
+/* MCP editor modal */
+.mcp-editor-text {
+  width: 100%;
+  background: var(--surface-1);
+  border: 1px solid var(--border-1);
+  border-radius: 8px;
+  padding: 12px 14px;
+  font-family: var(--font-mono, monospace);
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: var(--text-1);
+  resize: vertical;
+  min-height: 280px;
+}
+.mcp-editor-text:focus { outline: none; border-color: var(--accent-1); box-shadow: 0 0 0 3px rgba(139,92,246,0.15); }
+.mcp-editor-status { margin-top: 10px; min-height: 18px; font-size: 12px; }
+.mcp-editor-status.mcp-status-error { color: #f87171; }
+.mcp-editor-status.mcp-status-ok    { color: #4ade80; }
+.mcp-editor-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
+.mcp-cancel-btn, .mcp-save-btn {
+  padding: 8px 16px;
+  font-size: 13px;
+  border-radius: 8px;
+  border: 1px solid var(--border-1);
+  cursor: pointer;
+}
+.mcp-cancel-btn { background: transparent; color: var(--text-2); }
+.mcp-cancel-btn:hover { color: var(--text-1); }
+.mcp-save-btn {
+  background: var(--accent-1); color: white; border-color: var(--accent-1);
+}
+.mcp-save-btn:hover { filter: brightness(1.1); }
+.mcp-save-btn:disabled { opacity: 0.6; cursor: not-allowed; }
+
 /* APPROVAL MODAL */
 .approval-modal { width: min(680px, calc(100vw - 48px)); }
 .approval-head { display: flex; align-items: flex-start; gap: 16px; }

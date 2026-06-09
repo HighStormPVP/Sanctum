@@ -4,6 +4,15 @@ const fs = require('fs');
 const crypto = require('crypto');
 const os = require('os');
 const { exec, spawn } = require('child_process');
+const { McpManager } = require('./lib/mcp-manager');
+
+let mcpManager = null;
+function broadcastMcpUpdate() {
+  const payload = mcpManager ? mcpManager.listServers() : [];
+  for (const w of BrowserWindow.getAllWindows()) {
+    try { w.webContents.send('mcp:updated', payload); } catch {}
+  }
+}
 
 const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434';
 
@@ -64,12 +73,51 @@ app.whenReady().then(() => {
   });
 
   createWindow();
+
+  mcpManager = new McpManager({
+    configPath: path.join(app.getPath('userData'), 'mcp_config.json'),
+    onUpdate: broadcastMcpUpdate
+  });
+  mcpManager.loadConfig();
+  mcpManager.startAll().catch(e => console.error('[mcp] startAll:', e));
+});
+
+app.on('before-quit', async () => {
+  if (mcpManager) { try { await mcpManager.stopAll(); } catch {} }
 });
 
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
 app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
 
 ipcMain.handle('config:get', () => ({ ollamaUrl: OLLAMA_URL }));
+
+// =================== MCP SERVERS ===================
+ipcMain.handle('mcp:list', () => mcpManager ? mcpManager.listServers() : []);
+ipcMain.handle('mcp:add', async (_e, { name, config }) => {
+  if (!mcpManager) throw new Error('mcp not ready');
+  await mcpManager.addServer(name, config);
+  return mcpManager.listServers();
+});
+ipcMain.handle('mcp:remove', async (_e, { name }) => {
+  if (!mcpManager) throw new Error('mcp not ready');
+  await mcpManager.removeServer(name);
+  return mcpManager.listServers();
+});
+ipcMain.handle('mcp:restart', async (_e, { name }) => {
+  if (!mcpManager) throw new Error('mcp not ready');
+  await mcpManager.restartServer(name);
+  return mcpManager.listServers();
+});
+ipcMain.handle('mcp:get_tools', () => mcpManager ? mcpManager.getOllamaTools() : []);
+ipcMain.handle('mcp:call_tool', async (_e, { name, args }) => {
+  if (!mcpManager) throw new Error('mcp not ready');
+  try {
+    const result = await mcpManager.callTool(name, args);
+    return { ok: true, result };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+});
 
 ipcMain.handle('models:catalog', () => {
   const catalogPath = path.join(__dirname, 'models.json');

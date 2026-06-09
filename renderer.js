@@ -26,7 +26,12 @@ const state = {
   // model picker opens, so the dedicated Video Analysis section can show live
   // ✓/Install state for ffmpeg and Whisper without polling.
   videoDeps: { ffmpeg: null, whisper: null, lastChecked: 0 },
-  videoDepInstalling: new Set() // 'ffmpeg' / 'whisper' currently being installed
+  videoDepInstalling: new Set(), // 'ffmpeg' / 'whisper' currently being installed
+  // MCP servers — populated from main process. Each entry is
+  // { name, command, args, env, status, error, tools[] }. The Ollama-shaped
+  // tool list is cached so buildTools() doesn't need an async hop.
+  mcpServers: [],
+  mcpTools: []
 };
 
 // ============== BOOT ==============
@@ -39,6 +44,18 @@ const state = {
   await detectOllama();
   await refreshOllama();
   setInterval(refreshOllama, 8000);
+
+  // MCP — pull initial state, subscribe to updates from main, refresh tools
+  // whenever the server set changes so agentic mode sees them immediately.
+  try {
+    state.mcpServers = await window.api.mcp.list();
+    state.mcpTools   = await window.api.mcp.getTools();
+  } catch {}
+  window.api.mcp.onUpdate(async (servers) => {
+    state.mcpServers = servers || [];
+    try { state.mcpTools = await window.api.mcp.getTools(); } catch { state.mcpTools = []; }
+    if (typeof renderMcpSettings === 'function') renderMcpSettings();
+  });
 
   if (!state.order.length) {
     createChat();
@@ -56,6 +73,7 @@ const state = {
   wireModelPicker();
   wireModelsView();
   wireSettings();
+  wireMcpEditor();
   wireWebToggle();
   wireThinkToggle();
   wireToolsMenu();
@@ -1252,8 +1270,137 @@ function wireSettings() {
 function openSettings() {
   $('#settings-overlay').hidden = false;
   $('#setting-instructions').focus();
+  renderMcpSettings();
 }
 function closeSettings() { $('#settings-overlay').hidden = true; }
+
+// ============== MCP SERVER MANAGEMENT ==============
+function renderMcpSettings() {
+  const list = $('#mcp-list');
+  if (!list) return;
+  list.innerHTML = '';
+  const servers = state.mcpServers || [];
+  if (!servers.length) {
+    const empty = document.createElement('div');
+    empty.className = 'mcp-empty';
+    empty.textContent = 'No MCP servers configured. Click "Edit JSON config" to add Blender, Playwright, or any other server.';
+    list.appendChild(empty);
+    return;
+  }
+  for (const s of servers) {
+    const card = document.createElement('div');
+    card.className = `mcp-card mcp-status-${s.status}`;
+    const cmdSummary = [s.command, ...(s.args || [])].join(' ');
+    const errorBlock = s.error ? `<div class="mcp-error" title="${escapeAttr(s.error)}">${escapeHtml(s.error)}</div>` : '';
+    const toolBlock = s.tools && s.tools.length
+      ? `<details class="mcp-tools-details"><summary>${s.tools.length} tool${s.tools.length === 1 ? '' : 's'}</summary><ul class="mcp-tools-list">${
+          s.tools.map(t => `<li><code>${escapeHtml(t.name)}</code>${t.description ? ` — ${escapeHtml(t.description)}` : ''}</li>`).join('')
+        }</ul></details>`
+      : '<div class="mcp-tool-count-none">No tools (server not ready)</div>';
+    card.innerHTML = `
+      <div class="mcp-card-head">
+        <div>
+          <div class="mcp-name">${escapeHtml(s.name)}</div>
+          <div class="mcp-cmd"><code>${escapeHtml(cmdSummary)}</code></div>
+        </div>
+        <div class="mcp-status-pill">${escapeHtml(s.status)}</div>
+      </div>
+      ${errorBlock}
+      ${toolBlock}
+      <div class="mcp-card-actions">
+        <button type="button" class="mcp-restart-btn" data-mcp-name="${escapeAttr(s.name)}">Restart</button>
+        <button type="button" class="mcp-remove-btn" data-mcp-name="${escapeAttr(s.name)}">Remove</button>
+      </div>
+    `;
+    list.appendChild(card);
+  }
+  list.querySelectorAll('.mcp-restart-btn').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      btn.disabled = true; btn.textContent = 'Restarting…';
+      try { state.mcpServers = await window.api.mcp.restart(btn.dataset.mcpName); }
+      catch (e) { alert('Restart failed: ' + e.message); }
+      state.mcpTools = await window.api.mcp.getTools().catch(() => []);
+      renderMcpSettings();
+    });
+  });
+  list.querySelectorAll('.mcp-remove-btn').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      if (!confirm(`Remove MCP server "${btn.dataset.mcpName}"?`)) return;
+      try { state.mcpServers = await window.api.mcp.remove(btn.dataset.mcpName); }
+      catch (e) { alert('Remove failed: ' + e.message); }
+      state.mcpTools = await window.api.mcp.getTools().catch(() => []);
+      renderMcpSettings();
+    });
+  });
+}
+
+function escapeHtml(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
+}
+function escapeAttr(s) { return escapeHtml(s); }
+
+function wireMcpEditor() {
+  const editBtn   = $('#mcp-edit-config');
+  const overlay   = $('#mcp-editor-overlay');
+  const closeBtn  = $('#mcp-editor-close');
+  const cancelBtn = $('#mcp-editor-cancel');
+  const saveBtn   = $('#mcp-editor-save');
+  const textarea  = $('#mcp-editor-text');
+  const status    = $('#mcp-editor-status');
+  if (!editBtn || !overlay) return;
+
+  const close = () => { overlay.hidden = true; };
+  editBtn.addEventListener('click', () => {
+    const current = { mcpServers: {} };
+    for (const s of (state.mcpServers || [])) {
+      current.mcpServers[s.name] = { command: s.command, args: s.args || [], env: s.env || {} };
+    }
+    textarea.value = JSON.stringify(current, null, 2);
+    status.textContent = '';
+    overlay.hidden = false;
+    textarea.focus();
+  });
+  closeBtn.addEventListener('click', close);
+  cancelBtn.addEventListener('click', close);
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && !overlay.hidden) close();
+  });
+
+  saveBtn.addEventListener('click', async () => {
+    let parsed;
+    try { parsed = JSON.parse(textarea.value); }
+    catch (e) { status.textContent = 'Invalid JSON: ' + e.message; status.className = 'mcp-editor-status mcp-status-error'; return; }
+    if (!parsed?.mcpServers || typeof parsed.mcpServers !== 'object') {
+      status.textContent = 'Top-level "mcpServers" object required'; status.className = 'mcp-editor-status mcp-status-error'; return;
+    }
+    saveBtn.disabled = true; saveBtn.textContent = 'Applying…';
+    status.textContent = '';
+    try {
+      const existing = new Set((state.mcpServers || []).map(s => s.name));
+      const incoming = new Set(Object.keys(parsed.mcpServers));
+      // Removals first so a rename frees the old slot before the new add.
+      for (const oldName of existing) {
+        if (!incoming.has(oldName)) await window.api.mcp.remove(oldName);
+      }
+      for (const [name, cfg] of Object.entries(parsed.mcpServers)) {
+        if (!cfg?.command) { throw new Error(`Server "${name}" needs a "command" string`); }
+        await window.api.mcp.add(name, { command: cfg.command, args: cfg.args || [], env: cfg.env || {} });
+      }
+      state.mcpServers = await window.api.mcp.list();
+      state.mcpTools   = await window.api.mcp.getTools();
+      status.textContent = 'Saved. Servers starting in the background.';
+      status.className = 'mcp-editor-status mcp-status-ok';
+      renderMcpSettings();
+      setTimeout(close, 800);
+    } catch (e) {
+      status.textContent = 'Apply failed: ' + e.message;
+      status.className = 'mcp-editor-status mcp-status-error';
+    } finally {
+      saveBtn.disabled = false; saveBtn.textContent = 'Save & apply';
+    }
+  });
+}
 
 // ============== MODEL PICKER (custom dropdown) ==============
 function wireModelPicker() {
@@ -3128,6 +3275,12 @@ function buildTools(modality, webEnabled, modelId, chat) {
       tools.push(TOOL_DEFS.write_file, TOOL_DEFS.run_command);
       tools.push(TOOL_DEFS.run_command_async, TOOL_DEFS.task_status, TOOL_DEFS.task_list, TOOL_DEFS.task_kill);
     }
+    // Tools exposed by user-configured MCP servers (Blender, Playwright, etc.)
+    // appear here too. The cache is refreshed from main on every status/tools
+    // event, so a newly-started server's tools show up on the next turn.
+    if (Array.isArray(state.mcpTools) && state.mcpTools.length) {
+      tools.push(...state.mcpTools);
+    }
   }
   return tools.length ? tools : null;
 }
@@ -3321,6 +3474,21 @@ async function executeToolImpl(name, args) {
       const res = await window.api.shell.taskKill(toStringArg(args?.task_id));
       if (res.error) return { result: { error: res.error }, summary: 'failed', ok: false };
       return { result: { ok: true }, summary: 'killed', ok: true };
+    }
+    if (name.startsWith('mcp__')) {
+      const res = await window.api.mcp.callTool(name, args || {});
+      if (!res.ok) return { result: { error: res.error }, summary: 'failed', ok: false };
+      const r = res.result || {};
+      // MCP tools return { content: [{type:'text', text:...}, ...], isError? }
+      const text = Array.isArray(r.content)
+        ? r.content.map(c => c?.text ?? (c?.type === 'image' ? '[image returned]' : '')).filter(Boolean).join('\n')
+        : '';
+      const bytes = text.length;
+      return {
+        result: r,
+        summary: r.isError ? 'tool error' : (bytes ? `${(bytes/1024).toFixed(1)} KB` : 'ok'),
+        ok: !r.isError
+      };
     }
     return { result: { error: 'unknown tool ' + name }, summary: 'unknown', ok: false };
   } catch (e) {

@@ -348,6 +348,50 @@
             <span id="setting-saved" class="saved-tag">Saved</span>
           </div>
         </section>
+        <section class="setting-group">
+          <h3>MCP Servers</h3>
+          <p class="setting-help">Model Context Protocol servers expose external tools (Blender, Playwright, etc.) to agentic chats. Each entry runs as a local subprocess; its tools appear alongside Sanctum's built-ins whenever an agentic model is active.</p>
+          <div id="mcp-list" class="mcp-list"></div>
+          <div class="mcp-actions">
+            <button type="button" id="mcp-edit-config" class="mcp-config-btn">Edit JSON config</button>
+            <span class="setting-help" id="mcp-config-path"></span>
+          </div>
+        </section>
+      </div>
+    </div>
+  </div>
+
+  <!-- MCP CONFIG EDITOR MODAL -->
+  <div class="modal-overlay" id="mcp-editor-overlay" hidden>
+    <div class="modal" role="dialog" aria-labelledby="mcp-editor-title">
+      <header class="modal-head">
+        <h2 id="mcp-editor-title">MCP Servers — JSON Config</h2>
+        <button class="modal-close" id="mcp-editor-close" aria-label="Close">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
+        </button>
+      </header>
+      <div class="modal-body">
+        <p class="setting-help">
+          Same shape as Claude Desktop and Cursor — paste a config block under <code>mcpServers</code>.
+          Each entry needs a <code>command</code>, optional <code>args</code> array, and optional <code>env</code> object.
+        </p>
+        <textarea id="mcp-editor-text" class="mcp-editor-text" spellcheck="false" rows="20" placeholder='{
+  "mcpServers": {
+    "blender": {
+      "command": "uvx",
+      "args": ["blender-mcp"]
+    },
+    "playwright": {
+      "command": "npx",
+      "args": ["-y", "@playwright/mcp@latest"]
+    }
+  }
+}'></textarea>
+        <div class="mcp-editor-status" id="mcp-editor-status"></div>
+        <div class="mcp-editor-actions">
+          <button type="button" class="mcp-cancel-btn" id="mcp-editor-cancel">Cancel</button>
+          <button type="button" class="mcp-save-btn" id="mcp-editor-save">Save &amp; apply</button>
+        </div>
       </div>
     </div>
   </div>
