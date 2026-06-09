@@ -27,14 +27,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # macos-13 is Intel x64 (the others are Apple Silicon). The Apple
-          # Silicon runners hit a known APFS + hdiutil-detach bug under
-          # electron-builder 25.x; the Intel runner builds HFS+ DMGs which
-          # don't trip the bug. The resulting universal DMG still launches
-          # natively on M1/M2/M3 because the .app inside contains both
-          # arm64 and x64 binaries.
-          - os: macos-13
-            artifact_glob: dist/*.dmg
+          # Mac target is now `zip` instead of `dmg`. electron-builder 25.x
+          # has a deterministic hdiutil-detach failure when building APFS
+          # DMGs on Apple Silicon runners (every retry fails), and macos-13
+          # Intel runners are too queue-starved to schedule promptly. Zip
+          # ships the same .app — users unzip and drag to Applications.
+          - os: macos-latest
+            artifact_glob: dist/*.zip
             build_cmd: dist:mac
           - os: windows-latest
             artifact_glob: dist/*.exe
