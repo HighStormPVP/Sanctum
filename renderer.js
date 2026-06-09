@@ -38,7 +38,6 @@ const state = {
 
   await detectOllama();
   await refreshOllama();
-  refreshVideoDeps(); // non-blocking — paints in when ready
   setInterval(refreshOllama, 8000);
 
   if (!state.order.length) {
