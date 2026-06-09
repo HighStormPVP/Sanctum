@@ -2063,16 +2063,11 @@ function renderMessage(m) {
     for (const ev of m.toolEvents) el.appendChild(renderToolEvent(ev));
   }
 
-  // Token-count footer for assistant turns. prompt_eval_count / eval_count come
-  // back from Ollama in the final stream chunk. Only show once the turn is done
-  // (some value present) to avoid flicker mid-stream.
+  // Token-count badge for assistant turns. While streaming we approximate
+  // (Ollama doesn't expose per-chunk counts) and show "~N tokens"; the final
+  // `done` chunk replaces it with the exact "P in · O out" from the model.
   if (m.role === 'assistant' && m.tokenStats && (m.tokenStats.prompt || m.tokenStats.completion)) {
-    const t = document.createElement('div');
-    t.className = 'msg-tokens';
-    const pr = m.tokenStats.prompt || 0;
-    const co = m.tokenStats.completion || 0;
-    t.innerHTML = `<strong>${pr.toLocaleString()}</strong> in · <strong>${co.toLocaleString()}</strong> out · <strong>${(pr + co).toLocaleString()}</strong> total tokens`;
-    el.appendChild(t);
+    el.appendChild(tokenBadgeEl(m.tokenStats));
   }
 
   // Video Analysis status card — appears inside the placeholder assistant
@@ -3120,6 +3115,17 @@ ollama pull qwen2.5vl:7b
         if (assistantMsg.thinking) assistantMsg.thinking = false;
         acc += chunk.message.content;
         assistantMsg.content = acc;
+        // Live token estimate during streaming. Ollama doesn't expose per-chunk
+        // counts so we approximate completion tokens as chars/4 (a common
+        // heuristic for English LLM tokenizers). Exact counts overwrite this
+        // when the final `done` chunk lands.
+        const baseCompletion = (assistantMsg.tokenStats && assistantMsg.tokenStats._exactCompletion) || 0;
+        assistantMsg.tokenStats = {
+          prompt: assistantMsg.tokenStats?.prompt || 0,
+          completion: baseCompletion + Math.ceil(acc.length / 4),
+          _exactCompletion: baseCompletion,
+          live: true
+        };
         patchLastMessageContent(assistantMsg);
       }
       if (chunk.message?.tool_calls?.length) {
@@ -3128,13 +3134,18 @@ ollama pull qwen2.5vl:7b
       }
       // Final stream chunk carries Ollama's tokenizer counts. In multi-round
       // tool loops we want the SUM across rounds, not just the last round —
-      // so accumulate per round here.
+      // so accumulate per round here and lock in the exact figure.
       if (chunk.done) {
-        const prevStats = assistantMsg.tokenStats || { prompt: 0, completion: 0 };
+        const prev = assistantMsg.tokenStats || {};
+        const exactCompletion = (prev._exactCompletion || 0) + (chunk.eval_count || 0);
         assistantMsg.tokenStats = {
-          prompt: prevStats.prompt + (chunk.prompt_eval_count || 0),
-          completion: prevStats.completion + (chunk.eval_count || 0)
+          prompt: (prev.prompt || 0) + (chunk.prompt_eval_count || 0),
+          completion: exactCompletion,
+          _exactCompletion: exactCompletion,
+          live: false
         };
+        // Reset acc for the next tool round (live estimate restarts at 0).
+        acc = '';
         patchLastMessage(assistantMsg);
       }
     });
@@ -3818,6 +3829,22 @@ function patchLastMessage(msg) {
 
 // Lightweight: mutate the existing .msg-body text node in place rather than
 // rebuilding the whole bubble for every streamed token.
+// Build the small per-message token-count element. Shared by renderMessage and
+// patchLastMessageContent so the badge appears (and updates live) without
+// rebuilding the whole bubble on every streamed token.
+function tokenBadgeEl(stats) {
+  const t = document.createElement('div');
+  t.className = 'msg-tokens' + (stats.live ? ' live' : '');
+  const co = stats.completion || 0;
+  const pr = stats.prompt || 0;
+  if (stats.live) {
+    t.innerHTML = `~<strong>${co.toLocaleString()}</strong> tokens`;
+  } else {
+    t.innerHTML = `<strong>${pr.toLocaleString()}</strong> in · <strong>${co.toLocaleString()}</strong> out`;
+  }
+  return t;
+}
+
 function patchLastMessageContent(msg) {
   const list = $('#thread');
   const lastEl = list.lastElementChild;
@@ -3846,6 +3873,15 @@ function patchLastMessageContent(msg) {
   if (msg.content) {
     const t = lastEl.querySelector(':scope > .msg-thinking');
     if (t) t.remove();
+  }
+
+  // Live-update the token badge in place — append on first appearance, mutate
+  // in place after that, so the number ticks up smoothly without flicker.
+  if (msg.role === 'assistant' && msg.tokenStats && (msg.tokenStats.prompt || msg.tokenStats.completion)) {
+    const existing = lastEl.querySelector(':scope > .msg-tokens');
+    const fresh = tokenBadgeEl(msg.tokenStats);
+    if (existing) existing.replaceWith(fresh);
+    else lastEl.appendChild(fresh);
   }
 
   // Only auto-scroll when the user is already near the bottom so we don't
