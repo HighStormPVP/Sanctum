@@ -2066,7 +2066,9 @@ function renderMessage(m) {
   // Token-count badge for assistant turns. While streaming we approximate
   // (Ollama doesn't expose per-chunk counts) and show "~N tokens"; the final
   // `done` chunk replaces it with the exact "P in · O out" from the model.
-  if (m.role === 'assistant' && m.tokenStats && (m.tokenStats.prompt || m.tokenStats.completion)) {
+  // Shown from message creation so the user sees a placeholder even during
+  // the silent thinking / tool-call phase where no content streams in.
+  if (m.role === 'assistant' && m.tokenStats) {
     el.appendChild(tokenBadgeEl(m.tokenStats));
   }
 
@@ -2942,7 +2944,12 @@ async function runOllamaChat(c, attachments) {
     modality: c.modality,
     toolEvents: [],
     thinking: true,
-    thinkingMode: !!(c.thinkingEnabled && modelSupportsThinking(c.model))
+    thinkingMode: !!(c.thinkingEnabled && modelSupportsThinking(c.model)),
+    // Initialize the token badge at "~0 tokens" so it's visible from the very
+    // first frame, including the silent thinking / tool-call phase where no
+    // content streams in. The chunk handler updates it live; `done` snaps it
+    // to the exact count from Ollama.
+    tokenStats: { prompt: 0, completion: 0, _exactCompletion: 0, live: true }
   };
   c.messages.push(assistantMsg);
   // Mark this chat as running so the send button flips to a stop button.
@@ -3080,6 +3087,10 @@ ollama pull qwen2.5vl:7b
 
   while (round < MAX_ROUNDS && !aborted) {
     round++;
+    // Stop button can be clicked between rounds or mid-tool-execution. The
+    // chunk handler only sees aborts during a live stream; check the user's
+    // explicit abortRequested flag here too so the loop terminates promptly.
+    if (state.runningChats.get(c.id)?.abortRequested) { aborted = true; break; }
 
     const payload = { model: effectiveModel, messages: history };
     // Cap the context window so big models like Qwen3 30B-A3B don't OOM. The
@@ -3160,6 +3171,11 @@ ollama pull qwen2.5vl:7b
 
     // Execute each tool, append results
     for (const call of collectedToolCalls) {
+      // Honor a Stop click that happened while the previous tool was running
+      // (or between two tools). Without this, a 3-tool batch keeps running
+      // every tool before the loop notices the abort.
+      if (state.runningChats.get(c.id)?.abortRequested) { aborted = true; break; }
+
       const name = call.function?.name || call.name;
       let args = call.function?.arguments || call.arguments || {};
       if (typeof args === 'string') { try { args = JSON.parse(args); } catch {} }
@@ -3179,6 +3195,7 @@ ollama pull qwen2.5vl:7b
 
       history.push({ role: 'tool', content: typeof result === 'string' ? result : JSON.stringify(result) });
     }
+    if (aborted) break;
     // Clear accumulated content so next round starts with the model's continuation
     assistantMsg.content = '';
     patchLastMessage(assistantMsg);
@@ -3877,7 +3894,7 @@ function patchLastMessageContent(msg) {
 
   // Live-update the token badge in place — append on first appearance, mutate
   // in place after that, so the number ticks up smoothly without flicker.
-  if (msg.role === 'assistant' && msg.tokenStats && (msg.tokenStats.prompt || msg.tokenStats.completion)) {
+  if (msg.role === 'assistant' && msg.tokenStats) {
     const existing = lastEl.querySelector(':scope > .msg-tokens');
     const fresh = tokenBadgeEl(msg.tokenStats);
     if (existing) existing.replaceWith(fresh);

@@ -141,6 +141,14 @@
           "ram_gb": 6,
           "context": 131072,
           "thinking_capable": true
+        },
+        {
+          "id": "qwen2.5:3b",
+          "name": "Qwen2.5 3B Instruct",
+          "tag": "qwen2.5:3b",
+          "why": "The lightest tool-capable agent pick — ~2 GB runtime, snappy first-token latency on an 8 GB Mac Air where Qwen3 8B starts swapping. Qwen2.5 Instruct's tool-call grammar is well-supported by Ollama's templating, so web search, file reads, and shell commands work the same as on the bigger models. Trade-off vs Qwen3 8B: shorter chains-of-thought and less reliable multi-step planning, but for one-shot tool calls it's plenty.",
+          "ram_gb": 4,
+          "context": 32768
         }
       ]
     }
