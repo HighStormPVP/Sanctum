@@ -165,7 +165,14 @@ function createChat(modelOverride, modalityOverride, extraFields) {
     || currentChat()?.model
     || state.settings.lastModel
     || firstAvailableModel();
-  const modality = modalityOverride || modalityForModel(defaultModel);
+  // Default modality is 'chat' for the New Chat button. The previous behavior
+  // inherited the modality from whichever model was carried over — which made
+  // New Chat *sticky*: once you opened an agentic chat, every subsequent New
+  // Chat became agentic too (because qwen3:8b lives in the `agent` catalog
+  // category, so modalityForModel returns 'agent' even though the user just
+  // wanted a plain chat). Explicit modality (createAgenticChat, etc.) still
+  // wins via modalityOverride.
+  const modality = modalityOverride || 'chat';
   state.chats[id] = {
     id, title: '', model: defaultModel, modality,
     createdAt: Date.now(), updatedAt: Date.now(),
@@ -192,7 +199,8 @@ function createAgenticChat() {
   if (!model) return;
   createChat(model, 'agent', {
     planMode: true,             // safer default — plan first, no execution
-    approvalMode: false,        // mutually exclusive with planMode
+    approvalMode: false,        // mutex with planMode + noApproval
+    noApproval: false,          // YOLO — explicit opt-in, never default
     webEnabled: true,
     thinkingEnabled: false,
     readOnly: false,
@@ -1077,10 +1085,11 @@ function wireAgentBar() {
     });
   };
 
-  // Plan and Approval are mutually exclusive: turning one on turns the other
-  // off. Plan Mode = the agent only plans, never acts. Approval Mode = the
-  // agent acts but every tool call needs explicit user approval.
-  const mutexToggle = (btnId, fieldName, opposingField, opposingBtnId) => {
+  // Plan / Approval / No-Approval are mutually exclusive — exactly one (or
+  // none) can be on at any time. Plan = no execution at all. Approval = the
+  // agent executes but every tool call needs explicit approval. No-Approval =
+  // YOLO, no modal even for destructive tools.
+  const mutexToggle = (btnId, fieldName, opposing) => {
     const btn = $(`#${btnId}`);
     if (!btn) return;
     btn.addEventListener('click', () => {
@@ -1089,15 +1098,18 @@ function wireAgentBar() {
       c[fieldName] = !c[fieldName];
       btn.setAttribute('aria-pressed', c[fieldName] ? 'true' : 'false');
       if (c[fieldName]) {
-        c[opposingField] = false;
-        const opposing = $(`#${opposingBtnId}`);
-        if (opposing) opposing.setAttribute('aria-pressed', 'false');
+        for (const o of opposing) {
+          c[o.field] = false;
+          const oBtn = $(`#${o.btnId}`);
+          if (oBtn) oBtn.setAttribute('aria-pressed', 'false');
+        }
       }
       saveToStorage();
     });
   };
-  mutexToggle('toggle-plan',     'planMode',     'approvalMode', 'toggle-approval');
-  mutexToggle('toggle-approval', 'approvalMode', 'planMode',     'toggle-plan');
+  mutexToggle('toggle-plan',        'planMode',     [{field: 'approvalMode', btnId: 'toggle-approval'},   {field: 'noApproval',   btnId: 'toggle-noapproval'}]);
+  mutexToggle('toggle-approval',    'approvalMode', [{field: 'planMode',     btnId: 'toggle-plan'},       {field: 'noApproval',   btnId: 'toggle-noapproval'}]);
+  mutexToggle('toggle-noapproval',  'noApproval',   [{field: 'planMode',     btnId: 'toggle-plan'},       {field: 'approvalMode', btnId: 'toggle-approval'}]);
   simpleToggle('toggle-readonly', 'readOnly');
   simpleToggle('toggle-nofetch',  'noFetch');
 
@@ -1246,6 +1258,37 @@ function wireSettings() {
   const saved = $('#setting-saved');
 
   textarea.value = state.settings.instructions || '';
+
+  // API key field — Anthropic / Claude. Stored in localStorage alongside other
+  // settings. Saved live as the user types (debounced).
+  const anthInput = $('#setting-anthropic-key');
+  const anthSaved = $('#setting-api-saved');
+  const anthReveal = $('#setting-anthropic-reveal');
+  if (anthInput) {
+    state.settings.apiKeys = state.settings.apiKeys || {};
+    anthInput.value = state.settings.apiKeys.anthropic || '';
+    let apiTimer;
+    anthInput.addEventListener('input', () => {
+      state.settings.apiKeys.anthropic = anthInput.value.trim();
+      clearTimeout(apiTimer);
+      if (anthSaved) anthSaved.classList.remove('visible');
+      apiTimer = setTimeout(() => {
+        saveSettings();
+        if (anthSaved) {
+          anthSaved.classList.add('visible');
+          setTimeout(() => anthSaved.classList.remove('visible'), 1500);
+        }
+        // The picker shows a "needs key" pill when the key is empty, so refresh
+        // it as soon as the user adds a valid-looking value.
+        populateModelPicker();
+      }, 350);
+    });
+  }
+  if (anthReveal && anthInput) {
+    anthReveal.addEventListener('click', () => {
+      anthInput.type = anthInput.type === 'password' ? 'text' : 'password';
+    });
+  }
 
   // Theme picker: reflect current theme + wire clicks
   const themePicker = $('#theme-picker');
@@ -1462,6 +1505,25 @@ function wireModelPicker() {
     if (resumeBtn) { e.stopPropagation(); resumePull(resumeBtn.dataset.tag); return; }
     const cancelBtn = e.target.closest('button[data-action="cancel-inline"]');
     if (cancelBtn) { e.stopPropagation(); cancelPull(cancelBtn.dataset.tag); return; }
+    const uninstallBtn = e.target.closest('button[data-action="uninstall-inline"]');
+    if (uninstallBtn) {
+      e.stopPropagation();
+      const tag = uninstallBtn.dataset.tag;
+      if (!confirm(`Uninstall ${tag}?\n\nThis frees the disk blobs Ollama is keeping for this model. You can reinstall it any time from this picker.`)) return;
+      (async () => {
+        try {
+          const res = await window.api.ollama.delete(tag);
+          if (res && !res.ok) {
+            alert(`Failed to uninstall: ${res.error || 'unknown error'}`);
+            return;
+          }
+          await refreshOllama();
+        } catch (err) {
+          alert(`Failed to uninstall: ${err.message || err}`);
+        }
+      })();
+      return;
+    }
 
     // Video Analysis section: install ffmpeg / Whisper
     const installVidDep = e.target.closest('button[data-action="install-video-dep"]');
@@ -1480,7 +1542,20 @@ function wireModelPicker() {
     if (!c) return;
 
     c.model = value;
-    c.modality = modalityForModel(value);
+    // Cloud picks can be used in EITHER chat OR agent mode — keep whatever
+    // modality the chat is already in. modalityForModel would return 'cloud'
+    // which isn't a valid runtime mode.
+    const newMod = modalityForModel(value);
+    if (newMod !== 'cloud') {
+      c.modality = newMod;
+    } else if (c.modality !== 'chat' && c.modality !== 'agent') {
+      c.modality = 'chat';
+    }
+    // No API key configured? Prompt the user to add one before they try.
+    const picked = findPick(value);
+    if (picked && pickProvider(picked) !== 'ollama' && !pickReady(picked)) {
+      setTimeout(() => openSettings(), 50);
+    }
 
     // Remember this as the last picked model so future new chats default to it.
     state.settings.lastModel = value;
@@ -1512,7 +1587,30 @@ function wireModelPicker() {
 // them, but clicking the row doesn't change the chat — coding requests
 // auto-route to a code model, image attachments auto-route through a vision
 // router.
-const SELECTABLE_CATEGORIES = new Set(['chat', 'agent']);
+const SELECTABLE_CATEGORIES = new Set(['chat', 'agent', 'cloud']);
+
+// Returns the provider for a given pick. Default 'ollama' so existing rows
+// keep working without a provider field in models.json.
+function pickProvider(pick) {
+  return pick?.provider || 'ollama';
+}
+
+// True when this pick can be used right now (Ollama: model is pulled; cloud:
+// API key is set). Drives the "needs install" / "needs API key" badges in
+// the picker.
+function pickReady(pick) {
+  const prov = pickProvider(pick);
+  if (prov === 'anthropic') return !!state.settings.apiKeys?.anthropic;
+  return state.installed.has(pick.tag);
+}
+
+// Find the catalog pick for a model id (Ollama tag OR cloud id/model_id).
+function findPick(modelId) {
+  return allPicks().find(p =>
+    (p.tag || p.model_id || p.id || p.file) === modelId ||
+    p.id === modelId
+  );
+}
 
 // Refresh the cached install status for the Video Analysis tools. Called from
 // init and from the dropdown's open handler so the picker shows current state.
@@ -1565,17 +1663,17 @@ function populateModelPicker() {
     group.appendChild(label);
 
     for (const p of visiblePicks) {
-      const id = p.tag || p.file;
-      const isOllama = !!p.tag;
+      const id = p.tag || p.model_id || p.id || p.file;
+      const provider = pickProvider(p);
+      const isCloud = provider !== 'ollama';
       // Multimodal picks (qwen2.5vl, llama3.2-vision) live in the chat category
       // but are auto-routed for image inputs — not pickable as the primary
       // model. They still appear in the picker so the user can DOWNLOAD them.
       const itemSelectable = categorySelectable && !p.multimodal;
-      // Every model in the catalog is now an Ollama tag; check the installed
-      // registry.
-      const installed = state.installed.has(p.tag);
-      const pulling = state.pulling.has(id);
-      const justDone = state.recentlyInstalled.has(id);
+      // Ollama picks: installed registry. Cloud picks: API key presence.
+      const installed = isCloud ? pickReady(p) : state.installed.has(p.tag);
+      const pulling = !isCloud && state.pulling.has(id);
+      const justDone = !isCloud && state.recentlyInstalled.has(id);
 
       const item = document.createElement(itemSelectable ? 'button' : 'div');
       if (itemSelectable) item.type = 'button';
@@ -1594,6 +1692,31 @@ function populateModelPicker() {
         badge.className = 'cs-item-badge';
         badge.textContent = 'vision · auto';
         item.appendChild(badge);
+      }
+
+      // Cloud picks: show a tiny badge instead of an install/uninstall button.
+      // "API Key Needed" if missing, "cloud" once configured.
+      if (isCloud) {
+        const cloudBadge = document.createElement('span');
+        cloudBadge.className = 'cs-item-badge cs-item-cloud-badge' + (installed ? '' : ' needs-key');
+        cloudBadge.textContent = installed ? 'cloud · ready' : 'cloud · API key needed';
+        item.appendChild(cloudBadge);
+      }
+
+      // Uninstall button for installed (non-pulling) models — gives the same
+      // disk-freeing action as the Models view, without leaving the composer.
+      // Has to be a SEPARATE button next to the row, not inside it, because
+      // the row itself is a click target that switches the active model.
+      if (!isCloud && installed && !pulling && !state.paused.has(id) && !justDone && p.tag) {
+        const un = document.createElement('button');
+        un.type = 'button';
+        un.className = 'cs-item-action cs-item-uninstall';
+        un.dataset.action = 'uninstall-inline';
+        un.dataset.tag = p.tag;
+        un.title = `Uninstall ${p.name} (frees disk)`;
+        un.setAttribute('aria-label', `Uninstall ${p.name}`);
+        un.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M19 6 18 20a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg>`;
+        item.appendChild(un);
       }
 
       if (pulling || state.paused.has(id)) {
@@ -1626,7 +1749,7 @@ function populateModelPicker() {
         check.className = 'cs-item-check';
         check.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>`;
         item.appendChild(check);
-      } else if (!installed) {
+      } else if (!installed && !isCloud) {
         const dl = document.createElement('button');
         dl.type = 'button';
         dl.className = 'cs-item-action';
@@ -1772,14 +1895,14 @@ function renderActiveChat() {
       }
     }
     if (isAgent) {
-      // Mutex safety: if a legacy chat had both planMode and approvalMode true,
-      // prefer planMode (safer) and turn approval off.
-      if (c.planMode && c.approvalMode) {
-        c.approvalMode = false;
-        saveToStorage();
-      }
+      // Mutex safety. If a legacy chat had multiple of plan/approval/noApproval
+      // on, prefer the safest one (planMode > approvalMode > noApproval) and
+      // clear the others.
+      if (c.planMode) { c.approvalMode = false; c.noApproval = false; }
+      else if (c.approvalMode) { c.noApproval = false; }
       $('#toggle-plan').setAttribute('aria-pressed', c.planMode ? 'true' : 'false');
       $('#toggle-approval').setAttribute('aria-pressed', c.approvalMode ? 'true' : 'false');
+      $('#toggle-noapproval').setAttribute('aria-pressed', c.noApproval ? 'true' : 'false');
       $('#toggle-readonly').setAttribute('aria-pressed', c.readOnly ? 'true' : 'false');
       $('#toggle-nofetch').setAttribute('aria-pressed', c.noFetch ? 'true' : 'false');
     }
@@ -2969,6 +3092,18 @@ async function runOllamaChat(c, attachments) {
   if (c.modality === 'agent' && c.planMode) {
     history.unshift({ role: 'system', content: PLAN_MODE_PROMPT });
   }
+  if (c.modality === 'agent' && c.noApproval) {
+    history.unshift({ role: 'system', content: NO_APPROVAL_PROMPT });
+  }
+  // Web-search nudge — small/medium local models don't reliably call tools on
+  // their own unless the system prompt tells them to. Without this, a chat
+  // with web_search enabled still gets pure hallucination on questions about
+  // current events / today's prices / recent releases, because the model
+  // never invokes the tool. Inject this whenever web_search is in the
+  // toolset, regardless of modality.
+  if (c.webEnabled && modelSupportsTools(c.model)) {
+    history.unshift({ role: 'system', content: WEB_SEARCH_PROMPT });
+  }
   if (c.projectFolder) {
     const pf = projectFolderPrompt(c);
     if (pf) history.unshift({ role: 'system', content: pf });
@@ -3092,18 +3227,37 @@ ollama pull qwen2.5vl:7b
     // explicit abortRequested flag here too so the loop terminates promptly.
     if (state.runningChats.get(c.id)?.abortRequested) { aborted = true; break; }
 
-    const payload = { model: effectiveModel, messages: history };
-    // Cap the context window so big models like Qwen3 30B-A3B don't OOM. The
-    // KV cache for the default 32K context is ~13 GB on its own; 8K is the
-    // safe default that fits comfortably in 32 GB systems.
-    payload.options = { num_ctx: c.contextWindow || 8192 };
-    if (tools) payload.tools = tools;
-    if (round === 1 && imgs.length) payload.images = imgs;
+    // Route to either the local Ollama daemon or a cloud provider depending on
+    // the picked model. Both APIs emit the same chunk shape ({message: {content,
+    // tool_calls}, done, prompt_eval_count, eval_count}) so the rest of this
+    // loop is provider-agnostic.
+    const pick = findPick(effectiveModel);
+    const provider = pickProvider(pick);
+    const isCloud = provider !== 'ollama';
+
+    const payload = isCloud
+      ? {
+          provider,
+          apiKey: state.settings.apiKeys?.[provider] || '',
+          model: pick?.model_id || effectiveModel,
+          messages: history,
+          tools: tools || undefined
+        }
+      : { model: effectiveModel, messages: history };
+    if (!isCloud) {
+      // Cap the context window so big models like Qwen3 30B-A3B don't OOM. The
+      // KV cache for the default 32K context is ~13 GB on its own; 8K is the
+      // safe default that fits comfortably in 32 GB systems.
+      payload.options = { num_ctx: c.contextWindow || 8192 };
+      if (tools) payload.tools = tools;
+      if (round === 1 && imgs.length) payload.images = imgs;
+    }
 
     let acc = '';
     let collectedToolCalls = [];
 
-    await window.api.ollama.chat(payload, (chunk) => {
+    const chatFn = isCloud ? window.api.cloud.chat : window.api.ollama.chat;
+    await chatFn(payload, (chunk) => {
       // First chunk: record the channelId so a click on Stop can abort this stream.
       if (chunk._channelId) {
         const run = state.runningChats.get(c.id);
@@ -3193,7 +3347,14 @@ ollama pull qwen2.5vl:7b
       ev.resultSummary = summary;
       patchLastMessage(assistantMsg);
 
-      history.push({ role: 'tool', content: typeof result === 'string' ? result : JSON.stringify(result) });
+      // Capture the tool_call_id so Anthropic's tool_result blocks can match
+      // back to the original tool_use. Ollama doesn't need this — it ignores
+      // the field — so it's safe to always include.
+      history.push({
+        role: 'tool',
+        tool_call_id: call.id || call.tool_call_id,
+        content: typeof result === 'string' ? result : JSON.stringify(result)
+      });
     }
     if (aborted) break;
     // Clear accumulated content so next round starts with the model's continuation
@@ -3225,7 +3386,12 @@ function stopChat(chatId) {
   const run = state.runningChats.get(chatId);
   if (!run) return;
   run.abortRequested = true;
-  if (run.channelId) window.api.ollama.chatAbort(run.channelId);
+  if (run.channelId) {
+    // Cloud streams have channelIds that start with "cloud:" — route the
+    // abort to the right handler so we don't get an "unknown channel" no-op.
+    if (run.channelId.startsWith('cloud:')) window.api.cloud.chatAbort(run.channelId);
+    else window.api.ollama.chatAbort(run.channelId);
+  }
   if (run.videoChannelId) window.api.video.abort(run.videoChannelId);
 }
 
@@ -3272,6 +3438,28 @@ const TOOL_DEFS = {
   mcp_add_server:   { type: 'function', function: { name: 'mcp_add_server', description: 'Register and start a new MCP server. Pass `name` (your label), `command` (the executable e.g. "npx", "uvx", "python"), optional `args` (array of arguments), and optional `env` (object of env vars). The server spawns immediately and its tools become available to you on the next turn. REQUIRES USER APPROVAL since it executes a local subprocess.', parameters: { type: 'object', properties: { name: { type: 'string', description: 'Server name (used for tool prefix mcp__<name>__<tool>).' }, command: { type: 'string', description: 'Executable to run, e.g. "npx" or "uvx".' }, args: { type: 'array', items: { type: 'string' }, description: 'Args array, e.g. ["-y", "@playwright/mcp@latest"].' }, env: { type: 'object', description: 'Extra environment variables {KEY: VALUE}.' } }, required: ['name', 'command'] } } },
   mcp_remove_server: { type: 'function', function: { name: 'mcp_remove_server', description: 'Stop and delete a configured MCP server by name. Frees its config slot; its tools will no longer appear. REQUIRES USER APPROVAL.', parameters: { type: 'object', properties: { name: { type: 'string' } }, required: ['name'] } } },
 };
+
+const WEB_SEARCH_PROMPT = `You have a web_search tool that returns live results from the public web (DuckDuckGo). Use it WITHOUT being asked whenever the user's question depends on information you cannot answer with confidence from your training:
+- Anything time-sensitive (today's news / weather / sports scores, current prices, recent releases, "latest" / "newest" anything, dates after your knowledge cutoff).
+- Specific facts you would otherwise have to guess at (someone's current job title, a project's exact version number, a company's latest blog post).
+- Verifying a claim the user made that you're not 100% sure about.
+
+How to use it:
+1. Call \`web_search\` with a tight, focused query (3–8 words, like a search engine query — not a sentence).
+2. The tool returns a list of {url, title, snippet}. Pick the best 1–3 results and call \`web_fetch\` on each url to read the full page.
+3. Cite the page title and url inline when you use the information. Do not fabricate quotes or page contents you didn't actually fetch.
+
+If you're unsure whether to search: search anyway. A useless search is cheap; a confident-sounding hallucination is not. Do NOT tell the user "I don't have access to current information" — you do, via this tool.`;
+
+const NO_APPROVAL_PROMPT = `NO-APPROVAL MODE IS ACTIVE.
+
+Every tool call you make — including shell commands (run_command, run_command_async), file writes (write_file, apply_patch), and MCP server management (mcp_add_server, mcp_remove_server) — executes IMMEDIATELY with no approval modal. The user opted into this knowing the risks.
+
+Therefore:
+- Be decisive. When the user asks for something, do it. Don't preface with "this will execute immediately" or "are you sure?" warnings. They know.
+- Sanity-check yourself before destructive commands. There is no second pair of eyes here. Read before you write. Glob before you rm. Confirm the path is correct before you overwrite.
+- If you would normally pause to ask "should I proceed?" — don't ask. Either commit and execute, or explicitly note in your reply why you stopped (e.g. "I won't run this because the path falls outside the project folder").
+- Stay inside the project folder and any path allowlist unless the user explicitly directs you outside it.`;
 
 const APPROVAL_MODE_PROMPT = `APPROVAL MODE IS ACTIVE.
 
@@ -3436,6 +3624,10 @@ async function executeToolImpl(name, args) {
   const c = currentChat();
   const alwaysGated = ['write_file', 'apply_patch', 'run_command', 'run_command_async', 'mcp_add_server', 'mcp_remove_server'].includes(name);
   const forceApproval = c?.approvalMode === true;
+  // YOLO mode — skip the approval modal even for destructive tools. The user
+  // opted in with the No-Approval toggle; respect it. Read-only enforcement
+  // below still wins (No-Approval can't override Read-Only).
+  const skipAllApprovals = c?.noApproval === true;
   let approvalDecision = 'none';
 
   // run_command pre-approval: if the command starts with anything on the
@@ -3460,7 +3652,9 @@ async function executeToolImpl(name, args) {
     return { result: { error: 'this chat has No-Fetch mode on — web_fetch is disabled (use web_search results instead)' }, summary: 'no-fetch', ok: false };
   }
 
-  if (!skipApproval && (alwaysGated || forceApproval) && name !== 'calc') {
+  if (skipAllApprovals) {
+    approvalDecision = 'no-approval-mode';
+  } else if (!skipApproval && (alwaysGated || forceApproval) && name !== 'calc') {
     const ok = await requestApproval(name, args);
     approvalDecision = ok ? 'approved' : 'denied';
     if (!ok) {

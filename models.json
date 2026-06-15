@@ -1,6 +1,39 @@
 {
-  "_note": "Top 2 local models per task as of 2026. 'ollama' tags are pull strings. 'comfy' entries are ComfyUI checkpoint filenames.",
+  "_note": "Top local models per task as of 2026. 'ollama' tags are pull strings; 'comfy' entries are ComfyUI checkpoints; provider='anthropic' picks call the Claude Messages API via the user's API key (set in Settings → API Keys).",
   "categories": {
+    "cloud": {
+      "label": "Cloud Models (API key)",
+      "backend": "cloud",
+      "picks": [
+        {
+          "id": "claude-opus-4-8",
+          "name": "Claude Opus 4.8",
+          "provider": "anthropic",
+          "model_id": "claude-opus-4-8",
+          "why": "Anthropic's flagship — top-tier reasoning, code, and agentic tool use. Best for hard agent tasks where local models stall. Requires an Anthropic API key.",
+          "context": 200000,
+          "tools_capable": true
+        },
+        {
+          "id": "claude-sonnet-4-6",
+          "name": "Claude Sonnet 4.6",
+          "provider": "anthropic",
+          "model_id": "claude-sonnet-4-6",
+          "why": "Balanced cost/quality — fast enough for everyday chat, smart enough for serious agentic work. The default cloud pick. Requires an Anthropic API key.",
+          "context": 200000,
+          "tools_capable": true
+        },
+        {
+          "id": "claude-haiku-4-5",
+          "name": "Claude Haiku 4.5",
+          "provider": "anthropic",
+          "model_id": "claude-haiku-4-5-20251001",
+          "why": "Fastest Claude tier — quick conversational answers and low-latency tool calls. Requires an Anthropic API key.",
+          "context": 200000,
+          "tools_capable": true
+        }
+      ]
+    },
     "chat": {
       "label": "General Chat & Reasoning",
       "backend": "ollama",

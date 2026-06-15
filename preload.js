@@ -54,6 +54,23 @@ contextBridge.exposeInMainWorld('api', {
     chatAbort: (channelId) => ipcRenderer.invoke('ollama:chat-abort', channelId)
   },
 
+  cloud: {
+    chat: async ({ provider, apiKey, model, messages, tools, options }, onChunk) => {
+      const { channelId } = await ipcRenderer.invoke('cloud:chat', { provider, apiKey, model, messages, tools, options });
+      return new Promise((resolve) => {
+        const handler = (_e, payload) => {
+          onChunk({ ...payload, _channelId: channelId });
+          if (payload.done) {
+            ipcRenderer.removeListener(channelId, handler);
+            resolve();
+          }
+        };
+        ipcRenderer.on(channelId, handler);
+      });
+    },
+    chatAbort: (channelId) => ipcRenderer.invoke('cloud:chat-abort', channelId)
+  },
+
   files: {
     pick:       () => ipcRenderer.invoke('file:pick'),
     pickFolder: () => ipcRenderer.invoke('file:pick-folder'),

@@ -103,9 +103,13 @@
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M9 5H7a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-2"/><path d="M9 3h6v4H9z"/><path d="M9 12h6M9 16h4"/></svg>
             <span>Plan Mode</span>
           </button>
-          <button type="button" class="agent-mode-toggle" id="toggle-approval" aria-pressed="false" title="Execute with approval — every tool call needs explicit user approval before it runs. Mutually exclusive with Plan Mode.">
+          <button type="button" class="agent-mode-toggle" id="toggle-approval" aria-pressed="false" title="Execute with approval — every tool call needs explicit user approval before it runs. Mutually exclusive with Plan and No-Approval modes.">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg>
             <span>Approval Mode</span>
+          </button>
+          <button type="button" class="agent-mode-toggle danger" id="toggle-noapproval" aria-pressed="false" title="No-Approval (YOLO) — the agent runs every tool, INCLUDING shell commands and file writes, with NO approval modal. Dangerous: an agent that runs `rm -rf` will not be stopped. Mutually exclusive with Plan and Approval modes.">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 4 14h7l-1 8 9-12h-7l1-8z"/></svg>
+            <span>No Approval</span>
           </button>
           <button type="button" class="agent-mode-toggle" id="toggle-readonly" aria-pressed="false" title="Strip write_file, apply_patch, and run_command from the toolset. The agent can read and search but cannot modify anything.">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
@@ -346,6 +350,23 @@
           <textarea id="setting-instructions" rows="8" placeholder="You are a helpful assistant. Be direct and concise. When unsure, ask clarifying questions."></textarea>
           <div class="setting-meta">
             <span id="setting-saved" class="saved-tag">Saved</span>
+          </div>
+        </section>
+        <section class="setting-group">
+          <h3>API Keys (cloud models)</h3>
+          <p class="setting-help">Sanctum is local-first, but you can also call cloud models. Keys are stored in this app's local settings file on disk — no other process sees them. Picks appear under <strong>Cloud Models</strong> in the model picker. Leave blank to keep cloud picks disabled.</p>
+          <div class="api-key-row">
+            <label for="setting-anthropic-key">Anthropic (Claude)</label>
+            <div class="api-key-input">
+              <input type="password" id="setting-anthropic-key" autocomplete="off" spellcheck="false" placeholder="sk-ant-…" />
+              <button type="button" class="api-key-reveal" id="setting-anthropic-reveal" aria-label="Show / hide key" title="Show / hide">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8S1 12 1 12z"/><circle cx="12" cy="12" r="3"/></svg>
+              </button>
+            </div>
+            <small class="setting-help">Get a key at <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener">console.anthropic.com</a>. Pricing per million tokens varies by model — Haiku is cheapest, Opus is the most expensive.</small>
+          </div>
+          <div class="setting-meta">
+            <span id="setting-api-saved" class="saved-tag">Saved</span>
           </div>
         </section>
         <section class="setting-group">

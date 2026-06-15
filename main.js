@@ -472,6 +472,228 @@ ipcMain.handle('ollama:chat-abort', (_e, channelId) => {
   return { ok: true };
 });
 
+// =============== CLOUD CHAT (Anthropic) ===============
+// Routes provider=anthropic picks to the Claude Messages API. Emits the SAME
+// chunk shape as ollama:chat so the renderer's existing tool loop, token
+// counter, and stop-button wiring all work unchanged:
+//   { message: { content?, tool_calls? }, done, prompt_eval_count, eval_count }
+//   { error, done }
+//   { aborted, done }
+const ANTHROPIC_VERSION = '2023-06-01';
+
+function toAnthropicTools(tools) {
+  if (!Array.isArray(tools) || !tools.length) return undefined;
+  return tools
+    .filter(t => t && t.function && t.function.name)
+    .map(t => ({
+      name: t.function.name,
+      description: t.function.description || '',
+      input_schema: t.function.parameters || { type: 'object', properties: {} }
+    }));
+}
+
+// Convert Ollama-style messages (system / user / assistant / tool) into the
+// Anthropic format: separate `system` string + `messages` array of user/assistant.
+// Tool roles become user messages with tool_result content blocks.
+function toAnthropicMessages(messages) {
+  const sys = [];
+  const out = [];
+  let pendingToolResults = []; // batch consecutive tool roles into one user msg
+
+  const flushToolResults = () => {
+    if (!pendingToolResults.length) return;
+    out.push({ role: 'user', content: pendingToolResults });
+    pendingToolResults = [];
+  };
+
+  for (const m of messages) {
+    if (m.role === 'system') {
+      sys.push(typeof m.content === 'string' ? m.content : JSON.stringify(m.content));
+      continue;
+    }
+    if (m.role === 'tool') {
+      pendingToolResults.push({
+        type: 'tool_result',
+        tool_use_id: m.tool_call_id || m._anthropicId || `t_${pendingToolResults.length}`,
+        content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content)
+      });
+      continue;
+    }
+    flushToolResults();
+    if (m.role === 'assistant') {
+      const blocks = [];
+      if (m.content) blocks.push({ type: 'text', text: m.content });
+      if (Array.isArray(m.tool_calls)) {
+        for (const tc of m.tool_calls) {
+          const name = tc.function?.name || tc.name;
+          let input = tc.function?.arguments || tc.arguments || {};
+          if (typeof input === 'string') { try { input = JSON.parse(input); } catch { input = {}; } }
+          blocks.push({ type: 'tool_use', id: tc.id || `t_${name}_${blocks.length}`, name, input });
+        }
+      }
+      if (!blocks.length) blocks.push({ type: 'text', text: '' });
+      out.push({ role: 'assistant', content: blocks });
+    } else {
+      // user
+      out.push({ role: 'user', content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content) });
+    }
+  }
+  flushToolResults();
+  return { system: sys.join('\n\n').trim() || undefined, messages: out };
+}
+
+async function streamAnthropic({ apiKey, model, messages, tools, options, controller, evt, channelId, dlog }) {
+  const { system, messages: anthropicMsgs } = toAnthropicMessages(messages);
+  const body = {
+    model,
+    messages: anthropicMsgs,
+    max_tokens: options?.max_tokens || 8192,
+    stream: true
+  };
+  if (system) body.system = system;
+  const tdef = toAnthropicTools(tools);
+  if (tdef) body.tools = tdef;
+
+  const res = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-api-key': apiKey,
+      'anthropic-version': ANTHROPIC_VERSION
+    },
+    body: JSON.stringify(body),
+    signal: controller.signal
+  });
+  if (!res.ok || !res.body) {
+    const errText = res.body ? await res.text() : '(no body)';
+    dlog(`anthropic bad response ${res.status}: ${errText.slice(0, 500)}`);
+    let userMsg = `Anthropic API ${res.status}`;
+    try {
+      const j = JSON.parse(errText);
+      if (j?.error?.message) userMsg = j.error.message;
+    } catch {}
+    evt.sender.send(channelId, { error: userMsg, done: true });
+    return;
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+  const toolUses = new Map(); // index → { id, name, jsonAcc }
+  let inputTokens = 0;
+  let outputTokens = 0;
+
+  while (true) {
+    let value, done;
+    try { ({ value, done } = await reader.read()); }
+    catch (e) {
+      if (controller.signal.aborted) { evt.sender.send(channelId, { aborted: true, done: true }); return; }
+      throw e;
+    }
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+
+    // SSE frames are separated by blank lines. Each frame has `event: <name>` and
+    // `data: <json>` lines. We only care about the data payload.
+    let sep;
+    while ((sep = buf.indexOf('\n\n')) !== -1) {
+      const frame = buf.slice(0, sep);
+      buf = buf.slice(sep + 2);
+      const dataLine = frame.split('\n').find(l => l.startsWith('data:'));
+      if (!dataLine) continue;
+      const json = dataLine.slice(5).trim();
+      if (!json) continue;
+      let obj;
+      try { obj = JSON.parse(json); } catch { continue; }
+
+      if (obj.type === 'message_start') {
+        inputTokens = obj.message?.usage?.input_tokens || 0;
+        outputTokens = obj.message?.usage?.output_tokens || 0;
+      } else if (obj.type === 'content_block_start') {
+        if (obj.content_block?.type === 'tool_use') {
+          toolUses.set(obj.index, {
+            id: obj.content_block.id,
+            name: obj.content_block.name,
+            jsonAcc: ''
+          });
+        }
+      } else if (obj.type === 'content_block_delta') {
+        if (obj.delta?.type === 'text_delta' && obj.delta.text) {
+          evt.sender.send(channelId, { message: { content: obj.delta.text } });
+        } else if (obj.delta?.type === 'input_json_delta') {
+          const tu = toolUses.get(obj.index);
+          if (tu) tu.jsonAcc += obj.delta.partial_json || '';
+        }
+      } else if (obj.type === 'content_block_stop') {
+        const tu = toolUses.get(obj.index);
+        if (tu) {
+          let parsed = {};
+          try { parsed = tu.jsonAcc ? JSON.parse(tu.jsonAcc) : {}; } catch {}
+          evt.sender.send(channelId, {
+            message: {
+              tool_calls: [{
+                id: tu.id,
+                function: { name: tu.name, arguments: parsed }
+              }]
+            }
+          });
+        }
+      } else if (obj.type === 'message_delta') {
+        if (obj.usage?.output_tokens) outputTokens = obj.usage.output_tokens;
+      } else if (obj.type === 'message_stop') {
+        // emitted below via the final done chunk
+      }
+    }
+  }
+  evt.sender.send(channelId, {
+    done: true,
+    prompt_eval_count: inputTokens,
+    eval_count: outputTokens
+  });
+}
+
+ipcMain.handle('cloud:chat', async (evt, { provider, apiKey, model, messages, tools, options }) => {
+  const channelId = `cloud:chat:stream:${Date.now()}:${Math.random().toString(36).slice(2)}`;
+  const controller = new AbortController();
+  activeChatStreams.set(channelId, controller);
+
+  const debugLog = path.join(app.getPath('userData'), 'chat-debug.log');
+  const dlog = (msg) => { try { fs.appendFileSync(debugLog, `[${new Date().toISOString()}] ${msg}\n`); } catch {} };
+
+  (async () => {
+    dlog(`=== cloud chat start · provider=${provider} model=${model} msgs=${messages?.length} tools=${tools ? tools.length : 0} ===`);
+    try {
+      if (!apiKey) {
+        evt.sender.send(channelId, { error: `No API key set for ${provider}. Open Settings → API Keys to add one.`, done: true });
+        return;
+      }
+      if (provider === 'anthropic') {
+        await streamAnthropic({ apiKey, model, messages, tools, options, controller, evt, channelId, dlog });
+      } else {
+        evt.sender.send(channelId, { error: `Unknown cloud provider: ${provider}`, done: true });
+      }
+    } catch (e) {
+      if (controller.signal.aborted || e.name === 'AbortError') {
+        evt.sender.send(channelId, { aborted: true, done: true });
+      } else {
+        dlog(`cloud exception: ${e.message}`);
+        evt.sender.send(channelId, { error: e.message, done: true });
+      }
+    } finally {
+      activeChatStreams.delete(channelId);
+    }
+  })();
+
+  return { channelId };
+});
+
+ipcMain.handle('cloud:chat-abort', (_e, channelId) => {
+  const ctrl = activeChatStreams.get(channelId);
+  if (!ctrl) return { ok: false, note: 'no active stream' };
+  try { ctrl.abort(); } catch {}
+  return { ok: true };
+});
+
 // =============== UNIVERSAL FILE PICKER ===============
 // One picker that accepts any file. Routes by extension to:
 //   - kind: 'image' — png/jpg/webp/etc., returned as base64 for vision models
