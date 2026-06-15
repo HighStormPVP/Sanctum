@@ -12,7 +12,8 @@
           "model_id": "claude-opus-4-8",
           "why": "Anthropic's flagship — top-tier reasoning, code, and agentic tool use. Best for hard agent tasks where local models stall. Requires an Anthropic API key.",
           "context": 200000,
-          "tools_capable": true
+          "tools_capable": true,
+          "thinking_capable": true
         },
         {
           "id": "claude-sonnet-4-6",
@@ -21,7 +22,8 @@
           "model_id": "claude-sonnet-4-6",
           "why": "Balanced cost/quality — fast enough for everyday chat, smart enough for serious agentic work. The default cloud pick. Requires an Anthropic API key.",
           "context": 200000,
-          "tools_capable": true
+          "tools_capable": true,
+          "thinking_capable": true
         },
         {
           "id": "claude-haiku-4-5",

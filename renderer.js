@@ -127,12 +127,21 @@ function loadFromStorage() {
     // Migration: chats whose model is now a hidden router (vision auto-router)
     // OR an old image/video-gen modality (since removed) → reset to a
     // user-pickable default chat model.
+    //
+    // CRITICAL: the lookup MUST match cloud picks too. v0.3.0–v0.3.4 used
+    // `p.tag === c.model` here, but cloud picks have no `tag` (they use
+    // `model_id` / `id`). That meant every cloud-picked chat looked like an
+    // unknown model on boot and got silently reset to Qwen3 30B — which
+    // wasn't installed either, so Send appeared to do nothing. The catalog
+    // helper findPick checks all the alternate fields.
     if (state.catalog) {
       const fallback = state.catalog.categories.chat.picks.find(p => !p.multimodal)?.tag;
       for (const id of state.order) {
         const c = state.chats[id];
         if (!c) continue;
-        const pick = allPicks().find(p => p.tag === c.model);
+        const pick = allPicks().find(p =>
+          (p.tag || p.model_id || p.id || p.file) === c.model || p.id === c.model
+        );
         const removedModality = c.modality === 'image' || c.modality === 'video';
         if ((!pick || pick.multimodal || removedModality) && fallback) {
           c.model = fallback;
@@ -317,7 +326,7 @@ function modalityForModel(modelId) {
 }
 
 function isMultimodal(modelId) {
-  const pick = allPicks().find(p => (p.tag || p.file) === modelId);
+  const pick = findPick(modelId);
   return !!pick?.multimodal;
 }
 
@@ -326,15 +335,16 @@ function isMultimodal(modelId) {
 // malformed tool calls. Picks default to capable; set tools_capable=false in
 // models.json to opt out.
 function modelSupportsTools(modelId) {
-  const pick = allPicks().find(p => (p.tag || p.file) === modelId);
+  const pick = findPick(modelId);
   if (!pick) return false;
   return pick.tools_capable !== false;
 }
 
-// Whether the model has a native "thinking" mode controllable via /think and
-// /no_think soft switches (Qwen3 family).
+// Whether the model has a "thinking" mode — either Qwen3-family /think soft
+// switches (Ollama) or adaptive thinking (Anthropic / Google). The catalog
+// pick opts in via `thinking_capable: true`.
 function modelSupportsThinking(modelId) {
-  const pick = allPicks().find(p => (p.tag || p.file) === modelId);
+  const pick = findPick(modelId);
   return !!pick?.thinking_capable;
 }
 
@@ -3091,6 +3101,31 @@ async function dispatchSend() {
 
 // ============== OLLAMA CHAT (with tool loop + vision bridge) ==============
 async function runOllamaChat(c, attachments) {
+  // Defensive wrapper: any unhandled exception inside the chat loop would
+  // otherwise leave runningChats stuck with this chat's id, freezing the
+  // Send button in the Stop state and silently swallowing every subsequent
+  // submit (the form handler bails when runningChats.has(c.id) is true).
+  // The inner _runOllamaChatInner runs the actual work; this outer finally
+  // guarantees cleanup.
+  try {
+    await _runOllamaChatInner(c, attachments);
+  } catch (e) {
+    console.error('runOllamaChat fatal:', e);
+    const lastMsg = c.messages[c.messages.length - 1];
+    if (lastMsg && lastMsg.role === 'assistant') {
+      lastMsg.thinking = false;
+      if (!lastMsg.content) {
+        lastMsg.content = `**Chat crashed.** ${e?.message || e}\n\n_If this keeps happening, please file an issue with the chat-debug.log from Sanctum's user-data folder._`;
+        try { patchLastMessageContent(lastMsg); } catch {}
+      }
+    }
+  } finally {
+    state.runningChats.delete(c.id);
+    try { updateSendButton(); } catch {}
+  }
+}
+
+async function _runOllamaChatInner(c, attachments) {
   // Show loading indicator inside the assistant bubble until first content
   // arrives or a tool fires. `thinkingMode` separately tracks whether Qwen3's
   // /think reasoning is active for this turn — only THEN do we label the
