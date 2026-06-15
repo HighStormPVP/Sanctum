@@ -365,6 +365,16 @@
             </div>
             <small class="setting-help">Get a key at <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener">console.anthropic.com</a>. Pricing per million tokens varies by model — Haiku is cheapest, Opus is the most expensive.</small>
           </div>
+          <div class="api-key-row">
+            <label for="setting-google-key">Google (Gemini)</label>
+            <div class="api-key-input">
+              <input type="password" id="setting-google-key" autocomplete="off" spellcheck="false" placeholder="AIza…" />
+              <button type="button" class="api-key-reveal" id="setting-google-reveal" aria-label="Show / hide key" title="Show / hide">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8S1 12 1 12z"/><circle cx="12" cy="12" r="3"/></svg>
+              </button>
+            </div>
+            <small class="setting-help">Get a key at <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noopener">aistudio.google.com</a>. Gemini 2.5 Flash has a generous free tier; Pro is paid per million tokens.</small>
+          </div>
           <div class="setting-meta">
             <span id="setting-api-saved" class="saved-tag">Saved</span>
           </div>

@@ -1258,36 +1258,38 @@ function wireSettings() {
 
   textarea.value = state.settings.instructions || '';
 
-  // API key field — Anthropic / Claude. Stored in localStorage alongside other
-  // settings. Saved live as the user types (debounced).
-  const anthInput = $('#setting-anthropic-key');
-  const anthSaved = $('#setting-api-saved');
-  const anthReveal = $('#setting-anthropic-reveal');
-  if (anthInput) {
-    state.settings.apiKeys = state.settings.apiKeys || {};
-    anthInput.value = state.settings.apiKeys.anthropic || '';
-    let apiTimer;
-    anthInput.addEventListener('input', () => {
-      state.settings.apiKeys.anthropic = anthInput.value.trim();
-      clearTimeout(apiTimer);
-      if (anthSaved) anthSaved.classList.remove('visible');
-      apiTimer = setTimeout(() => {
+  // API key fields. Stored in localStorage alongside other settings; saved
+  // live as the user types (debounced). The picker shows a "needs key"
+  // badge when the relevant key is empty, so we refresh it after every save.
+  state.settings.apiKeys = state.settings.apiKeys || {};
+  const apiSaved = $('#setting-api-saved');
+  const wireApiKey = (inputId, revealId, providerKey) => {
+    const input = $(`#${inputId}`);
+    const reveal = $(`#${revealId}`);
+    if (!input) return;
+    input.value = state.settings.apiKeys[providerKey] || '';
+    let timer;
+    input.addEventListener('input', () => {
+      state.settings.apiKeys[providerKey] = input.value.trim();
+      clearTimeout(timer);
+      if (apiSaved) apiSaved.classList.remove('visible');
+      timer = setTimeout(() => {
         saveSettings();
-        if (anthSaved) {
-          anthSaved.classList.add('visible');
-          setTimeout(() => anthSaved.classList.remove('visible'), 1500);
+        if (apiSaved) {
+          apiSaved.classList.add('visible');
+          setTimeout(() => apiSaved.classList.remove('visible'), 1500);
         }
-        // The picker shows a "needs key" pill when the key is empty, so refresh
-        // it as soon as the user adds a valid-looking value.
         populateModelPicker();
       }, 350);
     });
-  }
-  if (anthReveal && anthInput) {
-    anthReveal.addEventListener('click', () => {
-      anthInput.type = anthInput.type === 'password' ? 'text' : 'password';
-    });
-  }
+    if (reveal) {
+      reveal.addEventListener('click', () => {
+        input.type = input.type === 'password' ? 'text' : 'password';
+      });
+    }
+  };
+  wireApiKey('setting-anthropic-key', 'setting-anthropic-reveal', 'anthropic');
+  wireApiKey('setting-google-key',    'setting-google-reveal',    'google');
 
   // Theme picker: reflect current theme + wire clicks
   const themePicker = $('#theme-picker');
@@ -1599,7 +1601,7 @@ function pickProvider(pick) {
 // the picker.
 function pickReady(pick) {
   const prov = pickProvider(pick);
-  if (prov === 'anthropic') return !!state.settings.apiKeys?.anthropic;
+  if (prov !== 'ollama') return !!state.settings.apiKeys?.[prov];
   return state.installed.has(pick.tag);
 }
 
@@ -2369,10 +2371,12 @@ function renderInstallBanner() {
   if (tagPick && pickProvider(tagPick) !== 'ollama') {
     if (pickReady(tagPick)) { banner.hidden = true; banner.innerHTML = ''; return; }
     banner.hidden = false;
+    const prov = pickProvider(tagPick);
+    const provLabel = prov === 'anthropic' ? 'Anthropic' : prov === 'google' ? 'Google' : prov;
     banner.innerHTML = `
       <div class="ib-text">
         <strong>${escapeHtml(tagPick.name)}</strong> needs an API key.
-        <span class="sub">Add your ${escapeHtml(pickProvider(tagPick) === 'anthropic' ? 'Anthropic' : pickProvider(tagPick))} key in Settings → API Keys, then send your message.</span>
+        <span class="sub">Add your ${escapeHtml(provLabel)} key in Settings → API Keys, then send your message.</span>
       </div>
       <button type="button" data-action="open-settings">Open Settings</button>
     `;
@@ -3182,9 +3186,19 @@ async function runOllamaChat(c, attachments) {
   let imageAttachments = (attachments || []).filter(a => a.kind === 'image');
   let imgs = imageAttachments.map(a => a.base64);
 
-  // VISION BRIDGE: if the active model can't natively see images but the user attached some,
-  // route each through an installed vision model first and inject the description as text.
-  if (imageAttachments.length && !isMultimodal(c.model)) {
+  // VISION BRIDGE: if the active model can't natively see images but the user
+  // attached some, route each through an installed vision model first and
+  // inject the description as text.
+  //
+  // SKIP this bridge for cloud picks (Claude / Gemini). Those models are
+  // multimodal on their own (Claude reads images, Gemini reads images +
+  // PDFs natively) — running them through a local Qwen2.5-VL captioning
+  // pass first is both wasteful and loses fidelity. v0.3.3 short-circuits
+  // here; sending raw image bytes to cloud providers is a TODO for a
+  // follow-up release.
+  const _activePick = findPick(c.model);
+  const _activeIsCloud = pickProvider(_activePick) !== 'ollama';
+  if (imageAttachments.length && !isMultimodal(c.model) && !_activeIsCloud) {
     const router = getVisionRouter(c.model);
     if (!router) {
       assistantMsg.content = `I can't read images with this text-only model and no vision model is installed locally.
@@ -3320,7 +3334,19 @@ ollama pull qwen2.5vl:7b
         return;
       }
       if (chunk.error) {
-        acc = friendlyOllamaError(chunk.error, c);
+        // Surface the actual provider error verbatim so the user can see WHY
+        // it failed (bad API key, model not found, rate limit, etc.) instead
+        // of a vague "didn't work". friendlyOllamaError handles Ollama-shaped
+        // errors and falls through unchanged on others — for cloud picks we
+        // prepend a clear header so the user knows which API rejected them.
+        const cloudPick = findPick(effectiveModel);
+        const cloudProv = pickProvider(cloudPick);
+        const isCloudErr = cloudProv !== 'ollama';
+        const provLabel = cloudProv === 'anthropic' ? 'Anthropic' : cloudProv === 'google' ? 'Google' : cloudProv;
+        const raw = friendlyOllamaError(chunk.error, c);
+        acc = isCloudErr
+          ? `**${provLabel} API error.** ${raw}\n\n_Double-check your API key in **Settings → API Keys**, and confirm the model id is current. Full error text above._`
+          : raw;
         assistantMsg.content = acc;
         assistantMsg.thinking = false;
         aborted = true;
@@ -3398,12 +3424,14 @@ ollama pull qwen2.5vl:7b
       ev.resultSummary = summary;
       patchLastMessage(assistantMsg);
 
-      // Capture the tool_call_id so Anthropic's tool_result blocks can match
-      // back to the original tool_use. Ollama doesn't need this — it ignores
-      // the field — so it's safe to always include.
+      // Capture the tool_call_id (Anthropic) and tool_name (Gemini) so cloud
+      // providers can match the result back to the original tool_use /
+      // functionCall. Ollama ignores both fields, so it's safe to always
+      // include them.
       history.push({
         role: 'tool',
         tool_call_id: call.id || call.tool_call_id,
+        tool_name: name,
         content: typeof result === 'string' ? result : JSON.stringify(result)
       });
     }

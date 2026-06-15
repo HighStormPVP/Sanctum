@@ -522,6 +522,11 @@ function toAnthropicMessages(messages) {
     flushToolResults();
     if (m.role === 'assistant') {
       const blocks = [];
+      // Anthropic rejects empty text content blocks — only push the text
+      // block if it has actual content. Tool calls still get their own
+      // tool_use blocks. If both are missing the message is meaningless,
+      // skip it entirely rather than send an empty assistant turn (which
+      // would also return a 400 from the API).
       if (m.content) blocks.push({ type: 'text', text: m.content });
       if (Array.isArray(m.tool_calls)) {
         for (const tc of m.tool_calls) {
@@ -531,7 +536,7 @@ function toAnthropicMessages(messages) {
           blocks.push({ type: 'tool_use', id: tc.id || `t_${name}_${blocks.length}`, name, input });
         }
       }
-      if (!blocks.length) blocks.push({ type: 'text', text: '' });
+      if (!blocks.length) continue;
       out.push({ role: 'assistant', content: blocks });
     } else {
       // user
@@ -547,7 +552,10 @@ async function streamAnthropic({ apiKey, model, messages, tools, options, contro
   const body = {
     model,
     messages: anthropicMsgs,
-    max_tokens: options?.max_tokens || 8192,
+    // 64K is the streaming default recommended by the Claude API skill —
+    // Opus/Sonnet/Haiku 4.x all support this, and hitting the cap truncates
+    // mid-thought which forces an awkward retry. Caller can override.
+    max_tokens: options?.max_tokens || 64000,
     stream: true
   };
   if (system) body.system = system;
@@ -652,6 +660,176 @@ async function streamAnthropic({ apiKey, model, messages, tools, options, contro
   });
 }
 
+// =============== CLOUD CHAT (Google Gemini) ===============
+// Uses the Generative Language API (Google AI Studio keys) via
+// :streamGenerateContent with alt=sse. Same chunk shape as Anthropic /
+// Ollama so the renderer doesn't need to know which provider this is.
+function toGeminiTools(tools) {
+  if (!Array.isArray(tools) || !tools.length) return undefined;
+  // Strip JSON Schema fields Gemini doesn't accept ($schema, additionalProperties,
+  // and `format` on non-string types). Recursively walk objects and arrays.
+  const sanitize = (node) => {
+    if (Array.isArray(node)) return node.map(sanitize);
+    if (node && typeof node === 'object') {
+      const out = {};
+      for (const [k, v] of Object.entries(node)) {
+        if (k === '$schema' || k === 'additionalProperties') continue;
+        out[k] = sanitize(v);
+      }
+      return out;
+    }
+    return node;
+  };
+  return [{
+    functionDeclarations: tools
+      .filter(t => t && t.function && t.function.name)
+      .map(t => ({
+        name: t.function.name,
+        description: t.function.description || '',
+        parameters: sanitize(t.function.parameters || { type: 'object', properties: {} })
+      }))
+  }];
+}
+
+function toGeminiContents(messages) {
+  const sysParts = [];
+  const out = [];
+  let pendingFnResults = [];
+
+  const flushFnResults = () => {
+    if (!pendingFnResults.length) return;
+    out.push({ role: 'user', parts: pendingFnResults });
+    pendingFnResults = [];
+  };
+
+  for (const m of messages) {
+    if (m.role === 'system') {
+      sysParts.push(typeof m.content === 'string' ? m.content : JSON.stringify(m.content));
+      continue;
+    }
+    if (m.role === 'tool') {
+      let payload;
+      try { payload = typeof m.content === 'string' ? JSON.parse(m.content) : m.content; }
+      catch { payload = { result: m.content }; }
+      if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
+        // already an object — pass through
+      } else {
+        payload = { result: payload };
+      }
+      pendingFnResults.push({
+        functionResponse: { name: m.tool_name || m._toolName || 'tool', response: payload }
+      });
+      continue;
+    }
+    flushFnResults();
+    if (m.role === 'assistant') {
+      const parts = [];
+      if (m.content) parts.push({ text: m.content });
+      if (Array.isArray(m.tool_calls)) {
+        for (const tc of m.tool_calls) {
+          const name = tc.function?.name || tc.name;
+          let args = tc.function?.arguments || tc.arguments || {};
+          if (typeof args === 'string') { try { args = JSON.parse(args); } catch { args = {}; } }
+          parts.push({ functionCall: { name, args } });
+        }
+      }
+      if (!parts.length) continue;
+      out.push({ role: 'model', parts });
+    } else {
+      out.push({ role: 'user', parts: [{ text: typeof m.content === 'string' ? m.content : JSON.stringify(m.content) }] });
+    }
+  }
+  flushFnResults();
+  return { systemInstruction: sysParts.length ? { parts: [{ text: sysParts.join('\n\n') }] } : undefined, contents: out };
+}
+
+async function streamGoogle({ apiKey, model, messages, tools, options, controller, evt, channelId, dlog }) {
+  const { systemInstruction, contents } = toGeminiContents(messages);
+  const body = { contents };
+  if (systemInstruction) body.systemInstruction = systemInstruction;
+  const gtools = toGeminiTools(tools);
+  if (gtools) body.tools = gtools;
+  if (options?.max_tokens) {
+    body.generationConfig = { maxOutputTokens: options.max_tokens };
+  }
+
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse&key=${encodeURIComponent(apiKey)}`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+    signal: controller.signal
+  });
+  if (!res.ok || !res.body) {
+    const errText = res.body ? await res.text() : '(no body)';
+    dlog(`google bad response ${res.status}: ${errText.slice(0, 500)}`);
+    let userMsg = `Google API ${res.status}`;
+    try {
+      const j = JSON.parse(errText);
+      if (j?.error?.message) userMsg = j.error.message;
+    } catch {}
+    evt.sender.send(channelId, { error: userMsg, done: true });
+    return;
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+  let inputTokens = 0;
+  let outputTokens = 0;
+
+  while (true) {
+    let value, done;
+    try { ({ value, done } = await reader.read()); }
+    catch (e) {
+      if (controller.signal.aborted) { evt.sender.send(channelId, { aborted: true, done: true }); return; }
+      throw e;
+    }
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+
+    let sep;
+    while ((sep = buf.indexOf('\n\n')) !== -1) {
+      const frame = buf.slice(0, sep);
+      buf = buf.slice(sep + 2);
+      const dataLine = frame.split('\n').find(l => l.startsWith('data:'));
+      if (!dataLine) continue;
+      const json = dataLine.slice(5).trim();
+      if (!json) continue;
+      let obj;
+      try { obj = JSON.parse(json); } catch { continue; }
+
+      if (obj.usageMetadata) {
+        if (obj.usageMetadata.promptTokenCount) inputTokens = obj.usageMetadata.promptTokenCount;
+        if (obj.usageMetadata.candidatesTokenCount) outputTokens = obj.usageMetadata.candidatesTokenCount;
+      }
+      const cand = obj.candidates?.[0];
+      const parts = cand?.content?.parts;
+      if (!Array.isArray(parts)) continue;
+      for (const part of parts) {
+        if (typeof part.text === 'string' && part.text.length) {
+          evt.sender.send(channelId, { message: { content: part.text } });
+        }
+        if (part.functionCall) {
+          evt.sender.send(channelId, {
+            message: {
+              tool_calls: [{
+                id: `gem_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+                function: { name: part.functionCall.name, arguments: part.functionCall.args || {} }
+              }]
+            }
+          });
+        }
+      }
+    }
+  }
+  evt.sender.send(channelId, {
+    done: true,
+    prompt_eval_count: inputTokens,
+    eval_count: outputTokens
+  });
+}
+
 ipcMain.handle('cloud:chat', async (evt, { provider, apiKey, model, messages, tools, options }) => {
   const channelId = `cloud:chat:stream:${Date.now()}:${Math.random().toString(36).slice(2)}`;
   const controller = new AbortController();
@@ -669,6 +847,8 @@ ipcMain.handle('cloud:chat', async (evt, { provider, apiKey, model, messages, to
       }
       if (provider === 'anthropic') {
         await streamAnthropic({ apiKey, model, messages, tools, options, controller, evt, channelId, dlog });
+      } else if (provider === 'google') {
+        await streamGoogle({ apiKey, model, messages, tools, options, controller, evt, channelId, dlog });
       } else {
         evt.sender.send(channelId, { error: `Unknown cloud provider: ${provider}`, done: true });
       }
