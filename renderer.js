@@ -3231,8 +3231,16 @@ ollama pull qwen2.5vl:7b
   // Code auto-route: if the user is in plain chat and asks a code question,
   // silently swap to an installed coding model for this turn. Surfaced via
   // the routedTo badge on the assistant message.
+  //
+  // SKIP the auto-route when the user explicitly picked a cloud model (Opus,
+  // Sonnet, Haiku) — those are deliberate choices and they handle code at
+  // least as well as any local coder. Swapping a $0.015/M token cloud pick
+  // for a local 7B every time the message looks code-shaped was a surprise
+  // bug, not a feature.
   let effectiveModel = c.model;
-  if (c.modality === 'chat') {
+  const currentPick = findPick(c.model);
+  const currentIsCloud = pickProvider(currentPick) !== 'ollama';
+  if (c.modality === 'chat' && !currentIsCloud) {
     const lastUser = [...c.messages].reverse().find(m => m.role === 'user');
     if (lastUser && isLikelyCodeRequest(lastUser.content)) {
       const codeModel = pickInstalledCodeModel();
@@ -3288,10 +3296,23 @@ ollama pull qwen2.5vl:7b
 
     const chatFn = isCloud ? window.api.cloud.chat : window.api.ollama.chat;
     await chatFn(payload, (chunk) => {
-      // First chunk: record the channelId so a click on Stop can abort this stream.
+      // First chunk: record the channelId so a click on Stop can abort this
+      // stream. If Stop was clicked BEFORE the first chunk arrived (which is
+      // common on slow models with long first-token latency), abortRequested
+      // is already true but stopChat() couldn't fire chatAbort because the
+      // channelId wasn't known yet. Fire it here as soon as we learn it —
+      // otherwise the stream finishes naturally and the user thinks Stop is
+      // broken.
       if (chunk._channelId) {
         const run = state.runningChats.get(c.id);
-        if (run) run.channelId = chunk._channelId;
+        if (run) {
+          run.channelId = chunk._channelId;
+          if (run.abortRequested && !run._lateAbortSent) {
+            run._lateAbortSent = true;
+            if (chunk._channelId.startsWith('cloud:')) window.api.cloud.chatAbort(chunk._channelId);
+            else window.api.ollama.chatAbort(chunk._channelId);
+          }
+        }
       }
       if (chunk.aborted) {
         // Clean exit caused by the user pressing Stop. Don't surface an error.
@@ -3416,6 +3437,21 @@ function stopChat(chatId) {
   const run = state.runningChats.get(chatId);
   if (!run) return;
   run.abortRequested = true;
+  // Reflect the stop in the UI IMMEDIATELY so the user gets instant feedback.
+  // The actual abort cycle (fetch interrupt → server-side aborted chunk →
+  // promise resolve → break loop) takes several hundred ms; without an
+  // immediate visual cue the user thinks the button didn't fire and clicks
+  // again. We drop the thinking dots on the in-flight assistant message and
+  // mark it as stopped if no content arrived yet.
+  const c = state.chats[chatId];
+  const lastMsg = c?.messages?.[c.messages.length - 1];
+  if (lastMsg && lastMsg.role === 'assistant' && lastMsg.thinking) {
+    lastMsg.thinking = false;
+    if (!lastMsg.content && !(lastMsg.toolEvents && lastMsg.toolEvents.length)) {
+      lastMsg.content = '_Stopped._';
+    }
+    try { patchLastMessage(lastMsg); } catch {}
+  }
   if (run.channelId) {
     // Cloud streams have channelIds that start with "cloud:" — route the
     // abort to the right handler so we don't get an "unknown channel" no-op.
