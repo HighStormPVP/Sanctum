@@ -3308,8 +3308,20 @@ ollama pull qwen2.5vl:7b
     let acc = '';
     let collectedToolCalls = [];
 
-    const chatFn = isCloud ? window.api.cloud.chat : window.api.ollama.chat;
-    await chatFn(payload, (chunk) => {
+    const chatFn = isCloud ? window.api.cloud?.chat : window.api.ollama.chat;
+    if (typeof chatFn !== 'function') {
+      // Belt-and-braces: if the preload bridge somehow didn't expose the cloud
+      // surface (older preload bundled with a newer renderer, for example),
+      // surface that clearly instead of throwing into the void.
+      const provLabel = provider === 'anthropic' ? 'Anthropic' : provider === 'google' ? 'Google' : provider;
+      assistantMsg.content = `**Cloud bridge missing.** The preload script for this build doesn't expose the ${provLabel} chat endpoint. Quit and reopen Sanctum; if the problem persists, this is a bug — please file an issue.`;
+      assistantMsg.thinking = false;
+      aborted = true;
+      patchLastMessageContent(assistantMsg);
+      break;
+    }
+    try {
+      await chatFn(payload, (chunk) => {
       // First chunk: record the channelId so a click on Stop can abort this
       // stream. If Stop was clicked BEFORE the first chunk arrived (which is
       // common on slow models with long first-token latency), abortRequested
@@ -3391,6 +3403,20 @@ ollama pull qwen2.5vl:7b
         patchLastMessage(assistantMsg);
       }
     });
+    } catch (e) {
+      // The IPC bridge or the underlying fetch can throw before any chunk
+      // arrives (transport-level failure: DNS, TLS, malformed payload, etc.).
+      // Without this catch the await would propagate up the stack and freeze
+      // the chat in a 'thinking forever' state. Surface the error and break.
+      const provLabel = provider === 'anthropic' ? 'Anthropic' : provider === 'google' ? 'Google' : provider || 'cloud';
+      const detail = (e && e.message) ? e.message : String(e);
+      assistantMsg.content = isCloud
+        ? `**${provLabel} request failed.** ${detail}\n\n_If this keeps happening, double-check your API key in **Settings → API Keys** and that the model id is current._`
+        : `**Chat failed.** ${detail}`;
+      assistantMsg.thinking = false;
+      aborted = true;
+      patchLastMessageContent(assistantMsg);
+    }
 
     if (aborted) break;
     lastContent = acc;

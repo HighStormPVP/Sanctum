@@ -33,20 +33,29 @@
           "tools_capable": true
         },
         {
-          "id": "gemini-2-5-pro",
-          "name": "Gemini 2.5 Pro",
+          "id": "gemini-3-1-pro-preview",
+          "name": "Gemini 3.1 Pro (Preview)",
           "provider": "google",
-          "model_id": "gemini-2.5-pro",
-          "why": "Google's top-tier multimodal model — 1M-token context, strong reasoning, native function calling. Requires a Google AI Studio API key.",
+          "model_id": "gemini-3.1-pro-preview",
+          "why": "Google's most advanced model — reasoning-first design optimized for complex agentic workflows and coding. Preview status. Requires a Google AI Studio API key.",
           "context": 1048576,
           "tools_capable": true
         },
         {
-          "id": "gemini-2-5-flash",
-          "name": "Gemini 2.5 Flash",
+          "id": "gemini-3-5-flash",
+          "name": "Gemini 3.5 Flash",
           "provider": "google",
-          "model_id": "gemini-2.5-flash",
-          "why": "Fast, cheap Google model — solid quality at very low cost per token. Good default for everyday chat when you want to use a key instead of running locally. Requires a Google AI Studio API key.",
+          "model_id": "gemini-3.5-flash",
+          "why": "GA Flash model — the most intelligent Flash tier for sustained frontier performance on agentic and coding tasks. Great default cloud pick that balances cost and quality. Requires a Google AI Studio API key.",
+          "context": 1048576,
+          "tools_capable": true
+        },
+        {
+          "id": "gemini-3-1-flash-lite",
+          "name": "Gemini 3.1 Flash-Lite",
+          "provider": "google",
+          "model_id": "gemini-3.1-flash-lite",
+          "why": "The most cost-efficient Gemini — optimized for low-latency, high-volume traffic. Pick this when you want a cheap fast cloud answer. Requires a Google AI Studio API key.",
           "context": 1048576,
           "tools_capable": true
         }

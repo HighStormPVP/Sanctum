@@ -590,6 +590,8 @@ async function streamAnthropic({ apiKey, model, messages, tools, options, contro
   const toolUses = new Map(); // index → { id, name, jsonAcc }
   let inputTokens = 0;
   let outputTokens = 0;
+  let frameCount = 0;
+  let firstTextSent = false;
 
   while (true) {
     let value, done;
@@ -600,6 +602,9 @@ async function streamAnthropic({ apiKey, model, messages, tools, options, contro
     }
     if (done) break;
     buf += decoder.decode(value, { stream: true });
+    // SSE allows both LF and CRLF line endings. Normalize so the frame
+    // splitter below works regardless of what Anthropic's proxy sends.
+    buf = buf.replace(/\r\n/g, '\n');
 
     // SSE frames are separated by blank lines. Each frame has `event: <name>` and
     // `data: <json>` lines. We only care about the data payload.
@@ -613,6 +618,7 @@ async function streamAnthropic({ apiKey, model, messages, tools, options, contro
       if (!json) continue;
       let obj;
       try { obj = JSON.parse(json); } catch { continue; }
+      frameCount++;
 
       if (obj.type === 'message_start') {
         inputTokens = obj.message?.usage?.input_tokens || 0;
@@ -627,6 +633,7 @@ async function streamAnthropic({ apiKey, model, messages, tools, options, contro
         }
       } else if (obj.type === 'content_block_delta') {
         if (obj.delta?.type === 'text_delta' && obj.delta.text) {
+          if (!firstTextSent) { firstTextSent = true; dlog(`anthropic first text delta after ${frameCount} frames`); }
           evt.sender.send(channelId, { message: { content: obj.delta.text } });
         } else if (obj.delta?.type === 'input_json_delta') {
           const tu = toolUses.get(obj.index);
@@ -777,6 +784,7 @@ async function streamGoogle({ apiKey, model, messages, tools, options, controlle
   let buf = '';
   let inputTokens = 0;
   let outputTokens = 0;
+  let frameCount = 0;
 
   while (true) {
     let value, done;
@@ -787,6 +795,7 @@ async function streamGoogle({ apiKey, model, messages, tools, options, controlle
     }
     if (done) break;
     buf += decoder.decode(value, { stream: true });
+    buf = buf.replace(/\r\n/g, '\n');
 
     let sep;
     while ((sep = buf.indexOf('\n\n')) !== -1) {
@@ -798,6 +807,7 @@ async function streamGoogle({ apiKey, model, messages, tools, options, controlle
       if (!json) continue;
       let obj;
       try { obj = JSON.parse(json); } catch { continue; }
+      frameCount++;
 
       if (obj.usageMetadata) {
         if (obj.usageMetadata.promptTokenCount) inputTokens = obj.usageMetadata.promptTokenCount;
@@ -823,6 +833,8 @@ async function streamGoogle({ apiKey, model, messages, tools, options, controlle
       }
     }
   }
+  dlog(`anthropic stream end · frames=${frameCount} inputTokens=${inputTokens} outputTokens=${outputTokens}`);
+  dlog(`google stream end · frames=${frameCount} inputTokens=${inputTokens} outputTokens=${outputTokens}`);
   evt.sender.send(channelId, {
     done: true,
     prompt_eval_count: inputTokens,
