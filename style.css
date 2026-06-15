@@ -662,6 +662,10 @@ button { font-family: inherit; }
   cursor: pointer;
   text-align: left;
   transition: background 0.12s var(--ease);
+  /* All rows have the same height regardless of whether they show a
+     download/uninstall button. Without this, cloud rows (badge only) read
+     as squished compared to local rows (28px circular action button). */
+  min-height: 44px;
 }
 .cs-item:hover { background: var(--surface-2); }
 .cs-item.active { background: var(--surface-2); }
@@ -1309,7 +1313,10 @@ button { font-family: inherit; }
   font-size: 14.5px;
   line-height: 1.5;
   resize: none;
-  max-height: 240px;
+  /* 5 lines × ~21.75px line-height + ~14px vertical padding. Past this the
+     textarea scrolls internally — long pasted blocks don't push the chat
+     thread off-screen. */
+  max-height: 130px;
 }
 .composer textarea::placeholder { color: var(--text-4); }
 

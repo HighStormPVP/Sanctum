@@ -1085,24 +1085,23 @@ function wireAgentBar() {
     });
   };
 
-  // Plan / Approval / No-Approval are mutually exclusive — exactly one (or
-  // none) can be on at any time. Plan = no execution at all. Approval = the
-  // agent executes but every tool call needs explicit approval. No-Approval =
-  // YOLO, no modal even for destructive tools.
+  // Plan / Approval / No-Approval are mutually exclusive AND required: exactly
+  // ONE is always on. Clicking the active mode is a no-op (no "off" state) —
+  // the agent must be in some safety posture. Clicking an inactive mode
+  // switches to it and turns the others off. Initial default = Plan.
   const mutexToggle = (btnId, fieldName, opposing) => {
     const btn = $(`#${btnId}`);
     if (!btn) return;
     btn.addEventListener('click', () => {
       const c = currentChat();
       if (!c || c.modality !== 'agent') return;
-      c[fieldName] = !c[fieldName];
-      btn.setAttribute('aria-pressed', c[fieldName] ? 'true' : 'false');
-      if (c[fieldName]) {
-        for (const o of opposing) {
-          c[o.field] = false;
-          const oBtn = $(`#${o.btnId}`);
-          if (oBtn) oBtn.setAttribute('aria-pressed', 'false');
-        }
+      if (c[fieldName]) return; // already on — clicking again would deselect
+      c[fieldName] = true;
+      btn.setAttribute('aria-pressed', 'true');
+      for (const o of opposing) {
+        c[o.field] = false;
+        const oBtn = $(`#${o.btnId}`);
+        if (oBtn) oBtn.setAttribute('aria-pressed', 'false');
       }
       saveToStorage();
     });
@@ -1895,11 +1894,13 @@ function renderActiveChat() {
       }
     }
     if (isAgent) {
-      // Mutex safety. If a legacy chat had multiple of plan/approval/noApproval
-      // on, prefer the safest one (planMode > approvalMode > noApproval) and
-      // clear the others.
+      // Mutex safety. Exactly ONE of plan / approval / noApproval is always on.
+      // If a legacy chat (or a brand-new one) has none of them set, default to
+      // Plan — the safest posture. If multiple are on, prefer the safest in
+      // the order Plan > Approval > NoApproval and clear the others.
       if (c.planMode) { c.approvalMode = false; c.noApproval = false; }
       else if (c.approvalMode) { c.noApproval = false; }
+      else if (!c.noApproval) { c.planMode = true; }
       $('#toggle-plan').setAttribute('aria-pressed', c.planMode ? 'true' : 'false');
       $('#toggle-approval').setAttribute('aria-pressed', c.approvalMode ? 'true' : 'false');
       $('#toggle-noapproval').setAttribute('aria-pressed', c.noApproval ? 'true' : 'false');
@@ -2072,6 +2073,11 @@ function renderEmptyState() {
     // Vision is auto-routed (a vision router runs when you attach an image);
     // it has no user-facing modality, so don't surface it as a chip.
     if (key === 'vision') continue;
+    // Cloud picks aren't a modality — they're cross-cutting models that work
+    // in either chat or agent. The empty-state chips are about picking a
+    // STARTING modality, so don't show a "Cloud Models" chip here; users
+    // switch to Claude via the model picker instead.
+    if (key === 'cloud') continue;
     const chip = document.createElement('button');
     chip.className = 'chip';
     chip.textContent = cat.label;
@@ -2314,6 +2320,8 @@ function wireInstallBanner() {
       installOllama(banner);
     } else if (action === 'start-ollama') {
       startOllama(banner);
+    } else if (action === 'open-settings') {
+      openSettings();
     }
   });
 }
@@ -2352,6 +2360,24 @@ function renderInstallBanner() {
 
   // 3) Per-model install banner
   const tag = c.model;
+  // Cloud picks aren't "installed" — they're API-key-gated. Show a focused
+  // setup banner if the key is missing, otherwise hide the banner entirely.
+  // Without this, switching the chat to claude-opus-4-8 made the banner say
+  // "isn't installed — Install model" which both failed (no Ollama tag) and
+  // hid the real fix (set the API key in Settings).
+  const tagPick = findPick(tag);
+  if (tagPick && pickProvider(tagPick) !== 'ollama') {
+    if (pickReady(tagPick)) { banner.hidden = true; banner.innerHTML = ''; return; }
+    banner.hidden = false;
+    banner.innerHTML = `
+      <div class="ib-text">
+        <strong>${escapeHtml(tagPick.name)}</strong> needs an API key.
+        <span class="sub">Add your ${escapeHtml(pickProvider(tagPick) === 'anthropic' ? 'Anthropic' : pickProvider(tagPick))} key in Settings → API Keys, then send your message.</span>
+      </div>
+      <button type="button" data-action="open-settings">Open Settings</button>
+    `;
+    return;
+  }
   if (state.installed.has(tag)) { banner.hidden = true; banner.innerHTML = ''; return; }
 
   // In-flight pull (downloading or paused) — show progress + pause/cancel.
@@ -2880,7 +2906,11 @@ function wireComposer() {
   const input = $('#composer-input');
   input.addEventListener('input', () => {
     input.style.height = 'auto';
-    input.style.height = Math.min(input.scrollHeight, 240) + 'px';
+    // 5 lines × ~21.75px line-height + ~14px vertical padding ≈ 130px. Past
+    // that the textarea scrolls internally instead of growing. Matches the
+    // CSS max-height so the cap is consistent whether you grew into it by
+    // typing or pasted in a long block.
+    input.style.height = Math.min(input.scrollHeight, 130) + 'px';
   });
   input.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); form.requestSubmit(); }
