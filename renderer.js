@@ -319,8 +319,15 @@ function allPicks() {
 
 function modalityForModel(modelId) {
   if (!state.catalog || !modelId) return 'chat';
+  // Must check tag / model_id / id / file — cloud picks have NO `tag` (they
+  // use `model_id` and `id`). Missing this was the v0.3.x send-broken bug:
+  // modalityForModel('claude-opus-4-8') returned the 'chat' default, then
+  // backendForModel returned 'ollama', then dispatchSend hit the install-
+  // check gate and silently bailed. Send animated but nothing happened.
   for (const [key, cat] of Object.entries(state.catalog.categories)) {
-    if (cat.picks.some(p => (p.tag || p.file) === modelId)) return key;
+    if (cat.picks.some(p => (p.tag || p.model_id || p.id || p.file) === modelId || p.id === modelId)) {
+      return key;
+    }
   }
   return 'chat';
 }
@@ -1656,7 +1663,9 @@ function populateModelPicker() {
 
   const activeChat = currentChat();
   const activeModel = activeChat?.model;
-  const activePick = allPicks().find(p => (p.tag || p.file) === activeModel);
+  // Same canonical lookup as elsewhere so the picker shows the friendly name
+  // ("Claude Opus 4.8") for cloud picks instead of the raw model id.
+  const activePick = findPick(activeModel);
   current.textContent = activePick?.name || activeModel || 'Select a model';
 
   // Build menu items
