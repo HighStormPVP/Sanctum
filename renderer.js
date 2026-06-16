@@ -3391,18 +3391,24 @@ ollama pull qwen2.5vl:7b
       }
       if (chunk.error) {
         // Surface the actual provider error verbatim so the user can see WHY
-        // it failed (bad API key, model not found, rate limit, etc.) instead
-        // of a vague "didn't work". friendlyOllamaError handles Ollama-shaped
-        // errors and falls through unchanged on others — for cloud picks we
-        // prepend a clear header so the user knows which API rejected them.
+        // it failed. Ollama-specific friendlyOllamaError rewrites only apply
+        // when the failing call WAS to Ollama — running them on a cloud error
+        // produces nonsense like 'Anthropic API error. Couldn't reach
+        // Ollama.' when an Anthropic request's `fetch failed` is rewritten by
+        // the Ollama-flavoured matcher.
         const cloudPick = findPick(effectiveModel);
         const cloudProv = pickProvider(cloudPick);
         const isCloudErr = cloudProv !== 'ollama';
         const provLabel = cloudProv === 'anthropic' ? 'Anthropic' : cloudProv === 'google' ? 'Google' : cloudProv;
-        const raw = friendlyOllamaError(chunk.error, c);
-        acc = isCloudErr
-          ? `**${provLabel} API error.** ${raw}\n\n_Double-check your API key in **Settings → API Keys**, and confirm the model id is current. Full error text above._`
-          : raw;
+        const rawErr = String(chunk.error || '');
+        if (isCloudErr) {
+          const hint = /fetch failed|ECONNREFUSED|ENETUNREACH|EAI_AGAIN/i.test(rawErr)
+            ? `\n\n_Network error — check your internet connection. If your machine is online, ${provLabel}'s API may be having a brief outage; try again in a minute._`
+            : `\n\n_Double-check your API key in **Settings → API Keys**, and confirm the model id is current._`;
+          acc = `**${provLabel} API error.** ${rawErr}${hint}`;
+        } else {
+          acc = friendlyOllamaError(chunk.error, c);
+        }
         assistantMsg.content = acc;
         assistantMsg.thinking = false;
         aborted = true;
@@ -4930,9 +4936,15 @@ function renderMarkdown(text) {
   // and equations — without this they leak through as raw backslash macros.
   src = renderMathLite(src);
 
-  // 4. Bold + italic + links.
+  // 4. Bold + italic + links. CommonMark supports both asterisk AND underscore
+  // delimiters: **bold** / __bold__ and *italic* / _italic_. Gemini (and some
+  // Anthropic responses) reach for the underscore form — without these rules
+  // the user sees raw _underscores_ around text. The underscore patterns use
+  // word-boundary lookarounds so we don't mangle identifiers like snake_case.
   src = src.replace(/\*\*([^*\n]+?)\*\*/g, '<strong>$1</strong>');
+  src = src.replace(/(^|[^\w])__([^_\n]+?)__(?=[^\w]|$)/g, '$1<strong>$2</strong>');
   src = src.replace(/(^|[^*])\*([^*\n]+?)\*(?!\*)/g, '$1<em>$2</em>');
+  src = src.replace(/(^|[^\w])_([^_\n]+?)_(?=[^\w]|$)/g, '$1<em>$2</em>');
   src = src.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (m, txt, url) => {
     if (!/^https?:\/\//.test(url)) return m;
     return `<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">${txt}</a>`;
