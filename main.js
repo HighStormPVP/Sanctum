@@ -547,6 +547,23 @@ function toAnthropicMessages(messages) {
   return { system: sys.join('\n\n').trim() || undefined, messages: out };
 }
 
+// Translate the renderer's boolean thinking_enabled into the Anthropic-native
+// shape, which differs by model family:
+//   Opus 4.x / Sonnet 4.6  → {type: "adaptive"}  (omit when off — both work)
+//   Haiku 4.5              → {type: "enabled", budget_tokens: N}  (manual only)
+// Anything else → no thinking param.
+function anthropicThinkingParam(model, enabled) {
+  if (!enabled) return null;
+  if (/^claude-haiku/i.test(model)) {
+    // Haiku 4.5 manual budget. budget_tokens must be < max_tokens (we send
+    // 64000). 10K is generous for a Haiku reasoning pass without dominating
+    // the response budget.
+    return { type: 'enabled', budget_tokens: 10000 };
+  }
+  // Opus 4.x, Sonnet 4.6, and Fable 5 family all accept adaptive.
+  return { type: 'adaptive' };
+}
+
 async function streamAnthropic({ apiKey, model, messages, tools, options, controller, evt, channelId, dlog }) {
   const { system, messages: anthropicMsgs } = toAnthropicMessages(messages);
   const body = {
@@ -561,6 +578,8 @@ async function streamAnthropic({ apiKey, model, messages, tools, options, contro
   if (system) body.system = system;
   const tdef = toAnthropicTools(tools);
   if (tdef) body.tools = tdef;
+  const tparam = anthropicThinkingParam(model, options?.thinking_enabled);
+  if (tparam) body.thinking = tparam;
 
   const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
@@ -750,15 +769,38 @@ function toGeminiContents(messages) {
   return { systemInstruction: sysParts.length ? { parts: [{ text: sysParts.join('\n\n') }] } : undefined, contents: out };
 }
 
+// Translate thinking_enabled into Gemini's thinkingConfig:
+//   3.1 Pro   → always-on (LOW is the floor). thinking_level: HIGH if enabled,
+//               LOW if disabled — gives the user a meaningful 'cheaper' toggle
+//               even though it's never fully off.
+//   3.5 Flash / 3.1 Flash-Lite → thinking_budget: 0 disables; otherwise
+//               thinking_level: HIGH for full reasoning.
+function geminiThinkingConfig(model, enabled) {
+  const isPro = /pro/i.test(model);
+  if (isPro) {
+    return { thinking_level: enabled ? 'HIGH' : 'LOW' };
+  }
+  // Flash / Flash-Lite family
+  if (!enabled) return { thinking_budget: 0 };
+  return { thinking_level: 'HIGH' };
+}
+
 async function streamGoogle({ apiKey, model, messages, tools, options, controller, evt, channelId, dlog }) {
   const { systemInstruction, contents } = toGeminiContents(messages);
   const body = { contents };
   if (systemInstruction) body.systemInstruction = systemInstruction;
   const gtools = toGeminiTools(tools);
   if (gtools) body.tools = gtools;
-  if (options?.max_tokens) {
-    body.generationConfig = { maxOutputTokens: options.max_tokens };
+  const generationConfig = {};
+  if (options?.max_tokens) generationConfig.maxOutputTokens = options.max_tokens;
+  // Always include the thinking config so the user's toggle reaches the API;
+  // 'thinking_enabled' is boolean from the renderer and undefined for callers
+  // that don't care. Skip the param when undefined (non-thinking-capable
+  // models would 400 on an unknown field on older Flash builds).
+  if (options?.thinking_enabled !== undefined) {
+    generationConfig.thinkingConfig = geminiThinkingConfig(model, !!options.thinking_enabled);
   }
+  if (Object.keys(generationConfig).length) body.generationConfig = generationConfig;
 
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse&key=${encodeURIComponent(apiKey)}`;
   const res = await fetch(url, {

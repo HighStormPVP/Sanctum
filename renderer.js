@@ -3223,9 +3223,18 @@ async function _runOllamaChatInner(c, attachments) {
 
   // Qwen3 thinking-mode soft switch — append /think or /no_think to the
   // latest user turn. The model honours the most recent directive in history.
+  // GATE: this is Qwen3-SPECIFIC. Cloud models (Claude / Gemini) have native
+  // thinking parameters in their APIs — sending them '/think' as plain text
+  // makes them explain what the tag would mean (a confused-bystander
+  // response) instead of actually thinking. Cloud thinking is wired through
+  // payload.options.thinking_enabled below and translated to provider-
+  // native params in main.js.
   if (modelSupportsThinking(c.model) && history.length) {
-    const directive = c.thinkingEnabled ? ' /think' : ' /no_think';
-    history[history.length - 1].content = (history[history.length - 1].content || '') + directive;
+    const _thinkingPick = findPick(c.model);
+    if (pickProvider(_thinkingPick) === 'ollama') {
+      const directive = c.thinkingEnabled ? ' /think' : ' /no_think';
+      history[history.length - 1].content = (history[history.length - 1].content || '') + directive;
+    }
   }
   let imageAttachments = (attachments || []).filter(a => a.kind === 'image');
   let imgs = imageAttachments.map(a => a.base64);
@@ -3337,7 +3346,11 @@ ollama pull qwen2.5vl:7b
           apiKey: state.settings.apiKeys?.[provider] || '',
           model: pick?.model_id || effectiveModel,
           messages: history,
-          tools: tools || undefined
+          tools: tools || undefined,
+          // Forwarded to streamAnthropic / streamGoogle which translate it to
+          // the provider-native thinking parameter. Only meaningful when the
+          // pick is thinking_capable; ignored otherwise.
+          options: { thinking_enabled: !!c.thinkingEnabled }
         }
       : { model: effectiveModel, messages: history };
     if (!isCloud) {

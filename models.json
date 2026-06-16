@@ -30,18 +30,20 @@
           "name": "Claude Haiku 4.5",
           "provider": "anthropic",
           "model_id": "claude-haiku-4-5",
-          "why": "Fastest Claude tier — quick conversational answers and low-latency tool calls. Requires an Anthropic API key.",
+          "why": "Fastest Claude tier — quick conversational answers and low-latency tool calls. First Haiku with extended thinking (manual budget, no adaptive). Requires an Anthropic API key.",
           "context": 200000,
-          "tools_capable": true
+          "tools_capable": true,
+          "thinking_capable": true
         },
         {
           "id": "gemini-3-1-pro-preview",
           "name": "Gemini 3.1 Pro (Preview)",
           "provider": "google",
           "model_id": "gemini-3.1-pro-preview",
-          "why": "Google's most advanced model — reasoning-first design optimized for complex agentic workflows and coding. Preview status. Requires a Google AI Studio API key.",
+          "why": "Google's most advanced model — reasoning-first design optimized for complex agentic workflows and coding. Preview status. Thinking is always on (LOW is the floor). Requires a Google AI Studio API key.",
           "context": 1048576,
-          "tools_capable": true
+          "tools_capable": true,
+          "thinking_capable": true
         },
         {
           "id": "gemini-3-5-flash",
@@ -50,7 +52,8 @@
           "model_id": "gemini-3.5-flash",
           "why": "GA Flash model — the most intelligent Flash tier for sustained frontier performance on agentic and coding tasks. Great default cloud pick that balances cost and quality. Requires a Google AI Studio API key.",
           "context": 1048576,
-          "tools_capable": true
+          "tools_capable": true,
+          "thinking_capable": true
         },
         {
           "id": "gemini-3-1-flash-lite",
@@ -59,7 +62,8 @@
           "model_id": "gemini-3.1-flash-lite",
           "why": "The most cost-efficient Gemini — optimized for low-latency, high-volume traffic. Pick this when you want a cheap fast cloud answer. Requires a Google AI Studio API key.",
           "context": 1048576,
-          "tools_capable": true
+          "tools_capable": true,
+          "thinking_capable": true
         }
       ]
     },

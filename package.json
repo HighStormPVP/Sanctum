@@ -1,7 +1,7 @@
 {
   "name": "sanctum",
   "productName": "Sanctum",
-  "version": "0.3.7",
+  "version": "0.3.8",
   "description": "Sanctum — a private, fully-local AI workspace. Chat, vision, code, video analysis, and agentic tasks, all running on your own machine.",
   "main": "main.js",
   "scripts": {
