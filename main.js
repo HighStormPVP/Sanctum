@@ -16,6 +16,35 @@ function broadcastMcpUpdate() {
 
 const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434';
 
+// Pick the shell that run_command / run_command_async will spawn. On Windows
+// we prefer Git Bash if it's installed so the agent can write POSIX-style
+// commands (forward slashes, &&, heredocs, $VAR) — same syntax as macOS /
+// Linux. Falls back to cmd.exe if Git Bash isn't there. Detected once at
+// boot; renderer reads the label via shell:info.
+function detectShell() {
+  try {
+    if (process.platform === 'win32') {
+      const candidates = [
+        'C:\\Program Files\\Git\\bin\\bash.exe',
+        'C:\\Program Files (x86)\\Git\\bin\\bash.exe'
+      ];
+      for (const p of candidates) {
+        try { if (fs.statSync(p).isFile()) return { name: 'Bash', path: p }; } catch {}
+      }
+      return { name: 'Cmd', path: 'cmd.exe' };
+    }
+    return { name: 'Bash', path: '/bin/sh' };
+  } catch {
+    // Don't crash main process boot over shell detection — fall back to
+    // platform defaults.
+    return process.platform === 'win32'
+      ? { name: 'Cmd', path: 'cmd.exe' }
+      : { name: 'Bash', path: '/bin/sh' };
+  }
+}
+const SHELL = detectShell();
+ipcMain.handle('shell:info', () => ({ name: SHELL.name, path: SHELL.path }));
+
 // Register custom protocol for cached media (must run before app ready)
 protocol.registerSchemesAsPrivileged([
   { scheme: 'aio-media', privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true } }
@@ -1035,10 +1064,11 @@ ipcMain.handle('shell:run_async', async (_e, { command, cwd, allowlist }) => {
       return { error: `cwd "${cwd}" outside allowed roots` };
     }
     const taskId = 'task_' + (nextTaskId++);
-    const isWin = process.platform === 'win32';
     const proc = spawn(command, [], {
       cwd: wd,
-      shell: isWin ? 'cmd.exe' : '/bin/sh',
+      // Same resolved shell as sync shell:run — Git Bash on Windows if
+      // installed, else cmd.exe.
+      shell: SHELL.path,
       windowsHide: true
     });
     const task = {
@@ -1839,12 +1869,13 @@ ipcMain.handle('fs:grep', async (_e, { pattern, root, glob: globFilter, caseInse
 ipcMain.handle('shell:run', async (_e, { command, cwd }) => {
   return new Promise((resolve) => {
     const wd = cwd ? resolveSafe(cwd) : os.homedir();
-    const isWin = process.platform === 'win32';
     exec(command, {
       cwd: wd,
       timeout: 60_000,
       maxBuffer: 4 * 1024 * 1024,
-      shell: isWin ? 'cmd.exe' : '/bin/sh',
+      // SHELL is the resolved shell at boot — Git Bash on Windows when it's
+      // installed, else cmd.exe; /bin/sh on macOS/Linux.
+      shell: SHELL.path,
       windowsHide: true
     }, (err, stdout, stderr) => {
       resolve({

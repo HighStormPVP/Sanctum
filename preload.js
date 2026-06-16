@@ -1,6 +1,36 @@
 const { contextBridge, ipcRenderer, webUtils } = require('electron');
 
+// Detect the actual shell the agent's run_command tool will spawn. Mirrors
+// the main.js probe so the renderer can label tool events from the very
+// first frame (before the shell:info IPC roundtrip completes).
+// Wrapped in a top-level try/catch so a failure here can NEVER strand the
+// rest of contextBridge.exposeInMainWorld — that would leave window.api
+// undefined and the entire renderer dead on boot (no chats, no Ollama, no
+// clickable buttons). A safe default is good enough.
+let SHELL_INFO = { name: process.platform === 'win32' ? 'Cmd' : 'Bash', path: '' };
+try {
+  const fsLocal = require('fs');
+  if (process.platform === 'win32') {
+    const candidates = [
+      'C:\\Program Files\\Git\\bin\\bash.exe',
+      'C:\\Program Files (x86)\\Git\\bin\\bash.exe'
+    ];
+    for (const p of candidates) {
+      try { if (fsLocal.statSync(p).isFile()) { SHELL_INFO = { name: 'Bash', path: p }; break; } } catch {}
+    }
+  } else {
+    SHELL_INFO = { name: 'Bash', path: '/bin/sh' };
+  }
+} catch (e) {
+  // Keep the platform default — better than crashing preload.
+}
+
 contextBridge.exposeInMainWorld('api', {
+  // Platform identifier the renderer can read synchronously.
+  platform: process.platform,
+  // The resolved shell the agent's run_command will spawn (name = display
+  // label, path = full binary path).
+  shell: SHELL_INFO,
   config: () => ipcRenderer.invoke('config:get'),
   catalog: () => ipcRenderer.invoke('models:catalog'),
 

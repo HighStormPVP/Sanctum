@@ -200,11 +200,26 @@ function createChat(modelOverride, modalityOverride, extraFields) {
 // Spin up an Agent-modality chat with Plan + Approval modes enabled by default.
 function createAgenticChat() {
   if (!state.catalog) return;
-  const picks = state.catalog.categories.agent?.picks || [];
-  // Prefer an already-installed agent model; fall back to the first listed.
-  const installedPick = picks.find(p => p.tag && state.installed.has(p.tag));
-  const fallback = picks[0];
-  const model = (installedPick || fallback)?.tag;
+  // 1) Keep whatever model the user has selected, as long as it's tools-capable
+  //    AND usable right now (installed for Ollama / API key set for cloud).
+  //    Picking "New Agentic Chat" while on Claude Opus shouldn't silently
+  //    swap to Qwen3 — the user already chose a capable model.
+  // 2) Fall back to the agent catalog: prefer an installed Ollama pick over
+  //    the first listed.
+  let model = null;
+  const curModel = currentChat()?.model;
+  if (curModel) {
+    const curPick = findPick(curModel);
+    if (curPick && modelSupportsTools(curModel) && pickReady(curPick)) {
+      model = curPick.tag || curPick.model_id || curPick.id;
+    }
+  }
+  if (!model) {
+    const picks = state.catalog.categories.agent?.picks || [];
+    const installedPick = picks.find(p => p.tag && state.installed.has(p.tag));
+    const fallback = picks[0];
+    model = (installedPick || fallback)?.tag;
+  }
   if (!model) return;
   createChat(model, 'agent', {
     planMode: true,             // safer default — plan first, no execution
@@ -1087,6 +1102,24 @@ function wireSidebar() {
   $('#new-agentic-chat').addEventListener('click', () => createAgenticChat());
   $('#open-models').addEventListener('click', () => switchView('models'));
   $('#open-settings').addEventListener('click', () => openSettings());
+
+  // Sidebar collapse — persisted across sessions via state.settings.
+  const toggleBtn = $('#sidebar-toggle');
+  const app = document.querySelector('.app');
+  if (toggleBtn && app) {
+    if (state.settings.sidebarCollapsed) {
+      app.classList.add('sidebar-collapsed');
+      toggleBtn.title = 'Show sidebar';
+      toggleBtn.setAttribute('aria-label', 'Show sidebar');
+    }
+    toggleBtn.addEventListener('click', () => {
+      const collapsed = app.classList.toggle('sidebar-collapsed');
+      state.settings.sidebarCollapsed = collapsed;
+      saveSettings();
+      toggleBtn.title = collapsed ? 'Show sidebar' : 'Hide sidebar';
+      toggleBtn.setAttribute('aria-label', collapsed ? 'Show sidebar' : 'Hide sidebar');
+    });
+  }
 }
 
 function wireAgentBar() {
@@ -2260,7 +2293,62 @@ function renderMessage(m) {
   return el;
 }
 
+// Friendly display labels for each tool — match the Claude Code aesthetic
+// (single capitalized word per tool). Falls back to the raw name for unknown
+// tools (e.g. MCP-provided ones get their own name verbatim).
+const TOOL_LABELS = {
+  read_file: 'Read',
+  list_dir: 'List',
+  write_file: 'Write',
+  apply_patch: 'Edit',
+  glob: 'Glob',
+  grep: 'Grep',
+  web_search: 'Search',
+  web_fetch: 'Fetch',
+  calc: 'Calc',
+  task_status: 'Task',
+  task_list: 'Tasks',
+  task_kill: 'Kill',
+  mcp_list_servers: 'MCP',
+  mcp_add_server: 'MCP add',
+  mcp_remove_server: 'MCP remove',
+  exit_plan_mode: 'Plan',
+  describe_image: 'Vision'
+};
+
 function renderToolEvent(ev) {
+  // Shell commands get the full Claude-Code-style card with a header row +
+  // IN/OUT box. Everything else gets a compact header line that shows the
+  // status dot, the tool label, the relevant argument (file path / URL /
+  // query), and the status text on the right — same family of designs, no
+  // pill chip anywhere.
+  if (ev.name === 'run_command' || ev.name === 'run_command_async') {
+    return renderShellToolEvent(ev);
+  }
+  return renderCompactToolEvent(ev);
+}
+
+function renderCompactToolEvent(ev) {
+  const el = document.createElement('div');
+  el.className = `tool-event te-row ${ev.status || 'done'}`;
+  const label = TOOL_LABELS[ev.name] || ev.name;
+  const argSummary = ev.argSummary || '';
+  let statusText;
+  if (ev.status === 'running') statusText = 'running';
+  else if (ev.status === 'error') statusText = ev.resultSummary ? `error · ${ev.resultSummary}` : 'error';
+  else statusText = ev.resultSummary || 'done';
+  el.innerHTML = `
+    <span class="te-shell-dot"></span>
+    <span class="te-shell-label">${escapeHtml(label)}</span>
+    <span class="te-shell-summary">${escapeHtml(argSummary)}</span>
+    <span class="te-shell-status">${escapeHtml(statusText)}</span>
+  `;
+  return el;
+}
+
+// Legacy pill renderer — kept for any path I might have missed, but the
+// dispatcher above routes through the new compact / shell renderers.
+function renderToolEventLegacyPill(ev) {
   const el = document.createElement('div');
   el.className = `tool-event ${ev.status || 'done'}`;
   const argSummary = ev.argSummary || '';
@@ -2311,6 +2399,49 @@ function renderToolEvent(ev) {
     <span class="te-name">${escapeHtml(prettyName)}</span>
     <span class="te-arg">${escapeHtml(argSummary)}</span>
     <span class="te-status">${escapeHtml(statusText)}</span>
+  `;
+  return el;
+}
+
+// Claude Code / VS Code style shell-command card. Header row with a status
+// dot + tool name + truncated command, then a bordered IN/OUT box that shows
+// the full command and the captured stdout/stderr (truncated to 4 KB upstream).
+function renderShellToolEvent(ev) {
+  const el = document.createElement('div');
+  el.className = `tool-event te-shell ${ev.status || 'done'}`;
+  const isAsync = ev.name === 'run_command_async';
+  // Use the shell the main process actually resolved — Git Bash if available
+  // on Windows, else cmd.exe; /bin/sh on macOS/Linux. preload exposes this
+  // synchronously so the label is right from the first render.
+  const shellName = window.api?.shell?.name || (window.api?.platform === 'win32' ? 'Cmd' : 'Bash');
+  const label = isAsync ? `${shellName} · async` : shellName;
+  const cmd = ev.input || ev.argSummary || '';
+  const truncatedCmd = cmd.length > 200 ? cmd.slice(0, 200) + '…' : cmd;
+  const statusText = ev.status === 'running'
+    ? 'running'
+    : (ev.status === 'error'
+        ? (ev.resultSummary ? `error · ${escapeHtml(ev.resultSummary)}` : 'error')
+        : (ev.resultSummary ? escapeHtml(ev.resultSummary) : 'done'));
+  const out = ev.output || '';
+  const showOut = ev.status !== 'running' && out.length > 0;
+  el.innerHTML = `
+    <div class="te-shell-head">
+      <span class="te-shell-dot"></span>
+      <span class="te-shell-label">${escapeHtml(label)}</span>
+      <span class="te-shell-summary">${escapeHtml(truncatedCmd)}</span>
+      <span class="te-shell-status">${statusText}</span>
+    </div>
+    <div class="te-shell-io">
+      <div class="te-shell-row">
+        <span class="te-shell-tag">IN</span>
+        <pre class="te-shell-text">${escapeHtml(cmd)}</pre>
+      </div>
+      ${showOut ? `
+      <div class="te-shell-row">
+        <span class="te-shell-tag">OUT</span>
+        <pre class="te-shell-text">${escapeHtml(out)}</pre>
+      </div>` : ''}
+    </div>
   `;
   return el;
 }
@@ -3505,12 +3636,29 @@ ollama pull qwen2.5vl:7b
         argSummary: summarizeArgs(name, args),
         status: 'running'
       };
+      // Capture the raw command up-front for shell tools so the IN box can
+      // show it even before the call completes (running state).
+      if (name === 'run_command' || name === 'run_command_async') {
+        ev.input = toStringArg(args?.command);
+      }
       assistantMsg.toolEvents.push(ev);
       patchLastMessage(assistantMsg);
 
       const { result, summary, ok } = await executeTool(name, args);
       ev.status = ok ? 'done' : 'error';
       ev.resultSummary = summary;
+      // Stash shell output (stdout/stderr) on the event so the OUT box can
+      // render it. Truncate to keep the bubble manageable — full content is
+      // already in the tool-result message in `history` for the model.
+      if (name === 'run_command' || name === 'run_command_async') {
+        const stdout = (result && typeof result === 'object' && result.stdout) || '';
+        const stderr = (result && typeof result === 'object' && result.stderr) || '';
+        const combined = [stdout, stderr ? `[stderr]\n${stderr}` : ''].filter(Boolean).join('\n');
+        ev.output = combined.length > 4000 ? combined.slice(0, 4000) + `\n… (${combined.length - 4000} more chars)` : combined;
+        if (result && typeof result === 'object' && typeof result.exitCode === 'number') {
+          ev.exitCode = result.exitCode;
+        }
+      }
       patchLastMessage(assistantMsg);
 
       // Capture the tool_call_id (Anthropic) and tool_name (Gemini) so cloud
@@ -3620,6 +3768,7 @@ const TOOL_DEFS = {
   mcp_list_servers: { type: 'function', function: { name: 'mcp_list_servers', description: 'List all configured Model Context Protocol (MCP) servers and their status (ready / starting / error / stopped) along with the tools each exposes. Useful to see what external integrations (Blender, Playwright, etc.) are currently available.', parameters: { type: 'object', properties: {} } } },
   mcp_add_server:   { type: 'function', function: { name: 'mcp_add_server', description: 'Register and start a new MCP server. Pass `name` (your label), `command` (the executable e.g. "npx", "uvx", "python"), optional `args` (array of arguments), and optional `env` (object of env vars). The server spawns immediately and its tools become available to you on the next turn. REQUIRES USER APPROVAL since it executes a local subprocess.', parameters: { type: 'object', properties: { name: { type: 'string', description: 'Server name (used for tool prefix mcp__<name>__<tool>).' }, command: { type: 'string', description: 'Executable to run, e.g. "npx" or "uvx".' }, args: { type: 'array', items: { type: 'string' }, description: 'Args array, e.g. ["-y", "@playwright/mcp@latest"].' }, env: { type: 'object', description: 'Extra environment variables {KEY: VALUE}.' } }, required: ['name', 'command'] } } },
   mcp_remove_server: { type: 'function', function: { name: 'mcp_remove_server', description: 'Stop and delete a configured MCP server by name. Frees its config slot; its tools will no longer appear. REQUIRES USER APPROVAL.', parameters: { type: 'object', properties: { name: { type: 'string' } }, required: ['name'] } } },
+  exit_plan_mode: { type: 'function', function: { name: 'exit_plan_mode', description: 'Exit Plan Mode by surfacing your plan to the user for approval. The user sees the plan in a modal with Approve / Reject buttons. On Approve the chat flips to Approval Mode and you can execute (each write tool still pops a per-call approval). On Reject the tool returns "rejected by user" and you stay in Plan Mode — refine the plan and call again when ready. ONLY call this when your plan is complete and ready for the user to review.', parameters: { type: 'object', properties: { plan: { type: 'string', description: 'The full plan, written as numbered steps with the tools you intend to call, files/state that will be touched, and any risks. Markdown is rendered.' } }, required: ['plan'] } } },
 };
 
 const WEB_SEARCH_PROMPT = `You have a web_search tool that returns live results from the public web (DuckDuckGo). Use it WITHOUT being asked whenever the user's question depends on information you cannot answer with confidence from your training:
@@ -3685,17 +3834,19 @@ When the user says "the project folder" or "this folder", they mean: ${c.project
 
 const PLAN_MODE_PROMPT = `PLAN MODE IS ACTIVE.
 
-You are in Plan Mode. Your job is to PLAN, not execute. You MUST NOT call any tools while Plan Mode is on — not now, not after the user asks again, not even if they insist, complain, or get frustrated. Plan Mode and Approval Mode are mutually exclusive: Plan Mode is for designing the plan; Approval Mode is what the user must switch to in order to actually execute it (with per-call approval).
+You are in Plan Mode. READ-ONLY tools (read_file, list_dir, glob, grep, web_search, web_fetch, calc, mcp_list_servers, task_status, task_list) ARE allowed — use them freely to investigate the codebase, gather evidence, and ground your plan in facts. WRITE tools (write_file, apply_patch, run_command, run_command_async, mcp_add_server, mcp_remove_server, task_kill) are BLOCKED by the executor; calling them returns an error. Do not bother calling them yet.
 
-For every user request, respond with:
-1. A numbered list of each step you would take.
-2. For each step, name the specific tool you would call and the key arguments.
-3. Potential risks, side effects, and files/state that would be touched.
-4. End with this exact line: "Plan Mode is on — I won't execute any of this. To run this plan, toggle off Plan Mode and toggle on Approval Mode in the safety bar; I'll then execute it step by step, asking you to approve each tool call."
+Your workflow:
 
-If the user pushes you to "just do it" / "go ahead" / "stop planning" / "run it anyway" / anything similar, DO NOT call tools. Calmly explain that Plan Mode is read-only by design and they must switch to Approval Mode to execute. Then offer to refine the plan instead.
+1. Investigate first. Use the read tools to map out the relevant code, files, and state. Do not guess — go look.
+2. Draft a concrete plan. A numbered list of steps, each naming the specific tool you'll call and the key arguments, plus the files/state that would be touched and any risks.
+3. When the plan is ready for the user to review, call \`exit_plan_mode\` with the plan text. This pops a modal showing the user your plan with Approve / Reject buttons.
+   - On Approve: the chat flips to Approval Mode and you can start executing. Each write tool call will still require per-call approval — that's by design.
+   - On Reject: the tool returns "rejected by user". Refine the plan and call \`exit_plan_mode\` again when ready.
 
-You may revise the plan when asked. You may answer questions about the plan. You may NOT take action while Plan Mode is on.`;
+Do NOT write the plan as chat text and ask the user to manually toggle modes — call \`exit_plan_mode\` so the formal approval gate fires.
+
+If the user pushes you to "just do it" / "go ahead" / "stop planning" before you've called \`exit_plan_mode\`, explain that the formal gate is the only way to start writing and offer to surface your plan via \`exit_plan_mode\` now.`;
 
 // Auto-route: given the user's current chat/agent model, find the tier-matched
 // model in another category. So "smartest chat" → "smartest image", etc.
@@ -3741,6 +3892,12 @@ function buildTools(modality, webEnabled, modelId, chat) {
       tools.push(TOOL_DEFS.mcp_list_servers, TOOL_DEFS.mcp_add_server, TOOL_DEFS.mcp_remove_server);
     } else {
       tools.push(TOOL_DEFS.mcp_list_servers);
+    }
+    // Plan Mode: also expose exit_plan_mode so the agent can formally end
+    // the planning phase. Writes still go through the executor-level gate
+    // (executeToolImpl returns an error for them while planMode is on).
+    if (chat?.planMode) {
+      tools.push(TOOL_DEFS.exit_plan_mode);
     }
     // Tools exposed by user-configured MCP servers (Blender, Playwright, etc.)
     // appear here too. The cache is refreshed from main on every status/tools
@@ -3822,6 +3979,48 @@ async function executeToolImpl(name, args) {
       skipApproval = true;
       approvalDecision = 'pre-approved';
     }
+  }
+
+  // Plan Mode: write-class tools are blocked at the executor until the user
+  // approves an exit_plan_mode call. Reads/searches/fetches/inspections pass
+  // through unchanged so the model can ground its plan in real evidence.
+  // exit_plan_mode itself is handled below — it's the formal gate that lets
+  // the chat leave Plan Mode.
+  if (c?.planMode && name !== 'exit_plan_mode') {
+    const planBlocked = ['write_file', 'apply_patch', 'run_command', 'run_command_async', 'task_kill', 'mcp_add_server', 'mcp_remove_server'];
+    if (planBlocked.includes(name)) {
+      await window.api.audit.log({ ts: new Date().toISOString(), chat: c.id, model: c.model, tool: name, args, status: 'blocked-planmode', ok: false });
+      return { result: { error: 'Plan Mode is on — write tools are blocked. Call exit_plan_mode(plan) to surface your plan to the user for approval; on approve the chat flips to Approval Mode and you can execute.' }, summary: 'plan-mode', ok: false };
+    }
+  }
+
+  // exit_plan_mode: surface the plan to the user; on approve flip the chat
+  // from Plan Mode to Approval Mode and return success; on reject return an
+  // error so the model can refine and try again.
+  if (name === 'exit_plan_mode') {
+    if (!c?.planMode) {
+      return { result: { error: 'exit_plan_mode called while Plan Mode is off — nothing to exit. Just call the actual tools.' }, summary: 'not-in-plan-mode', ok: false };
+    }
+    const planText = toStringArg(args?.plan).trim();
+    if (!planText) {
+      return { result: { error: 'exit_plan_mode needs a non-empty `plan` argument with the plan text to show the user.' }, summary: 'bad args', ok: false };
+    }
+    const approved = await requestPlanApproval(planText);
+    if (!approved) {
+      await window.api.audit.log({ ts: new Date().toISOString(), chat: c.id, model: c.model, tool: name, args: { planLen: planText.length }, status: 'plan-rejected', ok: false });
+      return { result: { error: 'rejected by user — refine the plan and call exit_plan_mode again when ready.' }, summary: 'rejected', ok: false };
+    }
+    // Flip the chat into Approval Mode. Plan/Approval/NoApproval are mutex,
+    // so set the others off explicitly and re-render the safety bar so the
+    // toggles reflect the new state.
+    c.planMode = false;
+    c.approvalMode = true;
+    c.noApproval = false;
+    c.approvedPlan = planText;
+    saveToStorage();
+    try { renderActiveChat(); } catch {}
+    await window.api.audit.log({ ts: new Date().toISOString(), chat: c.id, model: c.model, tool: name, args: { planLen: planText.length }, status: 'plan-approved', ok: true });
+    return { result: { ok: true, message: 'Plan approved by user. The chat is now in Approval Mode — proceed to execute the plan step by step. Each write tool call will pop a per-call approval modal.' }, summary: 'plan approved', ok: true };
   }
 
   // Read-only enforcement (defence in depth — buildTools already strips these).
@@ -4087,6 +4286,45 @@ async function runWithPathExpansion(toolName, args, allow, runFn) {
     }
   }
   return await runFn(currentAllow);
+}
+
+// ============== PLAN APPROVAL MODAL ==============
+// Shown when the agent calls exit_plan_mode(plan). Returns a Promise<boolean>:
+// true on Approve, false on Reject / Escape / overlay click. The plan text is
+// rendered as markdown so numbered lists and inline code look right.
+function requestPlanApproval(planText) {
+  return new Promise((resolve) => {
+    const overlay  = $('#plan-approval-overlay');
+    const bodyEl   = $('#plan-approval-body');
+    const approve  = $('#plan-approval-approve');
+    const deny     = $('#plan-approval-deny');
+    if (!overlay || !bodyEl || !approve || !deny) { resolve(false); return; }
+
+    bodyEl.innerHTML = renderMarkdown(planText);
+    overlay.hidden = false;
+
+    let done = false;
+    const cleanup = (result) => {
+      if (done) return;
+      done = true;
+      overlay.hidden = true;
+      approve.removeEventListener('click', onYes);
+      deny.removeEventListener('click', onNo);
+      document.removeEventListener('keydown', onKey);
+      overlay.removeEventListener('click', onOverlay);
+      resolve(result);
+    };
+    const onYes = () => cleanup(true);
+    const onNo  = () => cleanup(false);
+    const onKey = (e) => { if (e.key === 'Escape') cleanup(false); };
+    const onOverlay = (e) => { if (e.target === overlay) cleanup(false); };
+
+    approve.addEventListener('click', onYes);
+    deny.addEventListener('click', onNo);
+    document.addEventListener('keydown', onKey);
+    overlay.addEventListener('click', onOverlay);
+    deny.focus();
+  });
 }
 
 // ============== APPROVAL MODAL ==============

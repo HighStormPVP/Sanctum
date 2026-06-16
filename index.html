@@ -35,6 +35,9 @@
       <div class="brand">
         <div class="brand-mark"><span class="brand-glyph">S</span></div>
         <div class="brand-name">Sanctum</div>
+        <button class="sidebar-toggle" id="sidebar-toggle" title="Hide sidebar" aria-label="Hide sidebar">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 6 9 12 15 18"/></svg>
+        </button>
       </div>
 
       <button class="new-chat new-agentic" id="new-agentic-chat" title="Start an agentic chat with Plan + Approval modes enabled by default">
@@ -282,6 +285,28 @@
         <button class="ghost-btn" id="pe-deny">Deny</button>
         <button class="ghost-btn" id="pe-once">Just this once</button>
         <button class="approval-approve" id="pe-folder">Allow this folder</button>
+      </footer>
+    </div>
+  </div>
+
+  <!-- PLAN APPROVAL MODAL -->
+  <div class="modal-overlay" id="plan-approval-overlay" hidden>
+    <div class="modal plan-approval-modal" role="dialog" aria-labelledby="plan-approval-title">
+      <header class="modal-head">
+        <div class="approval-head">
+          <div class="approval-warn plan">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 5H7a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-2"/><path d="M9 3h6v4H9z"/><path d="M9 12h6M9 16h4"/></svg>
+          </div>
+          <div class="approval-title-block">
+            <h2 id="plan-approval-title">Approve plan?</h2>
+            <p>The agent is proposing this plan. On Approve the chat flips to Approval Mode and execution begins — every write still pops a per-call approval. On Reject the agent stays in Plan Mode and refines.</p>
+          </div>
+        </div>
+      </header>
+      <div class="modal-body plan-approval-body" id="plan-approval-body"></div>
+      <footer class="approval-footer">
+        <button class="ghost-btn" id="plan-approval-deny">Reject</button>
+        <button class="approval-approve" id="plan-approval-approve">Approve &amp; switch to Approval Mode</button>
       </footer>
     </div>
   </div>
