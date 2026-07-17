@@ -18,6 +18,10 @@ const state = {
   cancelled: new Set(),   // tags currently being cancelled (transient — for cleanup branch)
   runningChats: new Map(),// chatId → { channelId, abortRequested } — drives the send/stop button
   pendingAttachments: [],
+  hardware: null,          // hw:detect result — probed lazily when Download opens
+  downloadCatalog: null,   // download-catalog.json — lazy-loaded, ~86 models
+  dlFilter: 'all',
+  dlQuery: '',
   settings: { instructions: '' },
   ollamaDetected: null,
   ollamaRunning: false,
@@ -68,6 +72,7 @@ const state = {
   wireVideoBubbleActions();
   wireDragDrop();
   wireSidebar();
+  wireFreezeWatchdog();
   wireComposer();
   wireAttachments();
   wireTitleEdit();
@@ -323,6 +328,136 @@ Title:`;
 }
 
 // ============== MODELS ==============
+// Main aborted a run because the machine locked up. Explain it in the chat —
+// a run that just stops with no reason reads like a bug.
+function wireFreezeWatchdog() {
+  if (!window.api.watchdog?.onFreezeAbort) return;
+
+  // Push the user's preference down to main on boot.
+  const wd = state.settings.watchdog || {};
+  window.api.watchdog.config({
+    enabled: wd.enabled !== false,
+    tripMs: wd.tripMs || 15000
+  }).catch(() => {});
+
+  window.api.watchdog.onFreezeAbort(({ stalledMs, freeGB, models, unloaded }) => {
+    const secs = Math.round(stalledMs / 1000);
+    const model = models?.[0];
+
+    // Mark every running chat as stopped — the streams are already dead.
+    for (const [chatId] of state.runningChats) {
+      const c = state.chats[chatId];
+      const last = c?.messages?.[c.messages.length - 1];
+      if (last && last.role === 'assistant') {
+        last.thinking = false;
+        // Explain the mismatch with real numbers where we can.
+        const meta = (state.downloadCatalog?.models || []).find(m => m.tag === model);
+        let why = '';
+        if (meta && state.hardware) {
+          const need = modelFootprintGB(meta, 4096);
+          why = `\n\n**${escapeHtml(meta.name)}** needs about **${need.toFixed(1)} GB**, but your machine has roughly **${state.hardware.maxBudgetGB} GB** usable. It was being swapped to disk, which is what locked everything up.`;
+        }
+        const freed = unloaded?.length
+          ? `\n\nThe model has been unloaded, so your memory is back.`
+          : `\n\nI couldn't confirm the model unloaded — if things are still slow, run \`ollama stop ${model || '<model>'}\` in a terminal.`;
+        last.content = (last.content || '') +
+          `\n\n---\n\n**Stopped automatically.** Your system stopped responding for about ${secs} seconds${freeGB != null ? ` (free memory was down to ${freeGB} GB)` : ''}, so Sanctum ended the run rather than leave you unable to click Stop.${why}${freed}\n\n_Try a smaller model — **Downloads** shows what fits this machine. You can turn this off in Settings → General._`;
+        try { patchLastMessageContent(last); } catch {}
+      }
+      state.runningChats.delete(chatId);
+    }
+    try { updateSendButton(); saveToStorage(); renderActiveChat(); } catch {}
+  });
+}
+
+// ============== HARDWARE FIT ENGINE ==============
+// Turns "20GB model, 12GB card, 64GB RAM" into an honest verdict. Ollama does
+// partial offload, so a model larger than VRAM still runs — CPU-bound. The
+// three verdicts map to that reality:
+//   good        — fits in GPU/unified memory, runs at full speed
+//   tight       — spills to system RAM, works but noticeably slow
+//   unrunnable  — exceeds system RAM, won't load at all
+//
+// RUNTIME_OVERHEAD_GB covers the llama.cpp context, compute buffers, and
+// allocator slack that sit alongside the weights.
+const RUNTIME_OVERHEAD_GB = 0.6;
+const WEIGHT_SLACK = 1.08; // quantised weights land slightly above download size
+const CTX_TIERS = [2048, 4096, 8192, 16384, 32768, 65536, 131072];
+
+function modelFootprintGB(model, ctxTokens = 0) {
+  const weights = model.sizeGB * WEIGHT_SLACK;
+  const kv = ctxTokens ? (model.kvKbPerTok * ctxTokens) / (1024 * 1024) : 0;
+  return weights + kv + RUNTIME_OVERHEAD_GB;
+}
+
+// Verdict at a small baseline context (4K) — the question is "can I run this
+// at all", not "can I run it at 128K".
+function fitFor(model, hw) {
+  // Some flagships ship on Ollama with no local weights at all — they're
+  // proxied to Ollama's servers via a `:cloud` tag. Hardware is irrelevant
+  // for those, so they get their own verdict rather than being mislabelled
+  // "too large" (which would imply a bigger GPU could fix it).
+  if (model.cloudOnly) {
+    return {
+      verdict: 'cloud',
+      label: 'Cloud only',
+      detail: 'No local weights — Ollama runs this on its own servers and needs an ollama.com account.'
+    };
+  }
+  if (!hw) return { verdict: 'unknown', label: 'Checking…', detail: '' };
+  const need = modelFootprintGB(model, 4096);
+  if (need <= hw.fastBudgetGB) {
+    return {
+      verdict: 'good',
+      label: 'Runs well',
+      detail: hw.budgetSource === 'vram'
+        ? `Fits in ${hw.vramGB}GB of VRAM — full GPU speed.`
+        : `Fits in memory — full speed.`
+    };
+  }
+  if (need <= hw.maxBudgetGB) {
+    return {
+      verdict: 'tight',
+      label: 'Tight',
+      detail: hw.budgetSource === 'vram'
+        ? `Too big for ${hw.vramGB}GB of VRAM — spills to system RAM and runs slowly.`
+        : `Close to your memory limit — expect slow generation.`
+    };
+  }
+  return {
+    verdict: 'unrunnable',
+    label: 'Too large',
+    detail: `Needs about ${need.toFixed(1)}GB; you have ~${hw.maxBudgetGB}GB usable.`
+  };
+}
+
+// Largest context tier that still leaves headroom on this machine. Uses the
+// fast budget when the model fits on the GPU, otherwise the system budget.
+function recommendedCtx(model, hw) {
+  if (!hw || model.cloudOnly) return null;
+  const base = modelFootprintGB(model, 0);
+  const budget = base <= hw.fastBudgetGB ? hw.fastBudgetGB : hw.maxBudgetGB;
+  const headroom = budget - base;
+  if (headroom <= 0) return null;
+  let best = null;
+  for (const t of CTX_TIERS) {
+    if (t > (model.ctxMax || 0)) break;
+    const kvGB = (model.kvKbPerTok * t) / (1024 * 1024);
+    if (kvGB <= headroom * 0.7) best = t;   // keep 30% back for compute buffers
+  }
+  return best;
+}
+
+function fmtCtx(n) {
+  if (!n) return '—';
+  return n >= 1024 ? `${Math.round(n / 1024)}K` : String(n);
+}
+
+function fmtGB(n) {
+  if (n == null) return '—';
+  return n < 1 ? `${Math.round(n * 1024)} MB` : `${n} GB`;
+}
+
 function allPicks() {
   const out = [];
   if (!state.catalog) return out;
@@ -1101,6 +1236,7 @@ function wireSidebar() {
   $('#new-chat').addEventListener('click', () => createChat());
   $('#new-agentic-chat').addEventListener('click', () => createAgenticChat());
   $('#open-models').addEventListener('click', () => switchView('models'));
+  $('#open-downloads')?.addEventListener('click', () => openDownloads());
   $('#open-settings').addEventListener('click', () => openSettings());
 
   // Sidebar collapse — persisted across sessions via state.settings.
@@ -1288,7 +1424,190 @@ function shortModality(m) {
 function switchView(name) {
   $$('.view').forEach(v => v.classList.toggle('active', v.dataset.view === name));
 }
-function wireModelsView() { $('#close-models').addEventListener('click', () => switchView('chat')); }
+// ============== DOWNLOAD TAB ==============
+const DL_FILTERS = [
+  { key: 'all',       label: 'All' },
+  { key: 'runnable',  label: 'Runs on this machine' },
+  { key: 'text',      label: 'Text' },
+  { key: 'code',      label: 'Code' },
+  { key: 'vision',    label: 'Vision' },
+  { key: 'reasoning', label: 'Reasoning' },
+  { key: 'tools',     label: 'Tool use' },
+  { key: 'tiny',      label: 'Tiny' },
+  { key: 'abliterated', label: 'Abliterated' },
+  { key: 'uncensored',  label: 'Uncensored' }
+];
+
+function renderHwBar() {
+  const el = $('#hw-bar');
+  if (!el) return;
+  const hw = state.hardware;
+  if (!hw) { el.innerHTML = `<div class="hw-probing">Checking your hardware…</div>`; return; }
+
+  const gpu = hw.gpuName
+    ? `${escapeHtml(hw.gpuName)}${hw.vramGB ? ` · ${hw.vramGB} GB VRAM` : ''}`
+    : 'No dedicated GPU detected';
+  const basis = hw.budgetSource === 'vram'
+    ? `Models up to <strong>${hw.fastBudgetGB} GB</strong> run at full speed on the GPU. Larger ones spill into system RAM and slow down; the ceiling is about <strong>${hw.maxBudgetGB} GB</strong>.`
+    : hw.budgetSource === 'unified'
+      ? `Unified memory — about <strong>${hw.fastBudgetGB} GB</strong> is usable for models.`
+      : `No GPU offload, so models run on the CPU. Usable ceiling is about <strong>${hw.maxBudgetGB} GB</strong>.`;
+
+  el.innerHTML = `
+    <div class="hw-head">
+      <span class="hw-chip">${escapeHtml(hw.cpuModel)}</span>
+      <span class="hw-chip">${gpu}</span>
+      <span class="hw-chip">${hw.totalRamGB} GB RAM</span>
+    </div>
+    <p class="hw-note">${basis}</p>
+  `;
+}
+
+// The signature element: a memory bar showing this model's footprint against
+// the machine's real budget. Makes "will it fit" a thing you see, not read.
+function fitMeter(model, hw) {
+  if (!hw || model.cloudOnly) return '';
+  const need = modelFootprintGB(model, 4096);
+  const scale = Math.max(hw.fastBudgetGB, Math.min(need, hw.maxBudgetGB));
+  const pct = Math.min(100, (need / scale) * 100);
+  const gpuMark = hw.budgetSource === 'vram' && hw.fastBudgetGB < scale
+    ? `<span class="fm-mark" style="left:${(hw.fastBudgetGB / scale) * 100}%" title="${hw.vramGB} GB VRAM"></span>` : '';
+  const f = fitFor(model, hw);
+  return `
+    <div class="fit-meter ${f.verdict}">
+      <div class="fm-track">
+        <div class="fm-fill" style="width:${pct}%"></div>
+        ${gpuMark}
+      </div>
+      <div class="fm-legend">${need.toFixed(1)} GB needed</div>
+    </div>
+  `;
+}
+
+function renderDownloadTab() {
+  const list = $('#dl-list');
+  if (!list) return;
+  renderHwBar();
+
+  const filters = $('#dl-filters');
+  if (filters && !filters.dataset.wired) {
+    filters.innerHTML = DL_FILTERS.map(f =>
+      `<button class="dl-chip${f.key === state.dlFilter ? ' active' : ''}" data-filter="${f.key}">${escapeHtml(f.label)}</button>`
+    ).join('');
+    filters.dataset.wired = '1';
+    filters.addEventListener('click', (e) => {
+      const btn = e.target.closest('.dl-chip');
+      if (!btn) return;
+      state.dlFilter = btn.dataset.filter;
+      filters.querySelectorAll('.dl-chip').forEach(c =>
+        c.classList.toggle('active', c.dataset.filter === state.dlFilter));
+      renderDownloadTab();
+    });
+  }
+  const search = $('#dl-search');
+  if (search && !search.dataset.wired) {
+    search.dataset.wired = '1';
+    search.addEventListener('input', () => { state.dlQuery = search.value.trim().toLowerCase(); renderDownloadTab(); });
+  }
+
+  const hw = state.hardware;
+  const q = state.dlQuery || '';
+  let models = (state.downloadCatalog?.models || []).filter(m => {
+    if (q && !(`${m.name} ${m.tag} ${m.blurb}`.toLowerCase().includes(q))) return false;
+    const f = state.dlFilter || 'all';
+    if (f === 'all') return true;
+    if (f === 'runnable') return hw ? fitFor(m, hw).verdict !== 'unrunnable' : true;
+    return (m.tags || []).includes(f);
+  });
+
+  // Runnable first, then biggest-usable first — the models worth their
+  // download time float to the top on this specific machine.
+  const rank = { good: 0, tight: 1, unknown: 2, unrunnable: 3, cloud: 4 };
+  models.sort((a, b) => {
+    const d = rank[fitFor(a, hw).verdict] - rank[fitFor(b, hw).verdict];
+    return d !== 0 ? d : b.sizeGB - a.sizeGB;
+  });
+
+  const countEl = $('#dl-search-count');
+  if (countEl) {
+    const total = (state.downloadCatalog?.models || []).length;
+    countEl.textContent = models.length === total ? `${total}` : `${models.length}/${total}`;
+  }
+
+  if (!models.length) {
+    list.innerHTML = `<div class="dl-empty">No models match that search.</div>`;
+    return;
+  }
+
+  list.innerHTML = models.map(m => {
+    const f = fitFor(m, hw);
+    const ctx = recommendedCtx(m, hw);
+    const installed = state.installed.has(m.tag);
+    const pulling = state.pulling.has(m.tag);
+    const tagChips = (m.tags || []).map(t => `<span class="dl-tag t-${t}">${escapeHtml(t)}</span>`).join('');
+    // Cloud-only models have no weights to pull — the Download button would
+    // just fail, so offer the pull command for an ollama.com account instead.
+    const action = m.cloudOnly
+      ? `<span class="dl-cloudnote">Runs on Ollama&nbsp;Cloud</span>`
+      : installed
+        ? `<span class="dl-installed">Installed</span>`
+        : pulling
+          ? `<span class="dl-installed pulling">Downloading…</span>`
+          : `<button class="dl-get" data-tag="${escapeAttr(m.tag)}">Download</button>`;
+    return `
+      <article class="dl-card ${f.verdict}">
+        <div class="dl-main">
+          <div class="dl-title">
+            <h3>${escapeHtml(m.name)}</h3>
+            <span class="dl-verdict ${f.verdict}">${escapeHtml(f.label)}</span>
+          </div>
+          <div class="dl-meta">
+            <span class="dl-params">${escapeHtml(m.params)}</span>
+            ${m.cloudOnly ? '' : `<span class="dl-size">${fmtGB(m.sizeGB)}</span>`}
+            <code class="dl-tagname">${escapeHtml(m.tag)}</code>
+          </div>
+          <p class="dl-blurb">${escapeHtml(m.blurb)}</p>
+        </div>
+        <div class="dl-side">
+          ${fitMeter(m, hw)}
+          <p class="dl-fitnote">${escapeHtml(f.detail)}</p>
+          ${ctx ? `<div class="dl-ctx"><span class="dl-ctx-label">Suggested context</span><span class="dl-ctx-val">${fmtCtx(ctx)}</span></div>`
+                : `<div class="dl-ctx dim"><span class="dl-ctx-label">Suggested context</span><span class="dl-ctx-val">—</span></div>`}
+          ${action}
+        </div>
+        <div class="dl-tags">${tagChips}</div>
+      </article>
+    `;
+  }).join('');
+
+  if (!list.dataset.wired) {
+    list.dataset.wired = '1';
+    list.addEventListener('click', (e) => {
+      const btn = e.target.closest('.dl-get');
+      if (!btn) return;
+      pullModelInline(btn.dataset.tag);
+      btn.outerHTML = `<span class="dl-installed pulling">Downloading…</span>`;
+    });
+  }
+}
+
+function wireModelsView() {
+  $('#close-models').addEventListener('click', () => switchView('chat'));
+  $('#close-downloads')?.addEventListener('click', () => switchView('chat'));
+}
+
+// Called when the Downloads view opens. Lazy-loads the big catalog and the
+// hardware probe so boot stays fast for people who never open it.
+function openDownloads() {
+  switchView('downloads');
+  if (!state.downloadCatalog) {
+    window.api.downloadCatalog().then(c => { state.downloadCatalog = c; renderDownloadTab(); });
+  }
+  if (!state.hardware) {
+    window.api.hardware().then(hw => { state.hardware = hw; renderDownloadTab(); });
+  }
+  renderDownloadTab();
+}
 
 // Apply a theme by setting data-theme on <html>. The CSS variable overrides
 // inside :root[data-theme="dark"] swap the entire palette. Stored in
@@ -1341,6 +1660,38 @@ function wireSettings() {
   wireApiKey('setting-anthropic-key', 'setting-anthropic-reveal', 'anthropic');
   wireApiKey('setting-google-key',    'setting-google-reveal',    'google');
 
+  // Freeze protection — pushed to main on every change so the watchdog in the
+  // main process reflects the setting immediately.
+  state.settings.watchdog = state.settings.watchdog || { enabled: true, tripMs: 15000 };
+  const wdOn = $('#setting-wd-enabled');
+  const wdSlot = $('#setting-wd-trip-slot');
+  const pushWd = () => {
+    saveSettings();
+    window.api.watchdog?.config({
+      enabled: state.settings.watchdog.enabled,
+      tripMs: state.settings.watchdog.tripMs
+    }).catch(() => {});
+  };
+  let wdTripSel = null;
+  if (wdSlot && !wdSlot.dataset.wired) {
+    wdSlot.dataset.wired = '1';
+    wdTripSel = buildSelect({
+      options: [10000, 15000, 20000, 30000, 45000].map(ms => ({ value: ms, label: `${ms / 1000} seconds` })),
+      value: state.settings.watchdog.tripMs || 15000,
+      onChange: (v) => { state.settings.watchdog.tripMs = parseInt(v, 10); pushWd(); }
+    });
+    wdSlot.appendChild(wdTripSel);
+    wdTripSel.setDisabled(state.settings.watchdog.enabled === false);
+  }
+  if (wdOn) {
+    wdOn.checked = state.settings.watchdog.enabled !== false;
+    wdOn.addEventListener('change', () => {
+      state.settings.watchdog.enabled = wdOn.checked;
+      wdTripSel?.setDisabled(!wdOn.checked);
+      pushWd();
+    });
+  }
+
   // Theme picker: reflect current theme + wire clicks
   const themePicker = $('#theme-picker');
   if (themePicker) {
@@ -1377,8 +1728,174 @@ function wireSettings() {
   });
 }
 
+// ============== CUSTOM SELECT ==============
+// Native <select> popups are drawn by the OS — on Windows that means a white
+// list no CSS can touch. This renders the menu as real DOM so it inherits
+// Sanctum's palette. API mirrors a select: options [{value,label}], a current
+// value, and an onChange callback.
+function buildSelect({ options, value, onChange, className = '' }) {
+  const root = document.createElement('div');
+  root.className = `sel ${className}`.trim();
+  const current = options.find(o => String(o.value) === String(value)) || options[0];
+
+  root.innerHTML = `
+    <button type="button" class="sel-btn" aria-haspopup="listbox" aria-expanded="false">
+      <span class="sel-val">${escapeHtml(current?.label ?? '')}</span>
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+    </button>
+    <div class="sel-menu" role="listbox" hidden>
+      ${options.map(o => `
+        <button type="button" class="sel-opt${String(o.value) === String(value) ? ' active' : ''}" role="option"
+                data-value="${escapeAttr(String(o.value))}"${o.disabled ? ' disabled' : ''}>
+          <span>${escapeHtml(o.label)}</span>
+          ${o.note ? `<em class="sel-note">${escapeHtml(o.note)}</em>` : ''}
+        </button>`).join('')}
+    </div>
+  `;
+
+  const btn = root.querySelector('.sel-btn');
+  const menu = root.querySelector('.sel-menu');
+  const valEl = root.querySelector('.sel-val');
+
+  const close = () => {
+    menu.hidden = true;
+    btn.setAttribute('aria-expanded', 'false');
+    root.classList.remove('open');
+    document.removeEventListener('mousedown', onDocDown);
+    document.removeEventListener('keydown', onKey);
+  };
+  const onDocDown = (e) => { if (!root.contains(e.target)) close(); };
+  const onKey = (e) => { if (e.key === 'Escape') { close(); btn.focus(); } };
+  const open = () => {
+    if (root.classList.contains('disabled')) return;
+    // Flip upward when there isn't room below — long lists near the modal
+    // bottom would otherwise render off-screen.
+    const spaceBelow = window.innerHeight - btn.getBoundingClientRect().bottom;
+    root.classList.toggle('drop-up', spaceBelow < 220);
+    menu.hidden = false;
+    btn.setAttribute('aria-expanded', 'true');
+    root.classList.add('open');
+    document.addEventListener('mousedown', onDocDown);
+    document.addEventListener('keydown', onKey);
+  };
+
+  btn.addEventListener('click', () => (menu.hidden ? open() : close()));
+  menu.addEventListener('click', (e) => {
+    const opt = e.target.closest('.sel-opt');
+    if (!opt || opt.disabled) return;
+    const v = opt.dataset.value;
+    valEl.textContent = options.find(o => String(o.value) === v)?.label ?? '';
+    menu.querySelectorAll('.sel-opt').forEach(o => o.classList.toggle('active', o === opt));
+    close();
+    onChange?.(v);
+  });
+
+  root.setDisabled = (d) => {
+    root.classList.toggle('disabled', !!d);
+    btn.disabled = !!d;
+    if (d) close();
+  };
+  return root;
+}
+
+// Per-model context window controls. Lists every INSTALLED Ollama model and
+// lets the user pin a context size. Chats read this at send time via
+// contextWindowFor(); an unset model falls back to the hardware-aware
+// suggestion, then to a safe 8K.
+function renderCtxSettings() {
+  const list = $('#ctx-list');
+  if (!list) return;
+
+  const installed = [...state.installed];
+  if (!installed.length) {
+    list.innerHTML = `<div class="ctx-empty">No local models installed yet. Pull one from <strong>Models → Download</strong> and it'll show up here.</div>`;
+    return;
+  }
+
+  const dl = state.downloadCatalog?.models || [];
+  const hw = state.hardware;
+  state.settings.contextWindows = state.settings.contextWindows || {};
+
+  list.innerHTML = '';
+  for (const tag of installed) {
+    const meta = dl.find(m => m.tag === tag) || allPicks().find(p => p.tag === tag);
+    const name = meta?.name || tag;
+    const ctxMax = meta?.ctxMax || meta?.context || 131072;
+    const suggested = (meta && meta.kvKbPerTok && hw) ? recommendedCtx(meta, hw) : null;
+    const current = state.settings.contextWindows[tag];
+
+    const row = document.createElement('div');
+    row.className = 'ctx-row';
+    row.innerHTML = `
+      <div class="ctx-info">
+        <span class="ctx-name">${escapeHtml(name)}</span>
+        <code class="ctx-tag">${escapeHtml(tag)}</code>
+      </div>
+      <div class="ctx-ctl">
+        ${suggested ? `<span class="ctx-sug">Suggested: ${fmtCtx(suggested)}</span>` : ''}
+      </div>
+    `;
+
+    const options = [{ value: '', label: `Auto${suggested ? ` (${fmtCtx(suggested)})` : ''}` }];
+    for (const t of CTX_TIERS.filter(t => t <= ctxMax)) {
+      options.push({ value: t, label: fmtCtx(t), note: suggested === t ? 'suggested' : '' });
+    }
+    const sel = buildSelect({
+      options,
+      value: current ?? '',
+      className: 'ctx-select',
+      onChange: (v) => {
+        if (v) state.settings.contextWindows[tag] = parseInt(v, 10);
+        else delete state.settings.contextWindows[tag];
+        saveSettings();
+      }
+    });
+    row.querySelector('.ctx-ctl').appendChild(sel);
+    list.appendChild(row);
+  }
+}
+
+// Resolve the context window for a model at send time. Explicit user choice >
+// hardware-aware suggestion > conservative 8K default.
+function contextWindowFor(tag) {
+  const pinned = state.settings.contextWindows?.[tag];
+  if (pinned) return pinned;
+  const meta = (state.downloadCatalog?.models || []).find(m => m.tag === tag);
+  if (meta && state.hardware) {
+    const rec = recommendedCtx(meta, state.hardware);
+    if (rec) return rec;
+  }
+  return 8192;
+}
+
+function wireSettingsNav() {
+  const nav = $('#settings-nav');
+  if (!nav || nav.dataset.wired) return;
+  nav.dataset.wired = '1';
+  nav.addEventListener('click', (e) => {
+    const btn = e.target.closest('.set-nav-btn');
+    if (!btn) return;
+    const panel = btn.dataset.panel;
+    nav.querySelectorAll('.set-nav-btn').forEach(b => {
+      const on = b === btn;
+      b.classList.toggle('active', on);
+      b.setAttribute('aria-selected', String(on));
+    });
+    document.querySelectorAll('.set-panel').forEach(p =>
+      p.classList.toggle('active', p.dataset.panel === panel));
+    if (panel === 'context') {
+      // The suggestion column needs hardware + catalog; pull them on demand.
+      const done = () => renderCtxSettings();
+      if (!state.hardware) window.api.hardware().then(hw => { state.hardware = hw; done(); });
+      if (!state.downloadCatalog) window.api.downloadCatalog().then(c => { state.downloadCatalog = c; done(); });
+      done();
+    }
+  });
+}
+
 function openSettings() {
   $('#settings-overlay').hidden = false;
+  wireSettingsNav();
   $('#setting-instructions').focus();
   renderMcpSettings();
 }
@@ -1701,9 +2218,13 @@ function populateModelPicker() {
   const activePick = findPick(activeModel);
   current.textContent = activePick?.name || activeModel || 'Select a model';
 
-  // Build menu items
+  // Build menu items. Cloud picks sort to the BOTTOM — Sanctum is local-first,
+  // so the local models a user already has on disk should be what they see
+  // first; cloud is the deliberate opt-in below them.
   menu.innerHTML = '';
-  for (const [key, cat] of Object.entries(state.catalog.categories)) {
+  const orderedCategories = Object.entries(state.catalog.categories)
+    .sort(([aKey], [bKey]) => (aKey === 'cloud' ? 1 : 0) - (bKey === 'cloud' ? 1 : 0));
+  for (const [key, cat] of orderedCategories) {
     const visiblePicks = cat.picks;
     if (!visiblePicks.length) continue;
     const categorySelectable = SELECTABLE_CATEGORIES.has(key);
@@ -3485,10 +4006,14 @@ ollama pull qwen2.5vl:7b
         }
       : { model: effectiveModel, messages: history };
     if (!isCloud) {
-      // Cap the context window so big models like Qwen3 30B-A3B don't OOM. The
-      // KV cache for the default 32K context is ~13 GB on its own; 8K is the
-      // safe default that fits comfortably in 32 GB systems.
-      payload.options = { num_ctx: c.contextWindow || 8192 };
+      // Context window resolution order:
+      //   1. this chat's own override (agent opts panel)
+      //   2. the per-model pin from Settings -> Context Windows
+      //   3. the hardware-aware suggestion for this machine
+      //   4. a conservative 8K
+      // Oversizing here is what makes big models OOM — the KV cache for 32K on
+      // a 30B model is several GB on its own.
+      payload.options = { num_ctx: c.contextWindow || contextWindowFor(effectiveModel) };
       if (tools) payload.tools = tools;
       if (round === 1 && imgs.length) payload.images = imgs;
     }

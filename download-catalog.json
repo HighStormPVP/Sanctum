@@ -1,0 +1,3142 @@
+{
+  "_note": "Text-capable local models pullable from the Ollama library. sizeGB = download/disk size at the default quant (usually Q4_K_M). kvKbPerTok = approximate KV-cache cost per token in KB at fp16, used to recommend a context window that fits the user's memory budget — it is an estimate derived from layer count x KV heads x head dim, not a measured value. ctxMax = the model's trained context limit. tags drive the filter chips in the Download tab.",
+  "_tagLegend": {
+    "text": "General conversation and reasoning",
+    "code": "Trained or tuned for programming",
+    "vision": "Accepts images as well as text",
+    "reasoning": "Emits explicit chain-of-thought",
+    "tools": "Reliable function/tool calling",
+    "moe": "Mixture-of-experts — fewer active params than total",
+    "tiny": "Runs on almost anything, including CPU-only",
+    "uncensored": "Reduced or removed refusal training",
+    "abliterated": "Refusal direction removed via orthogonalisation — answers where the base model would decline"
+  },
+  "models": [
+    {
+      "id": "smollm2-135m",
+      "name": "SmolLM2 135M",
+      "tag": "smollm2:135m",
+      "params": "135M",
+      "sizeGB": 0.27,
+      "kvKbPerTok": 12,
+      "ctxMax": 8192,
+      "tags": [
+        "text",
+        "tiny"
+      ],
+      "blurb": "About as small as a usable language model gets. Fine for autocomplete-grade text on a Raspberry Pi; don't expect reasoning."
+    },
+    {
+      "id": "smollm2-360m",
+      "name": "SmolLM2 360M",
+      "tag": "smollm2:360m",
+      "params": "360M",
+      "sizeGB": 0.73,
+      "kvKbPerTok": 18,
+      "ctxMax": 8192,
+      "tags": [
+        "text",
+        "tiny"
+      ],
+      "blurb": "Still tiny, noticeably more coherent than the 135M. Good for simple summarising and classification on weak hardware."
+    },
+    {
+      "id": "qwen2.5-0.5b",
+      "name": "Qwen2.5 0.5B",
+      "tag": "qwen2.5:0.5b",
+      "params": "0.5B",
+      "sizeGB": 0.4,
+      "kvKbPerTok": 24,
+      "ctxMax": 32768,
+      "tags": [
+        "text",
+        "tiny",
+        "tools"
+      ],
+      "blurb": "Punches above its weight for the size and handles 32K context. A sensible floor model for old laptops."
+    },
+    {
+      "id": "tinyllama",
+      "name": "TinyLlama 1.1B",
+      "tag": "tinyllama:1.1b",
+      "params": "1.1B",
+      "sizeGB": 0.64,
+      "kvKbPerTok": 32,
+      "ctxMax": 2048,
+      "tags": [
+        "text",
+        "tiny"
+      ],
+      "blurb": "The classic small Llama. Superseded by Llama 3.2 1B in almost every way, but it's fast and runs anywhere."
+    },
+    {
+      "id": "qwen3-0.6b",
+      "name": "Qwen3 0.6B",
+      "tag": "qwen3:0.6b",
+      "params": "0.6B",
+      "sizeGB": 0.52,
+      "kvKbPerTok": 24,
+      "ctxMax": 32768,
+      "tags": [
+        "text",
+        "tiny",
+        "reasoning",
+        "tools"
+      ],
+      "blurb": "Smallest Qwen3. Inherits the family's toggleable thinking mode, so it can reason step-by-step despite the size."
+    },
+    {
+      "id": "llama3.2-1b",
+      "name": "Llama 3.2 1B",
+      "tag": "llama3.2:1b",
+      "params": "1B",
+      "sizeGB": 1.3,
+      "kvKbPerTok": 32,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "tiny",
+        "tools"
+      ],
+      "blurb": "Meta's smallest instruct model. Genuinely coherent for its size and takes a huge context. Good pick for CPU-only machines."
+    },
+    {
+      "id": "qwen2.5-1.5b",
+      "name": "Qwen2.5 1.5B",
+      "tag": "qwen2.5:1.5b",
+      "params": "1.5B",
+      "sizeGB": 0.99,
+      "kvKbPerTok": 36,
+      "ctxMax": 32768,
+      "tags": [
+        "text",
+        "tiny",
+        "tools"
+      ],
+      "blurb": "Strong multilingual ability for a sub-1GB download. Reliable at short structured tasks."
+    },
+    {
+      "id": "gemma3-1b",
+      "name": "Gemma 3 1B",
+      "tag": "gemma3:1b",
+      "params": "1B",
+      "sizeGB": 0.82,
+      "kvKbPerTok": 40,
+      "ctxMax": 32768,
+      "tags": [
+        "text",
+        "tiny"
+      ],
+      "blurb": "Google's compact Gemma. Clean, well-behaved prose; weaker at code than the Qwen equivalents."
+    },
+    {
+      "id": "qwen3-1.7b",
+      "name": "Qwen3 1.7B",
+      "tag": "qwen3:1.7b",
+      "params": "1.7B",
+      "sizeGB": 1.4,
+      "kvKbPerTok": 40,
+      "ctxMax": 32768,
+      "tags": [
+        "text",
+        "tiny",
+        "reasoning",
+        "tools"
+      ],
+      "blurb": "The sweet spot in Qwen3's tiny tier. Thinking mode makes it surprisingly capable at multi-step questions."
+    },
+    {
+      "id": "deepseek-r1-1.5b",
+      "name": "DeepSeek-R1 1.5B",
+      "tag": "deepseek-r1:1.5b",
+      "params": "1.5B",
+      "sizeGB": 1.1,
+      "kvKbPerTok": 36,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "tiny",
+        "reasoning"
+      ],
+      "blurb": "A reasoning-distilled model small enough for a phone-class machine. Shows its working on maths and logic."
+    },
+    {
+      "id": "smollm2-1.7b",
+      "name": "SmolLM2 1.7B",
+      "tag": "smollm2:1.7b",
+      "params": "1.7B",
+      "sizeGB": 1.8,
+      "kvKbPerTok": 40,
+      "ctxMax": 8192,
+      "tags": [
+        "text",
+        "tiny"
+      ],
+      "blurb": "The largest SmolLM2. Trained on a heavily filtered corpus — clean output, modest world knowledge."
+    },
+    {
+      "id": "moondream",
+      "name": "Moondream 1.8B",
+      "tag": "moondream:1.8b",
+      "params": "1.8B",
+      "sizeGB": 1.7,
+      "kvKbPerTok": 40,
+      "ctxMax": 2048,
+      "tags": [
+        "vision",
+        "tiny"
+      ],
+      "blurb": "A tiny vision model that describes images and does OCR. Runs on hardware no other vision model will touch."
+    },
+    {
+      "id": "gemma2-2b",
+      "name": "Gemma 2 2B",
+      "tag": "gemma2:2b",
+      "params": "2B",
+      "sizeGB": 1.6,
+      "kvKbPerTok": 48,
+      "ctxMax": 8192,
+      "tags": [
+        "text",
+        "tiny"
+      ],
+      "blurb": "Well-liked small model with a distinctly polite, careful voice. Solid general chat under 2GB."
+    },
+    {
+      "id": "qwen2.5-3b",
+      "name": "Qwen2.5 3B",
+      "tag": "qwen2.5:3b",
+      "params": "3B",
+      "sizeGB": 1.9,
+      "kvKbPerTok": 48,
+      "ctxMax": 32768,
+      "tags": [
+        "text",
+        "tools"
+      ],
+      "blurb": "Reliable tool-caller at a small size — a good agentic model for machines that can't hold 7B."
+    },
+    {
+      "id": "llama3.2-3b",
+      "name": "Llama 3.2 3B",
+      "tag": "llama3.2:3b",
+      "params": "3B",
+      "sizeGB": 2,
+      "kvKbPerTok": 48,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "tools"
+      ],
+      "blurb": "The best all-round model that still fits in 4GB. Fast, coherent, and handles long documents."
+    },
+    {
+      "id": "phi3-mini",
+      "name": "Phi-3 Mini",
+      "tag": "phi3:mini",
+      "params": "3.8B",
+      "sizeGB": 2.2,
+      "kvKbPerTok": 64,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "code"
+      ],
+      "blurb": "Microsoft's textbook-trained small model. Unusually strong at reasoning and code for under 3GB."
+    },
+    {
+      "id": "qwen3-4b",
+      "name": "Qwen3 4B",
+      "tag": "qwen3:4b",
+      "params": "4B",
+      "sizeGB": 2.6,
+      "kvKbPerTok": 56,
+      "ctxMax": 32768,
+      "tags": [
+        "text",
+        "reasoning",
+        "tools"
+      ],
+      "blurb": "Thinking mode in a 4B package. A strong default if 8B is too tight for your machine."
+    },
+    {
+      "id": "gemma3-4b",
+      "name": "Gemma 3 4B",
+      "tag": "gemma3:4b",
+      "params": "4B",
+      "sizeGB": 3.3,
+      "kvKbPerTok": 72,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "vision"
+      ],
+      "blurb": "Reads images as well as text, at a size most laptops can handle. Good general-purpose multimodal starter."
+    },
+    {
+      "id": "deepseek-coder-1.3b",
+      "name": "DeepSeek-Coder 1.3B",
+      "tag": "deepseek-coder:1.3b",
+      "params": "1.3B",
+      "sizeGB": 0.78,
+      "kvKbPerTok": 32,
+      "ctxMax": 16384,
+      "tags": [
+        "code",
+        "tiny"
+      ],
+      "blurb": "A dedicated code model under 1GB. Useful for completion and boilerplate, not architecture."
+    },
+    {
+      "id": "qwen2.5-coder-1.5b",
+      "name": "Qwen2.5-Coder 1.5B",
+      "tag": "qwen2.5-coder:1.5b",
+      "params": "1.5B",
+      "sizeGB": 0.99,
+      "kvKbPerTok": 36,
+      "ctxMax": 32768,
+      "tags": [
+        "code",
+        "tiny"
+      ],
+      "blurb": "Tiny coder with fill-in-the-middle support. Good for inline completion on modest hardware."
+    },
+    {
+      "id": "qwen2.5-coder-3b",
+      "name": "Qwen2.5-Coder 3B",
+      "tag": "qwen2.5-coder:3b",
+      "params": "3B",
+      "sizeGB": 1.9,
+      "kvKbPerTok": 48,
+      "ctxMax": 32768,
+      "tags": [
+        "code"
+      ],
+      "blurb": "Noticeably better than the 1.5B at whole-function generation while staying under 2GB."
+    },
+    {
+      "id": "starcoder2-3b",
+      "name": "StarCoder2 3B",
+      "tag": "starcoder2:3b",
+      "params": "3B",
+      "sizeGB": 1.7,
+      "kvKbPerTok": 48,
+      "ctxMax": 16384,
+      "tags": [
+        "code"
+      ],
+      "blurb": "Trained on permissively-licensed source across 600+ languages. Strong at obscure languages."
+    },
+    {
+      "id": "codegemma-2b",
+      "name": "CodeGemma 2B",
+      "tag": "codegemma:2b",
+      "params": "2B",
+      "sizeGB": 1.6,
+      "kvKbPerTok": 48,
+      "ctxMax": 8192,
+      "tags": [
+        "code",
+        "tiny"
+      ],
+      "blurb": "Built for fast code infilling rather than chat. Pair it with a general model for explanations."
+    },
+    {
+      "id": "llama3.1-8b",
+      "name": "Llama 3.1 8B",
+      "tag": "llama3.1:8b",
+      "params": "8B",
+      "sizeGB": 4.7,
+      "kvKbPerTok": 128,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "tools"
+      ],
+      "blurb": "The workhorse open model. Broad knowledge, dependable tool use, and a 128K context. A safe default at 8GB+."
+    },
+    {
+      "id": "qwen2.5-7b",
+      "name": "Qwen2.5 7B",
+      "tag": "qwen2.5:7b",
+      "params": "7B",
+      "sizeGB": 4.7,
+      "kvKbPerTok": 128,
+      "ctxMax": 32768,
+      "tags": [
+        "text",
+        "code",
+        "tools"
+      ],
+      "blurb": "Balanced 7B that codes better than most of its peers. Excellent multilingual coverage."
+    },
+    {
+      "id": "mistral-7b",
+      "name": "Mistral 7B",
+      "tag": "mistral:7b",
+      "params": "7B",
+      "sizeGB": 4.1,
+      "kvKbPerTok": 128,
+      "ctxMax": 32768,
+      "tags": [
+        "text"
+      ],
+      "blurb": "The model that started the open-weights wave. Terse, fast, and still a fine general chat model."
+    },
+    {
+      "id": "qwen3-8b",
+      "name": "Qwen3 8B",
+      "tag": "qwen3:8b",
+      "params": "8B",
+      "sizeGB": 5.2,
+      "kvKbPerTok": 128,
+      "ctxMax": 32768,
+      "tags": [
+        "text",
+        "reasoning",
+        "tools"
+      ],
+      "blurb": "Strong agentic model with toggleable thinking. A good choice for tool-heavy work on a 12GB+ machine."
+    },
+    {
+      "id": "deepseek-r1-7b",
+      "name": "DeepSeek-R1 7B",
+      "tag": "deepseek-r1:7b",
+      "params": "7B",
+      "sizeGB": 4.7,
+      "kvKbPerTok": 128,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "reasoning"
+      ],
+      "blurb": "Reasoning-distilled from R1. Thinks visibly before answering — slower, but better on hard problems."
+    },
+    {
+      "id": "deepseek-r1-8b",
+      "name": "DeepSeek-R1 8B",
+      "tag": "deepseek-r1:8b",
+      "params": "8B",
+      "sizeGB": 5.2,
+      "kvKbPerTok": 128,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "reasoning"
+      ],
+      "blurb": "The Llama-based R1 distill. Slightly broader world knowledge than the 7B Qwen-based one."
+    },
+    {
+      "id": "hermes3-8b",
+      "name": "Hermes 3 8B",
+      "tag": "hermes3:8b",
+      "params": "8B",
+      "sizeGB": 4.7,
+      "kvKbPerTok": 128,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "tools"
+      ],
+      "blurb": "Nous Research's Llama 3.1 tune, built for function calling and steerability. A solid agent backbone."
+    },
+    {
+      "id": "dolphin3-8b",
+      "name": "Dolphin 3 8B",
+      "tag": "dolphin3:8b",
+      "params": "8B",
+      "sizeGB": 4.9,
+      "kvKbPerTok": 128,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "uncensored"
+      ],
+      "blurb": "Instruction-tuned with refusals largely trained out. Useful when a safety-tuned model won't engage with your task."
+    },
+    {
+      "id": "gemma2-9b",
+      "name": "Gemma 2 9B",
+      "tag": "gemma2:9b",
+      "params": "9B",
+      "sizeGB": 5.4,
+      "kvKbPerTok": 160,
+      "ctxMax": 8192,
+      "tags": [
+        "text"
+      ],
+      "blurb": "Excellent writing quality for its size. The 8K context is the main limitation."
+    },
+    {
+      "id": "glm4-9b",
+      "name": "GLM-4 9B",
+      "tag": "glm4:9b",
+      "params": "9B",
+      "sizeGB": 5.5,
+      "kvKbPerTok": 144,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "tools"
+      ],
+      "blurb": "Zhipu's bilingual model. Very strong Chinese/English, competitive with Llama 3.1 8B in English."
+    },
+    {
+      "id": "olmo2-7b",
+      "name": "OLMo 2 7B",
+      "tag": "olmo2:7b",
+      "params": "7B",
+      "sizeGB": 4.5,
+      "kvKbPerTok": 128,
+      "ctxMax": 4096,
+      "tags": [
+        "text"
+      ],
+      "blurb": "Fully open — weights, data, and training code all published. The pick when reproducibility matters."
+    },
+    {
+      "id": "falcon3-7b",
+      "name": "Falcon 3 7B",
+      "tag": "falcon3:7b",
+      "params": "7B",
+      "sizeGB": 4.6,
+      "kvKbPerTok": 128,
+      "ctxMax": 32768,
+      "tags": [
+        "text"
+      ],
+      "blurb": "TII's third-generation Falcon. Competitive general model with strong maths for the tier."
+    },
+    {
+      "id": "aya-expanse-8b",
+      "name": "Aya Expanse 8B",
+      "tag": "aya-expanse:8b",
+      "params": "8B",
+      "sizeGB": 5.1,
+      "kvKbPerTok": 128,
+      "ctxMax": 8192,
+      "tags": [
+        "text"
+      ],
+      "blurb": "Cohere's multilingual specialist covering 23 languages properly rather than incidentally."
+    },
+    {
+      "id": "exaone3.5-7.8b",
+      "name": "EXAONE 3.5 7.8B",
+      "tag": "exaone3.5:7.8b",
+      "params": "7.8B",
+      "sizeGB": 4.8,
+      "kvKbPerTok": 128,
+      "ctxMax": 32768,
+      "tags": [
+        "text"
+      ],
+      "blurb": "LG's bilingual Korean/English model. Strong instruction-following, long-context capable."
+    },
+    {
+      "id": "granite3.1-dense-8b",
+      "name": "Granite 3.1 Dense 8B",
+      "tag": "granite3.1-dense:8b",
+      "params": "8B",
+      "sizeGB": 4.9,
+      "kvKbPerTok": 128,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "tools"
+      ],
+      "blurb": "IBM's enterprise-focused model. Apache-2.0 licensed and tuned for RAG and tool use."
+    },
+    {
+      "id": "solar-10.7b",
+      "name": "Solar 10.7B",
+      "tag": "solar:10.7b",
+      "params": "10.7B",
+      "sizeGB": 6.1,
+      "kvKbPerTok": 160,
+      "ctxMax": 4096,
+      "tags": [
+        "text"
+      ],
+      "blurb": "Upstage's depth-scaled model — punched above its weight at release and still writes well."
+    },
+    {
+      "id": "qwen2.5-coder-7b",
+      "name": "Qwen2.5-Coder 7B",
+      "tag": "qwen2.5-coder:7b",
+      "params": "7B",
+      "sizeGB": 4.7,
+      "kvKbPerTok": 128,
+      "ctxMax": 32768,
+      "tags": [
+        "code",
+        "tools"
+      ],
+      "blurb": "The best small coding model available locally. Competitive with much larger models on real tasks."
+    },
+    {
+      "id": "deepseek-coder-6.7b",
+      "name": "DeepSeek-Coder 6.7B",
+      "tag": "deepseek-coder:6.7b",
+      "params": "6.7B",
+      "sizeGB": 3.8,
+      "kvKbPerTok": 128,
+      "ctxMax": 16384,
+      "tags": [
+        "code"
+      ],
+      "blurb": "Trained on 87% code. Excellent at completion and repository-level context for its size."
+    },
+    {
+      "id": "codegemma-7b",
+      "name": "CodeGemma 7B",
+      "tag": "codegemma:7b",
+      "params": "7B",
+      "sizeGB": 5,
+      "kvKbPerTok": 128,
+      "ctxMax": 8192,
+      "tags": [
+        "code"
+      ],
+      "blurb": "Google's code model. Good at Python and Java; the 8K context limits whole-file work."
+    },
+    {
+      "id": "starcoder2-7b",
+      "name": "StarCoder2 7B",
+      "tag": "starcoder2:7b",
+      "params": "7B",
+      "sizeGB": 4,
+      "kvKbPerTok": 128,
+      "ctxMax": 16384,
+      "tags": [
+        "code"
+      ],
+      "blurb": "Broad language coverage with clean licensing. A dependable completion engine."
+    },
+    {
+      "id": "opencoder-8b",
+      "name": "OpenCoder 8B",
+      "tag": "opencoder:8b",
+      "params": "8B",
+      "sizeGB": 4.7,
+      "kvKbPerTok": 128,
+      "ctxMax": 8192,
+      "tags": [
+        "code"
+      ],
+      "blurb": "Fully-open code model with published data pipeline. Strong on Python and JavaScript."
+    },
+    {
+      "id": "codeqwen-7b",
+      "name": "CodeQwen 1.5 7B",
+      "tag": "codeqwen:7b",
+      "params": "7B",
+      "sizeGB": 4.2,
+      "kvKbPerTok": 128,
+      "ctxMax": 65536,
+      "tags": [
+        "code"
+      ],
+      "blurb": "Long-context code model — 64K lets it hold several large files at once."
+    },
+    {
+      "id": "llava-7b",
+      "name": "LLaVA 7B",
+      "tag": "llava:7b",
+      "params": "7B",
+      "sizeGB": 4.7,
+      "kvKbPerTok": 128,
+      "ctxMax": 4096,
+      "tags": [
+        "vision"
+      ],
+      "blurb": "The original open vision-language model. Describes images and answers questions about them."
+    },
+    {
+      "id": "llava-llama3-8b",
+      "name": "LLaVA-Llama3 8B",
+      "tag": "llava-llama3:8b",
+      "params": "8B",
+      "sizeGB": 5.5,
+      "kvKbPerTok": 128,
+      "ctxMax": 8192,
+      "tags": [
+        "vision"
+      ],
+      "blurb": "LLaVA's vision head on a Llama 3 base — better language quality than the original LLaVA."
+    },
+    {
+      "id": "minicpm-v-8b",
+      "name": "MiniCPM-V 8B",
+      "tag": "minicpm-v:8b",
+      "params": "8B",
+      "sizeGB": 5.5,
+      "kvKbPerTok": 128,
+      "ctxMax": 32768,
+      "tags": [
+        "vision"
+      ],
+      "blurb": "Strong OCR and document understanding. Better than LLaVA at reading text inside images."
+    },
+    {
+      "id": "qwen2.5vl-7b",
+      "name": "Qwen2.5-VL 7B",
+      "tag": "qwen2.5vl:7b",
+      "params": "7B",
+      "sizeGB": 6,
+      "kvKbPerTok": 128,
+      "ctxMax": 32768,
+      "tags": [
+        "vision",
+        "tools"
+      ],
+      "blurb": "Excellent all-round vision model — OCR, charts, UI screenshots, and spatial reasoning."
+    },
+    {
+      "id": "llama3.2-vision-11b",
+      "name": "Llama 3.2 Vision 11B",
+      "tag": "llama3.2-vision:11b",
+      "params": "11B",
+      "sizeGB": 7.9,
+      "kvKbPerTok": 160,
+      "ctxMax": 131072,
+      "tags": [
+        "vision",
+        "tools"
+      ],
+      "blurb": "Meta's multimodal model. Reliable image reasoning with a very large context window."
+    },
+    {
+      "id": "mistral-nemo-12b",
+      "name": "Mistral Nemo 12B",
+      "tag": "mistral-nemo:12b",
+      "params": "12B",
+      "sizeGB": 7.1,
+      "kvKbPerTok": 160,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "tools"
+      ],
+      "blurb": "Mistral and NVIDIA's joint 12B. Great multilingual coverage and a genuinely usable 128K context."
+    },
+    {
+      "id": "gemma3-12b",
+      "name": "Gemma 3 12B",
+      "tag": "gemma3:12b",
+      "params": "12B",
+      "sizeGB": 8.1,
+      "kvKbPerTok": 176,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "vision"
+      ],
+      "blurb": "The mid-tier Gemma 3. Handles images, writes well, and fits comfortably in 12GB of VRAM."
+    },
+    {
+      "id": "phi4",
+      "name": "Phi-4 14B",
+      "tag": "phi4:14b",
+      "params": "14B",
+      "sizeGB": 9.1,
+      "kvKbPerTok": 192,
+      "ctxMax": 16384,
+      "tags": [
+        "text",
+        "code",
+        "reasoning"
+      ],
+      "blurb": "Microsoft's synthetic-data model. Outperforms much larger models on maths and reasoning benchmarks."
+    },
+    {
+      "id": "qwen2.5-14b",
+      "name": "Qwen2.5 14B",
+      "tag": "qwen2.5:14b",
+      "params": "14B",
+      "sizeGB": 9,
+      "kvKbPerTok": 192,
+      "ctxMax": 32768,
+      "tags": [
+        "text",
+        "code",
+        "tools"
+      ],
+      "blurb": "The value pick in the mid tier — near-32B quality at roughly half the memory."
+    },
+    {
+      "id": "qwen3-14b",
+      "name": "Qwen3 14B",
+      "tag": "qwen3:14b",
+      "params": "14B",
+      "sizeGB": 9.3,
+      "kvKbPerTok": 192,
+      "ctxMax": 32768,
+      "tags": [
+        "text",
+        "reasoning",
+        "tools"
+      ],
+      "blurb": "Qwen3's mid-size model with thinking mode. Excellent agentic behaviour if you have 16GB to spare."
+    },
+    {
+      "id": "deepseek-r1-14b",
+      "name": "DeepSeek-R1 14B",
+      "tag": "deepseek-r1:14b",
+      "params": "14B",
+      "sizeGB": 9,
+      "kvKbPerTok": 192,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "reasoning"
+      ],
+      "blurb": "The mid-tier R1 distill. A real step up in reasoning over the 7B/8B versions."
+    },
+    {
+      "id": "qwen2.5-coder-14b",
+      "name": "Qwen2.5-Coder 14B",
+      "tag": "qwen2.5-coder:14b",
+      "params": "14B",
+      "sizeGB": 9,
+      "kvKbPerTok": 192,
+      "ctxMax": 32768,
+      "tags": [
+        "code",
+        "tools"
+      ],
+      "blurb": "Strong enough for real refactoring work, not just completion. Great local coding assistant at 16GB."
+    },
+    {
+      "id": "deepseek-coder-v2-16b",
+      "name": "DeepSeek-Coder-V2 Lite 16B",
+      "tag": "deepseek-coder-v2:16b",
+      "params": "16B (2.4B active)",
+      "sizeGB": 8.9,
+      "kvKbPerTok": 96,
+      "ctxMax": 131072,
+      "tags": [
+        "code",
+        "moe",
+        "tools"
+      ],
+      "blurb": "Mixture-of-experts coder — only 2.4B params active, so it runs fast while holding 16B of knowledge."
+    },
+    {
+      "id": "llava-13b",
+      "name": "LLaVA 13B",
+      "tag": "llava:13b",
+      "params": "13B",
+      "sizeGB": 8,
+      "kvKbPerTok": 160,
+      "ctxMax": 4096,
+      "tags": [
+        "vision"
+      ],
+      "blurb": "The larger LLaVA. Better visual detail than the 7B, same short context."
+    },
+    {
+      "id": "mistral-small-22b",
+      "name": "Mistral Small 22B",
+      "tag": "mistral-small:22b",
+      "params": "22B",
+      "sizeGB": 13,
+      "kvKbPerTok": 224,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "tools"
+      ],
+      "blurb": "Mistral's mid-weight flagship. Genuinely strong general model if you have 16GB+ of VRAM."
+    },
+    {
+      "id": "codestral-22b",
+      "name": "Codestral 22B",
+      "tag": "codestral:22b",
+      "params": "22B",
+      "sizeGB": 13,
+      "kvKbPerTok": 224,
+      "ctxMax": 32768,
+      "tags": [
+        "code"
+      ],
+      "blurb": "Mistral's dedicated code model covering 80+ languages. Excellent fill-in-the-middle."
+    },
+    {
+      "id": "gemma2-27b",
+      "name": "Gemma 2 27B",
+      "tag": "gemma2:27b",
+      "params": "27B",
+      "sizeGB": 16,
+      "kvKbPerTok": 256,
+      "ctxMax": 8192,
+      "tags": [
+        "text"
+      ],
+      "blurb": "Best-in-class writing quality among open models at release. Held back by the 8K context."
+    },
+    {
+      "id": "gemma3-27b",
+      "name": "Gemma 3 27B",
+      "tag": "gemma3:27b",
+      "params": "27B",
+      "sizeGB": 17,
+      "kvKbPerTok": 256,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "vision"
+      ],
+      "blurb": "The flagship Gemma 3 — multimodal, 128K context, and excellent prose. Wants a 24GB card."
+    },
+    {
+      "id": "qwen3-30b-a3b",
+      "name": "Qwen3 30B-A3B",
+      "tag": "qwen3:30b-a3b",
+      "params": "30B (3B active)",
+      "sizeGB": 19,
+      "kvKbPerTok": 96,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "reasoning",
+        "tools",
+        "moe"
+      ],
+      "blurb": "Frontier reasoning with only ~3B params active — fast on a 24GB card while matching much larger dense models."
+    },
+    {
+      "id": "qwen2.5-32b",
+      "name": "Qwen2.5 32B",
+      "tag": "qwen2.5:32b",
+      "params": "32B",
+      "sizeGB": 20,
+      "kvKbPerTok": 256,
+      "ctxMax": 32768,
+      "tags": [
+        "text",
+        "code",
+        "tools"
+      ],
+      "blurb": "Dense 32B with broad capability. A serious local assistant if you can hold 20GB."
+    },
+    {
+      "id": "qwen3-32b",
+      "name": "Qwen3 32B",
+      "tag": "qwen3:32b",
+      "params": "32B",
+      "sizeGB": 20,
+      "kvKbPerTok": 256,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "reasoning",
+        "tools"
+      ],
+      "blurb": "The dense Qwen3 flagship. Slower than the 30B-A3B MoE but stronger on knowledge-heavy tasks."
+    },
+    {
+      "id": "deepseek-r1-32b",
+      "name": "DeepSeek-R1 32B",
+      "tag": "deepseek-r1:32b",
+      "params": "32B",
+      "sizeGB": 20,
+      "kvKbPerTok": 256,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "reasoning"
+      ],
+      "blurb": "The strongest R1 distill that fits on a single 24GB card. Excellent at maths and proofs."
+    },
+    {
+      "id": "qwen2.5-coder-32b",
+      "name": "Qwen2.5-Coder 32B",
+      "tag": "qwen2.5-coder:32b",
+      "params": "32B",
+      "sizeGB": 20,
+      "kvKbPerTok": 256,
+      "ctxMax": 32768,
+      "tags": [
+        "code",
+        "tools"
+      ],
+      "blurb": "The best open coding model you can run on one consumer GPU. Rivals frontier cloud models on many tasks."
+    },
+    {
+      "id": "command-r-35b",
+      "name": "Command R 35B",
+      "tag": "command-r:35b",
+      "params": "35B",
+      "sizeGB": 20,
+      "kvKbPerTok": 256,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "tools"
+      ],
+      "blurb": "Cohere's RAG-tuned model. Built for grounded generation with citations over your own documents."
+    },
+    {
+      "id": "aya-expanse-32b",
+      "name": "Aya Expanse 32B",
+      "tag": "aya-expanse:32b",
+      "params": "32B",
+      "sizeGB": 20,
+      "kvKbPerTok": 256,
+      "ctxMax": 131072,
+      "tags": [
+        "text"
+      ],
+      "blurb": "The large multilingual Aya. The best open option if you work across many languages."
+    },
+    {
+      "id": "yi-34b",
+      "name": "Yi 34B",
+      "tag": "yi:34b",
+      "params": "34B",
+      "sizeGB": 19,
+      "kvKbPerTok": 240,
+      "ctxMax": 32768,
+      "tags": [
+        "text"
+      ],
+      "blurb": "01.AI's bilingual model. Strong English and Chinese, good long-context recall."
+    },
+    {
+      "id": "codellama-34b",
+      "name": "Code Llama 34B",
+      "tag": "codellama:34b",
+      "params": "34B",
+      "sizeGB": 19,
+      "kvKbPerTok": 240,
+      "ctxMax": 16384,
+      "tags": [
+        "code"
+      ],
+      "blurb": "Meta's large code model. Largely superseded by Qwen2.5-Coder but still solid on C and C++."
+    },
+    {
+      "id": "llava-34b",
+      "name": "LLaVA 34B",
+      "tag": "llava:34b",
+      "params": "34B",
+      "sizeGB": 20,
+      "kvKbPerTok": 240,
+      "ctxMax": 4096,
+      "tags": [
+        "vision"
+      ],
+      "blurb": "The largest LLaVA. Best visual reasoning in the family; short context and heavy."
+    },
+    {
+      "id": "mixtral-8x7b",
+      "name": "Mixtral 8x7B",
+      "tag": "mixtral:8x7b",
+      "params": "47B (13B active)",
+      "sizeGB": 26,
+      "kvKbPerTok": 128,
+      "ctxMax": 32768,
+      "tags": [
+        "text",
+        "moe"
+      ],
+      "blurb": "The MoE that made sparse models mainstream. Fast for its knowledge, but wants 32GB."
+    },
+    {
+      "id": "llama3.3-70b",
+      "name": "Llama 3.3 70B",
+      "tag": "llama3.3:70b",
+      "params": "70B",
+      "sizeGB": 43,
+      "kvKbPerTok": 320,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "tools"
+      ],
+      "blurb": "Meta's strongest open instruct model — roughly 405B quality at 70B cost. Needs a 48GB card or dual GPUs."
+    },
+    {
+      "id": "llama3.1-70b",
+      "name": "Llama 3.1 70B",
+      "tag": "llama3.1:70b",
+      "params": "70B",
+      "sizeGB": 40,
+      "kvKbPerTok": 320,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "tools"
+      ],
+      "blurb": "The previous 70B flagship. Still excellent; 3.3 is strictly better at the same size."
+    },
+    {
+      "id": "deepseek-r1-70b",
+      "name": "DeepSeek-R1 70B",
+      "tag": "deepseek-r1:70b",
+      "params": "70B",
+      "sizeGB": 43,
+      "kvKbPerTok": 320,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "reasoning"
+      ],
+      "blurb": "The largest R1 distill. Approaches frontier reasoning if you have the hardware to hold it."
+    },
+    {
+      "id": "qwen2.5-72b",
+      "name": "Qwen2.5 72B",
+      "tag": "qwen2.5:72b",
+      "params": "72B",
+      "sizeGB": 47,
+      "kvKbPerTok": 320,
+      "ctxMax": 32768,
+      "tags": [
+        "text",
+        "code",
+        "tools"
+      ],
+      "blurb": "Qwen's dense flagship. One of the strongest open models overall, at serious hardware cost."
+    },
+    {
+      "id": "nemotron-70b",
+      "name": "Nemotron 70B",
+      "tag": "nemotron:70b",
+      "params": "70B",
+      "sizeGB": 43,
+      "kvKbPerTok": 320,
+      "ctxMax": 131072,
+      "tags": [
+        "text"
+      ],
+      "blurb": "NVIDIA's RLHF-tuned Llama 3.1. Tuned hard for helpfulness; scored exceptionally on human-preference evals."
+    },
+    {
+      "id": "athene-v2-72b",
+      "name": "Athene V2 72B",
+      "tag": "athene-v2:72b",
+      "params": "72B",
+      "sizeGB": 47,
+      "kvKbPerTok": 320,
+      "ctxMax": 32768,
+      "tags": [
+        "text",
+        "code",
+        "tools"
+      ],
+      "blurb": "A Qwen2.5-72B tune targeting chat, code, and maths. Competitive with frontier cloud models."
+    },
+    {
+      "id": "llama3.2-vision-90b",
+      "name": "Llama 3.2 Vision 90B",
+      "tag": "llama3.2-vision:90b",
+      "params": "90B",
+      "sizeGB": 55,
+      "kvKbPerTok": 340,
+      "ctxMax": 131072,
+      "tags": [
+        "vision",
+        "tools"
+      ],
+      "blurb": "Meta's large multimodal model. Workstation-class hardware only."
+    },
+    {
+      "id": "command-r-plus",
+      "name": "Command R+ 104B",
+      "tag": "command-r-plus:104b",
+      "params": "104B",
+      "sizeGB": 59,
+      "kvKbPerTok": 340,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "tools"
+      ],
+      "blurb": "Cohere's flagship RAG model. Excellent grounded generation; needs 64GB+."
+    },
+    {
+      "id": "mixtral-8x22b",
+      "name": "Mixtral 8x22B",
+      "tag": "mixtral:8x22b",
+      "params": "141B (39B active)",
+      "sizeGB": 80,
+      "kvKbPerTok": 224,
+      "ctxMax": 65536,
+      "tags": [
+        "text",
+        "moe"
+      ],
+      "blurb": "The large Mixtral MoE. Strong and comparatively fast to run — if you can fit 80GB."
+    },
+    {
+      "id": "qwen3-235b-a22b",
+      "name": "Qwen3 235B-A22B",
+      "tag": "qwen3:235b-a22b",
+      "params": "235B (22B active)",
+      "sizeGB": 142,
+      "kvKbPerTok": 192,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "reasoning",
+        "tools",
+        "moe"
+      ],
+      "blurb": "Qwen3's frontier MoE. Genuinely competitive with closed models — and needs a multi-GPU server."
+    },
+    {
+      "id": "llama3.1-405b",
+      "name": "Llama 3.1 405B",
+      "tag": "llama3.1:405b",
+      "params": "405B",
+      "sizeGB": 231,
+      "kvKbPerTok": 400,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "tools"
+      ],
+      "blurb": "Meta's largest open model. Datacentre hardware only — listed for completeness."
+    },
+    {
+      "id": "deepseek-r1-671b",
+      "name": "DeepSeek-R1 671B",
+      "tag": "deepseek-r1:671b",
+      "params": "671B (37B active)",
+      "sizeGB": 404,
+      "kvKbPerTok": 300,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "reasoning",
+        "moe"
+      ],
+      "blurb": "The full R1, not a distill. Frontier-grade reasoning; needs a rack, not a desk."
+    },
+    {
+      "id": "gemma3-270m",
+      "name": "Gemma 3 270M",
+      "tag": "gemma3:270m",
+      "params": "270M",
+      "sizeGB": 0.29,
+      "kvKbPerTok": 14,
+      "ctxMax": 32768,
+      "tags": [
+        "text",
+        "tiny"
+      ],
+      "blurb": "Google's smallest Gemma. Built for on-device classification and extraction rather than conversation."
+    },
+    {
+      "id": "gemma3n-e2b",
+      "name": "Gemma 3n E2B",
+      "tag": "gemma3n:e2b",
+      "params": "2B effective",
+      "sizeGB": 1.6,
+      "kvKbPerTok": 44,
+      "ctxMax": 32768,
+      "tags": [
+        "text",
+        "tiny"
+      ],
+      "blurb": "Engineered for phones and laptops — selective parameter loading keeps memory use far below the raw size."
+    },
+    {
+      "id": "gemma3n-e4b",
+      "name": "Gemma 3n E4B",
+      "tag": "gemma3n:e4b",
+      "params": "4B effective",
+      "sizeGB": 2.8,
+      "kvKbPerTok": 60,
+      "ctxMax": 32768,
+      "tags": [
+        "text"
+      ],
+      "blurb": "The larger on-device Gemma 3n. Good quality-per-megabyte on everyday hardware."
+    },
+    {
+      "id": "phi4-mini",
+      "name": "Phi-4 Mini",
+      "tag": "phi4-mini:3.8b",
+      "params": "3.8B",
+      "sizeGB": 2.5,
+      "kvKbPerTok": 64,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "tools"
+      ],
+      "blurb": "Microsoft's small Phi-4. Strong multilingual, maths, and reasoning for under 3GB, with tool calling."
+    },
+    {
+      "id": "granite4.1-3b",
+      "name": "Granite 4.1 3B",
+      "tag": "granite4.1:3b",
+      "params": "3B",
+      "sizeGB": 2,
+      "kvKbPerTok": 48,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "tools"
+      ],
+      "blurb": "IBM's compact enterprise model. Apache-2.0, tuned for RAG and structured extraction."
+    },
+    {
+      "id": "granite4.1-30b",
+      "name": "Granite 4.1 30B",
+      "tag": "granite4.1:30b",
+      "params": "30B",
+      "sizeGB": 18,
+      "kvKbPerTok": 240,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "tools"
+      ],
+      "blurb": "The large Granite 4.1. Enterprise-focused with strong multilingual and long-context handling."
+    },
+    {
+      "id": "falcon3-1b",
+      "name": "Falcon 3 1B",
+      "tag": "falcon3:1b",
+      "params": "1B",
+      "sizeGB": 0.9,
+      "kvKbPerTok": 32,
+      "ctxMax": 8192,
+      "tags": [
+        "text",
+        "tiny"
+      ],
+      "blurb": "The smallest Falcon 3. Decent maths and science for the size."
+    },
+    {
+      "id": "falcon3-10b",
+      "name": "Falcon 3 10B",
+      "tag": "falcon3:10b",
+      "params": "10B",
+      "sizeGB": 6.3,
+      "kvKbPerTok": 160,
+      "ctxMax": 32768,
+      "tags": [
+        "text"
+      ],
+      "blurb": "TII's largest sub-10B-class model. Targets science, maths, and code specifically."
+    },
+    {
+      "id": "qwq-32b",
+      "name": "QwQ 32B",
+      "tag": "qwq:32b",
+      "params": "32B",
+      "sizeGB": 20,
+      "kvKbPerTok": 256,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "reasoning",
+        "tools"
+      ],
+      "blurb": "Qwen's dedicated reasoning model. Thinks at length before answering — excellent on maths and logic puzzles."
+    },
+    {
+      "id": "openthinker-7b",
+      "name": "OpenThinker 7B",
+      "tag": "openthinker:7b",
+      "params": "7B",
+      "sizeGB": 4.7,
+      "kvKbPerTok": 128,
+      "ctxMax": 32768,
+      "tags": [
+        "text",
+        "reasoning"
+      ],
+      "blurb": "Fully open reasoning model distilled from DeepSeek-R1. Published data and recipe."
+    },
+    {
+      "id": "openthinker-32b",
+      "name": "OpenThinker 32B",
+      "tag": "openthinker:32b",
+      "params": "32B",
+      "sizeGB": 20,
+      "kvKbPerTok": 256,
+      "ctxMax": 32768,
+      "tags": [
+        "text",
+        "reasoning"
+      ],
+      "blurb": "The large fully-open reasoner. Competitive with R1's own distills."
+    },
+    {
+      "id": "deepscaler",
+      "name": "DeepScaleR 1.5B",
+      "tag": "deepscaler:1.5b",
+      "params": "1.5B",
+      "sizeGB": 1.1,
+      "kvKbPerTok": 36,
+      "ctxMax": 32768,
+      "tags": [
+        "text",
+        "tiny",
+        "reasoning"
+      ],
+      "blurb": "A 1.5B that beats o1-preview on maths benchmarks. Narrow but remarkable at what it does."
+    },
+    {
+      "id": "granite-code-3b",
+      "name": "Granite Code 3B",
+      "tag": "granite-code:3b",
+      "params": "3B",
+      "sizeGB": 2,
+      "kvKbPerTok": 48,
+      "ctxMax": 131072,
+      "tags": [
+        "code"
+      ],
+      "blurb": "IBM's small code model, trained on cleanly-licensed source across 116 languages."
+    },
+    {
+      "id": "granite-code-34b",
+      "name": "Granite Code 34B",
+      "tag": "granite-code:34b",
+      "params": "34B",
+      "sizeGB": 19,
+      "kvKbPerTok": 240,
+      "ctxMax": 8192,
+      "tags": [
+        "code"
+      ],
+      "blurb": "The large Granite Code. Enterprise-friendly licensing for commercial codegen."
+    },
+    {
+      "id": "starcoder2-15b",
+      "name": "StarCoder2 15B",
+      "tag": "starcoder2:15b",
+      "params": "15B",
+      "sizeGB": 9.1,
+      "kvKbPerTok": 192,
+      "ctxMax": 16384,
+      "tags": [
+        "code"
+      ],
+      "blurb": "The largest StarCoder2. Best-in-family repository-level completion."
+    },
+    {
+      "id": "deepseek-coder-33b",
+      "name": "DeepSeek-Coder 33B",
+      "tag": "deepseek-coder:33b",
+      "params": "33B",
+      "sizeGB": 19,
+      "kvKbPerTok": 240,
+      "ctxMax": 16384,
+      "tags": [
+        "code"
+      ],
+      "blurb": "The large first-gen DeepSeek coder. Still strong on systems languages."
+    },
+    {
+      "id": "codellama-7b",
+      "name": "Code Llama 7B",
+      "tag": "codellama:7b",
+      "params": "7B",
+      "sizeGB": 3.8,
+      "kvKbPerTok": 128,
+      "ctxMax": 16384,
+      "tags": [
+        "code"
+      ],
+      "blurb": "Meta's small code model. Largely superseded, but a light option for completion."
+    },
+    {
+      "id": "codellama-13b",
+      "name": "Code Llama 13B",
+      "tag": "codellama:13b",
+      "params": "13B",
+      "sizeGB": 7.4,
+      "kvKbPerTok": 160,
+      "ctxMax": 16384,
+      "tags": [
+        "code"
+      ],
+      "blurb": "The mid-size Code Llama. Reasonable infilling; newer Qwen coders beat it."
+    },
+    {
+      "id": "qwen2.5-coder-0.5b",
+      "name": "Qwen2.5-Coder 0.5B",
+      "tag": "qwen2.5-coder:0.5b",
+      "params": "0.5B",
+      "sizeGB": 0.4,
+      "kvKbPerTok": 24,
+      "ctxMax": 32768,
+      "tags": [
+        "code",
+        "tiny"
+      ],
+      "blurb": "Absolute smallest usable coder. Autocomplete only, but runs on anything."
+    },
+    {
+      "id": "hermes3-3b",
+      "name": "Hermes 3 3B",
+      "tag": "hermes3:3b",
+      "params": "3B",
+      "sizeGB": 2,
+      "kvKbPerTok": 48,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "tools"
+      ],
+      "blurb": "The small Hermes 3. Good function calling for its size — a light agent backbone."
+    },
+    {
+      "id": "hermes3-70b",
+      "name": "Hermes 3 70B",
+      "tag": "hermes3:70b",
+      "params": "70B",
+      "sizeGB": 43,
+      "kvKbPerTok": 320,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "tools"
+      ],
+      "blurb": "Nous Research's large flagship. Excellent steerability and agentic behaviour."
+    },
+    {
+      "id": "mistral-small3.2",
+      "name": "Mistral Small 3.2 24B",
+      "tag": "mistral-small3.2:24b",
+      "params": "24B",
+      "sizeGB": 14,
+      "kvKbPerTok": 224,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "vision",
+        "tools"
+      ],
+      "blurb": "The refreshed Mistral Small — now multimodal, with better instruction-following than 3.1."
+    },
+    {
+      "id": "magistral-24b",
+      "name": "Magistral 24B",
+      "tag": "magistral:24b",
+      "params": "24B",
+      "sizeGB": 14,
+      "kvKbPerTok": 224,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "reasoning",
+        "tools"
+      ],
+      "blurb": "Mistral's reasoning model. Shows transparent multi-step working, tuned for European languages."
+    },
+    {
+      "id": "devstral-24b",
+      "name": "Devstral 24B",
+      "tag": "devstral:24b",
+      "params": "24B",
+      "sizeGB": 14,
+      "kvKbPerTok": 224,
+      "ctxMax": 131072,
+      "tags": [
+        "code",
+        "tools"
+      ],
+      "blurb": "Mistral's agentic coding model — built to drive tools and edit real repositories, not just complete lines."
+    },
+    {
+      "id": "gpt-oss-20b",
+      "name": "gpt-oss 20B",
+      "tag": "gpt-oss:20b",
+      "params": "21B (3.6B active)",
+      "sizeGB": 14,
+      "kvKbPerTok": 96,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "reasoning",
+        "tools",
+        "moe"
+      ],
+      "blurb": "OpenAI's open-weight MoE. Only ~3.6B params active, so it runs fast on a 16GB card with configurable reasoning effort."
+    },
+    {
+      "id": "gpt-oss-120b",
+      "name": "gpt-oss 120B",
+      "tag": "gpt-oss:120b",
+      "params": "117B (5.1B active)",
+      "sizeGB": 65,
+      "kvKbPerTok": 128,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "reasoning",
+        "tools",
+        "moe"
+      ],
+      "blurb": "The large open-weight OpenAI MoE. Near-frontier reasoning; wants 80GB but is sparse enough to run well when it fits."
+    },
+    {
+      "id": "llama4-scout",
+      "name": "Llama 4 Scout",
+      "tag": "llama4:16x17b",
+      "params": "109B (17B active)",
+      "sizeGB": 67,
+      "kvKbPerTok": 128,
+      "ctxMax": 1048576,
+      "tags": [
+        "text",
+        "vision",
+        "tools",
+        "moe"
+      ],
+      "blurb": "Meta's multimodal MoE with a 10M-token context ceiling. Only 17B active, so it's quicker than the size suggests."
+    },
+    {
+      "id": "llama4-maverick",
+      "name": "Llama 4 Maverick",
+      "tag": "llama4:128x17b",
+      "params": "400B (17B active)",
+      "sizeGB": 245,
+      "kvKbPerTok": 160,
+      "ctxMax": 1048576,
+      "tags": [
+        "text",
+        "vision",
+        "tools",
+        "moe"
+      ],
+      "blurb": "The large Llama 4. Frontier multimodal quality at 17B active params — but 245GB of weights to hold."
+    },
+    {
+      "id": "qwen3.5-0.8b",
+      "name": "Qwen3.5 0.8B",
+      "tag": "qwen3.5:0.8b",
+      "params": "0.8B",
+      "sizeGB": 0.6,
+      "kvKbPerTok": 24,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "tiny",
+        "reasoning",
+        "tools"
+      ],
+      "blurb": "The smallest Qwen3.5. Multimodal-capable family with thinking mode, at a size that runs anywhere."
+    },
+    {
+      "id": "qwen3.5-9b",
+      "name": "Qwen3.5 9B",
+      "tag": "qwen3.5:9b",
+      "params": "9B",
+      "sizeGB": 5.6,
+      "kvKbPerTok": 128,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "vision",
+        "reasoning",
+        "tools"
+      ],
+      "blurb": "The everyday Qwen3.5. Vision, thinking, and tool use in a package that fits a 12GB card comfortably."
+    },
+    {
+      "id": "qwen3.5-32b",
+      "name": "Qwen3.5 32B",
+      "tag": "qwen3.5:32b",
+      "params": "32B",
+      "sizeGB": 20,
+      "kvKbPerTok": 256,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "vision",
+        "reasoning",
+        "tools"
+      ],
+      "blurb": "The dense Qwen3.5 flagship for single-GPU rigs. Strong across vision, reasoning, and agentic work."
+    },
+    {
+      "id": "qwen3.5-122b",
+      "name": "Qwen3.5 122B",
+      "tag": "qwen3.5:122b",
+      "params": "122B",
+      "sizeGB": 73,
+      "kvKbPerTok": 320,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "vision",
+        "reasoning",
+        "tools"
+      ],
+      "blurb": "The largest local Qwen3.5. Workstation-class, but genuinely frontier-adjacent."
+    },
+    {
+      "id": "qwen3.6-27b",
+      "name": "Qwen3.6 27B",
+      "tag": "qwen3.6:27b",
+      "params": "27B",
+      "sizeGB": 17,
+      "kvKbPerTok": 240,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "vision",
+        "reasoning",
+        "tools"
+      ],
+      "blurb": "Widely rated the best all-round local model of 2026. Improved agentic coding and better thinking preservation across turns."
+    },
+    {
+      "id": "qwen3.6-35b",
+      "name": "Qwen3.6 35B",
+      "tag": "qwen3.6:35b",
+      "params": "35B",
+      "sizeGB": 21,
+      "kvKbPerTok": 256,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "vision",
+        "reasoning",
+        "tools"
+      ],
+      "blurb": "The larger Qwen3.6. A step up on hard agentic tasks if you can hold 21GB."
+    },
+    {
+      "id": "qwen3-vl-2b",
+      "name": "Qwen3-VL 2B",
+      "tag": "qwen3-vl:2b",
+      "params": "2B",
+      "sizeGB": 1.8,
+      "kvKbPerTok": 44,
+      "ctxMax": 131072,
+      "tags": [
+        "vision",
+        "tiny",
+        "tools"
+      ],
+      "blurb": "Tiny vision-language model. Handles OCR and screenshots on modest hardware."
+    },
+    {
+      "id": "qwen3-vl-32b",
+      "name": "Qwen3-VL 32B",
+      "tag": "qwen3-vl:32b",
+      "params": "32B",
+      "sizeGB": 20,
+      "kvKbPerTok": 256,
+      "ctxMax": 131072,
+      "tags": [
+        "vision",
+        "reasoning",
+        "tools"
+      ],
+      "blurb": "The strongest vision model you can run on one consumer GPU. Excellent charts, documents, and UI understanding."
+    },
+    {
+      "id": "qwen3-vl-235b",
+      "name": "Qwen3-VL 235B",
+      "tag": "qwen3-vl:235b",
+      "params": "235B (22B active)",
+      "sizeGB": 142,
+      "kvKbPerTok": 192,
+      "ctxMax": 131072,
+      "tags": [
+        "vision",
+        "reasoning",
+        "tools",
+        "moe"
+      ],
+      "blurb": "The most powerful vision model in the Qwen family. Multi-GPU territory."
+    },
+    {
+      "id": "gemma4-31b",
+      "name": "Gemma 4 31B",
+      "tag": "gemma4:31b",
+      "params": "31B",
+      "sizeGB": 19,
+      "kvKbPerTok": 256,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "vision",
+        "reasoning"
+      ],
+      "blurb": "Google's latest flagship Gemma — multimodal with audio input and thinking mode. Excellent prose quality."
+    },
+    {
+      "id": "deepseek-v3.1",
+      "name": "DeepSeek-V3.1",
+      "tag": "deepseek-v3.1:671b",
+      "params": "671B (37B active)",
+      "sizeGB": 404,
+      "kvKbPerTok": 300,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "tools",
+        "moe"
+      ],
+      "blurb": "DeepSeek's flagship MoE. Frontier general capability; server hardware only."
+    },
+    {
+      "id": "mistral-medium3.5",
+      "name": "Mistral Medium 3.5",
+      "tag": "mistral-medium3.5:128b",
+      "params": "128B",
+      "sizeGB": 77,
+      "kvKbPerTok": 320,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "vision",
+        "reasoning",
+        "tools"
+      ],
+      "blurb": "Mistral's flagship merging instruction-following, reasoning, and coding. Multi-GPU or a very large workstation."
+    },
+    {
+      "id": "hh-r1-1.5b",
+      "name": "DeepSeek-R1 1.5B (abliterated)",
+      "tag": "huihui_ai/deepseek-r1-abliterated:1.5b",
+      "params": "1.5B",
+      "sizeGB": 1.1,
+      "kvKbPerTok": 36,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "tiny",
+        "reasoning",
+        "abliterated",
+        "uncensored"
+      ],
+      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+    },
+    {
+      "id": "hh-r1-7b",
+      "name": "DeepSeek-R1 7B (abliterated)",
+      "tag": "huihui_ai/deepseek-r1-abliterated:7b",
+      "params": "7B",
+      "sizeGB": 4.7,
+      "kvKbPerTok": 128,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "reasoning",
+        "abliterated",
+        "uncensored"
+      ],
+      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+    },
+    {
+      "id": "hh-r1-8b",
+      "name": "DeepSeek-R1 8B (abliterated)",
+      "tag": "huihui_ai/deepseek-r1-abliterated:8b",
+      "params": "8B",
+      "sizeGB": 5.2,
+      "kvKbPerTok": 128,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "reasoning",
+        "abliterated",
+        "uncensored"
+      ],
+      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+    },
+    {
+      "id": "hh-r1-14b",
+      "name": "DeepSeek-R1 14B (abliterated)",
+      "tag": "huihui_ai/deepseek-r1-abliterated:14b",
+      "params": "14B",
+      "sizeGB": 9,
+      "kvKbPerTok": 192,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "reasoning",
+        "abliterated",
+        "uncensored"
+      ],
+      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+    },
+    {
+      "id": "hh-r1-32b",
+      "name": "DeepSeek-R1 32B (abliterated)",
+      "tag": "huihui_ai/deepseek-r1-abliterated:32b",
+      "params": "32B",
+      "sizeGB": 20,
+      "kvKbPerTok": 256,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "reasoning",
+        "abliterated",
+        "uncensored"
+      ],
+      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+    },
+    {
+      "id": "hh-r1-70b",
+      "name": "DeepSeek-R1 70B (abliterated)",
+      "tag": "huihui_ai/deepseek-r1-abliterated:70b",
+      "params": "70B",
+      "sizeGB": 43,
+      "kvKbPerTok": 320,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "reasoning",
+        "abliterated",
+        "uncensored"
+      ],
+      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+    },
+    {
+      "id": "hh-qwen3-0.6b",
+      "name": "Qwen3 0.6B (abliterated)",
+      "tag": "huihui_ai/qwen3-abliterated:0.6b",
+      "params": "0.6B",
+      "sizeGB": 0.52,
+      "kvKbPerTok": 24,
+      "ctxMax": 32768,
+      "tags": [
+        "text",
+        "tiny",
+        "reasoning",
+        "tools",
+        "abliterated",
+        "uncensored"
+      ],
+      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+    },
+    {
+      "id": "hh-qwen3-1.7b",
+      "name": "Qwen3 1.7B (abliterated)",
+      "tag": "huihui_ai/qwen3-abliterated:1.7b",
+      "params": "1.7B",
+      "sizeGB": 1.4,
+      "kvKbPerTok": 40,
+      "ctxMax": 32768,
+      "tags": [
+        "text",
+        "tiny",
+        "reasoning",
+        "tools",
+        "abliterated",
+        "uncensored"
+      ],
+      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+    },
+    {
+      "id": "hh-qwen3-4b",
+      "name": "Qwen3 4B (abliterated)",
+      "tag": "huihui_ai/qwen3-abliterated:4b",
+      "params": "4B",
+      "sizeGB": 2.6,
+      "kvKbPerTok": 56,
+      "ctxMax": 32768,
+      "tags": [
+        "text",
+        "reasoning",
+        "tools",
+        "abliterated",
+        "uncensored"
+      ],
+      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+    },
+    {
+      "id": "hh-qwen3-8b",
+      "name": "Qwen3 8B (abliterated)",
+      "tag": "huihui_ai/qwen3-abliterated:8b",
+      "params": "8B",
+      "sizeGB": 5.2,
+      "kvKbPerTok": 128,
+      "ctxMax": 32768,
+      "tags": [
+        "text",
+        "reasoning",
+        "tools",
+        "abliterated",
+        "uncensored"
+      ],
+      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+    },
+    {
+      "id": "hh-qwen3-14b",
+      "name": "Qwen3 14B (abliterated)",
+      "tag": "huihui_ai/qwen3-abliterated:14b",
+      "params": "14B",
+      "sizeGB": 9.3,
+      "kvKbPerTok": 192,
+      "ctxMax": 32768,
+      "tags": [
+        "text",
+        "reasoning",
+        "tools",
+        "abliterated",
+        "uncensored"
+      ],
+      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+    },
+    {
+      "id": "hh-qwen3-30b",
+      "name": "Qwen3 30B (abliterated)",
+      "tag": "huihui_ai/qwen3-abliterated:30b",
+      "params": "30B",
+      "sizeGB": 19,
+      "kvKbPerTok": 96,
+      "ctxMax": 32768,
+      "tags": [
+        "text",
+        "moe",
+        "reasoning",
+        "tools",
+        "abliterated",
+        "uncensored"
+      ],
+      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+    },
+    {
+      "id": "hh-qwen3-32b",
+      "name": "Qwen3 32B (abliterated)",
+      "tag": "huihui_ai/qwen3-abliterated:32b",
+      "params": "32B",
+      "sizeGB": 20,
+      "kvKbPerTok": 256,
+      "ctxMax": 32768,
+      "tags": [
+        "text",
+        "reasoning",
+        "tools",
+        "abliterated",
+        "uncensored"
+      ],
+      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+    },
+    {
+      "id": "hh-qwen3-235b",
+      "name": "Qwen3 235B (abliterated)",
+      "tag": "huihui_ai/qwen3-abliterated:235b",
+      "params": "235B",
+      "sizeGB": 142,
+      "kvKbPerTok": 192,
+      "ctxMax": 32768,
+      "tags": [
+        "text",
+        "moe",
+        "reasoning",
+        "tools",
+        "abliterated",
+        "uncensored"
+      ],
+      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+    },
+    {
+      "id": "hh-qwen35-0.8b",
+      "name": "Qwen3.5 0.8B (abliterated)",
+      "tag": "huihui_ai/qwen3.5-abliterated:0.8b",
+      "params": "0.8B",
+      "sizeGB": 0.6,
+      "kvKbPerTok": 24,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "tiny",
+        "reasoning",
+        "tools",
+        "abliterated",
+        "uncensored"
+      ],
+      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+    },
+    {
+      "id": "hh-qwen35-2b",
+      "name": "Qwen3.5 2B (abliterated)",
+      "tag": "huihui_ai/qwen3.5-abliterated:2b",
+      "params": "2B",
+      "sizeGB": 1.5,
+      "kvKbPerTok": 44,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "tiny",
+        "reasoning",
+        "tools",
+        "abliterated",
+        "uncensored"
+      ],
+      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+    },
+    {
+      "id": "hh-qwen35-4b",
+      "name": "Qwen3.5 4B (abliterated)",
+      "tag": "huihui_ai/qwen3.5-abliterated:4b",
+      "params": "4B",
+      "sizeGB": 2.7,
+      "kvKbPerTok": 56,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "reasoning",
+        "tools",
+        "abliterated",
+        "uncensored"
+      ],
+      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+    },
+    {
+      "id": "hh-qwen35-9b",
+      "name": "Qwen3.5 9B (abliterated)",
+      "tag": "huihui_ai/qwen3.5-abliterated:9b",
+      "params": "9B",
+      "sizeGB": 5.6,
+      "kvKbPerTok": 128,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "vision",
+        "reasoning",
+        "tools",
+        "abliterated",
+        "uncensored"
+      ],
+      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+    },
+    {
+      "id": "hh-qwen35-27b",
+      "name": "Qwen3.5 27B (abliterated)",
+      "tag": "huihui_ai/qwen3.5-abliterated:27b",
+      "params": "27B",
+      "sizeGB": 17,
+      "kvKbPerTok": 240,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "vision",
+        "reasoning",
+        "tools",
+        "abliterated",
+        "uncensored"
+      ],
+      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+    },
+    {
+      "id": "hh-qwen35-35b",
+      "name": "Qwen3.5 35B (abliterated)",
+      "tag": "huihui_ai/qwen3.5-abliterated:35b",
+      "params": "35B",
+      "sizeGB": 21,
+      "kvKbPerTok": 256,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "vision",
+        "reasoning",
+        "tools",
+        "abliterated",
+        "uncensored"
+      ],
+      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+    },
+    {
+      "id": "hh-qwen35-122b",
+      "name": "Qwen3.5 122B (abliterated)",
+      "tag": "huihui_ai/qwen3.5-abliterated:122b",
+      "params": "122B",
+      "sizeGB": 73,
+      "kvKbPerTok": 320,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "vision",
+        "reasoning",
+        "tools",
+        "abliterated",
+        "uncensored"
+      ],
+      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+    },
+    {
+      "id": "hh-qwen36-27b",
+      "name": "Qwen3.6 27B (abliterated)",
+      "tag": "huihui_ai/Qwen3.6-abliterated:27b",
+      "params": "27B",
+      "sizeGB": 17,
+      "kvKbPerTok": 240,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "vision",
+        "reasoning",
+        "tools",
+        "abliterated",
+        "uncensored"
+      ],
+      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+    },
+    {
+      "id": "hh-qwen36-35b",
+      "name": "Qwen3.6 35B (abliterated)",
+      "tag": "huihui_ai/Qwen3.6-abliterated:35b",
+      "params": "35B",
+      "sizeGB": 21,
+      "kvKbPerTok": 256,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "vision",
+        "reasoning",
+        "tools",
+        "abliterated",
+        "uncensored"
+      ],
+      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+    },
+    {
+      "id": "hh-gemma3-270m",
+      "name": "Gemma 3 270M (abliterated)",
+      "tag": "huihui_ai/gemma3-abliterated:270m",
+      "params": "270M",
+      "sizeGB": 0.29,
+      "kvKbPerTok": 14,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "tiny",
+        "abliterated",
+        "uncensored"
+      ],
+      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+    },
+    {
+      "id": "hh-gemma3-1b",
+      "name": "Gemma 3 1B (abliterated)",
+      "tag": "huihui_ai/gemma3-abliterated:1b",
+      "params": "1B",
+      "sizeGB": 0.82,
+      "kvKbPerTok": 40,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "tiny",
+        "abliterated",
+        "uncensored"
+      ],
+      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+    },
+    {
+      "id": "hh-gemma3-4b",
+      "name": "Gemma 3 4B (abliterated)",
+      "tag": "huihui_ai/gemma3-abliterated:4b",
+      "params": "4B",
+      "sizeGB": 3.3,
+      "kvKbPerTok": 72,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "vision",
+        "abliterated",
+        "uncensored"
+      ],
+      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+    },
+    {
+      "id": "hh-gemma3-12b",
+      "name": "Gemma 3 12B (abliterated)",
+      "tag": "huihui_ai/gemma3-abliterated:12b",
+      "params": "12B",
+      "sizeGB": 8.1,
+      "kvKbPerTok": 176,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "vision",
+        "abliterated",
+        "uncensored"
+      ],
+      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+    },
+    {
+      "id": "hh-gemma3-27b",
+      "name": "Gemma 3 27B (abliterated)",
+      "tag": "huihui_ai/gemma3-abliterated:27b",
+      "params": "27B",
+      "sizeGB": 17,
+      "kvKbPerTok": 256,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "vision",
+        "abliterated",
+        "uncensored"
+      ],
+      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+    },
+    {
+      "id": "hh-gemma4-e2b",
+      "name": "Gemma 4 E2B (abliterated)",
+      "tag": "huihui_ai/gemma-4-abliterated:e2b",
+      "params": "E2B",
+      "sizeGB": 1.6,
+      "kvKbPerTok": 44,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "tiny",
+        "reasoning",
+        "abliterated",
+        "uncensored"
+      ],
+      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+    },
+    {
+      "id": "hh-gemma4-e4b",
+      "name": "Gemma 4 E4B (abliterated)",
+      "tag": "huihui_ai/gemma-4-abliterated:e4b",
+      "params": "E4B",
+      "sizeGB": 2.8,
+      "kvKbPerTok": 60,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "reasoning",
+        "abliterated",
+        "uncensored"
+      ],
+      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+    },
+    {
+      "id": "hh-gemma4-12b",
+      "name": "Gemma 4 12B (abliterated)",
+      "tag": "huihui_ai/gemma-4-abliterated:12b",
+      "params": "12B",
+      "sizeGB": 8.1,
+      "kvKbPerTok": 176,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "vision",
+        "reasoning",
+        "abliterated",
+        "uncensored"
+      ],
+      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+    },
+    {
+      "id": "hh-gemma4-26b",
+      "name": "Gemma 4 26B (abliterated)",
+      "tag": "huihui_ai/gemma-4-abliterated:26b",
+      "params": "26B",
+      "sizeGB": 16,
+      "kvKbPerTok": 240,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "vision",
+        "reasoning",
+        "abliterated",
+        "uncensored"
+      ],
+      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+    },
+    {
+      "id": "hh-gemma4-31b",
+      "name": "Gemma 4 31B (abliterated)",
+      "tag": "huihui_ai/gemma-4-abliterated:31b",
+      "params": "31B",
+      "sizeGB": 19,
+      "kvKbPerTok": 256,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "vision",
+        "reasoning",
+        "abliterated",
+        "uncensored"
+      ],
+      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+    },
+    {
+      "id": "hh-gemma4-48b",
+      "name": "Gemma 4 48B (abliterated)",
+      "tag": "huihui_ai/gemma-4-abliterated:48b",
+      "params": "48B",
+      "sizeGB": 29,
+      "kvKbPerTok": 288,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "vision",
+        "reasoning",
+        "abliterated",
+        "uncensored"
+      ],
+      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+    },
+    {
+      "id": "hh-gptoss-20b",
+      "name": "gpt-oss 20B (abliterated)",
+      "tag": "huihui_ai/gpt-oss-abliterated:20b",
+      "params": "21B (3.6B active)",
+      "sizeGB": 14,
+      "kvKbPerTok": 96,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "reasoning",
+        "tools",
+        "moe",
+        "abliterated",
+        "uncensored"
+      ],
+      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+    },
+    {
+      "id": "hh-gptoss-120b",
+      "name": "gpt-oss 120B (abliterated)",
+      "tag": "huihui_ai/gpt-oss-abliterated:120b",
+      "params": "117B (5.1B active)",
+      "sizeGB": 65,
+      "kvKbPerTok": 128,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "reasoning",
+        "tools",
+        "moe",
+        "abliterated",
+        "uncensored"
+      ],
+      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+    },
+    {
+      "id": "hh-qwq-32b",
+      "name": "QwQ 32B (abliterated)",
+      "tag": "huihui_ai/qwq-abliterated:32b",
+      "params": "32B",
+      "sizeGB": 20,
+      "kvKbPerTok": 256,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "reasoning",
+        "tools",
+        "abliterated",
+        "uncensored"
+      ],
+      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+    },
+    {
+      "id": "hh-glm47-30b",
+      "name": "GLM-4.7 Flash 30B (abliterated)",
+      "tag": "huihui_ai/glm-4.7-flash-abliterated:30b",
+      "params": "30B",
+      "sizeGB": 18,
+      "kvKbPerTok": 240,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "reasoning",
+        "tools",
+        "abliterated",
+        "uncensored"
+      ],
+      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+    },
+    {
+      "id": "hh-qwen3vl-2b",
+      "name": "Qwen3-VL 2B (abliterated)",
+      "tag": "huihui_ai/qwen3-vl-abliterated:2b",
+      "params": "2B",
+      "sizeGB": 1.8,
+      "kvKbPerTok": 44,
+      "ctxMax": 131072,
+      "tags": [
+        "vision",
+        "reasoning",
+        "tools",
+        "abliterated",
+        "uncensored"
+      ],
+      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+    },
+    {
+      "id": "hh-qwen3vl-4b",
+      "name": "Qwen3-VL 4B (abliterated)",
+      "tag": "huihui_ai/qwen3-vl-abliterated:4b",
+      "params": "4B",
+      "sizeGB": 2.8,
+      "kvKbPerTok": 56,
+      "ctxMax": 131072,
+      "tags": [
+        "vision",
+        "reasoning",
+        "tools",
+        "abliterated",
+        "uncensored"
+      ],
+      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+    },
+    {
+      "id": "hh-qwen3vl-8b",
+      "name": "Qwen3-VL 8B (abliterated)",
+      "tag": "huihui_ai/qwen3-vl-abliterated:8b",
+      "params": "8B",
+      "sizeGB": 5.4,
+      "kvKbPerTok": 128,
+      "ctxMax": 131072,
+      "tags": [
+        "vision",
+        "reasoning",
+        "tools",
+        "abliterated",
+        "uncensored"
+      ],
+      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+    },
+    {
+      "id": "hh-qwen3vl-30b",
+      "name": "Qwen3-VL 30B (abliterated)",
+      "tag": "huihui_ai/qwen3-vl-abliterated:30b",
+      "params": "30B",
+      "sizeGB": 19,
+      "kvKbPerTok": 96,
+      "ctxMax": 131072,
+      "tags": [
+        "vision",
+        "reasoning",
+        "tools",
+        "abliterated",
+        "uncensored"
+      ],
+      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+    },
+    {
+      "id": "hh-qwen3vl-32b",
+      "name": "Qwen3-VL 32B (abliterated)",
+      "tag": "huihui_ai/qwen3-vl-abliterated:32b",
+      "params": "32B",
+      "sizeGB": 20,
+      "kvKbPerTok": 256,
+      "ctxMax": 131072,
+      "tags": [
+        "vision",
+        "reasoning",
+        "tools",
+        "abliterated",
+        "uncensored"
+      ],
+      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+    },
+    {
+      "id": "dolphin-mixtral-8x7b",
+      "name": "Dolphin Mixtral 8x7B",
+      "tag": "dolphin-mixtral:8x7b",
+      "params": "47B (13B active)",
+      "sizeGB": 26,
+      "kvKbPerTok": 128,
+      "ctxMax": 32768,
+      "tags": [
+        "text",
+        "moe",
+        "uncensored"
+      ],
+      "blurb": "Uncensored Mixtral tune. Sparse, so it is quicker than 47B suggests — a long-standing favourite for unrestricted chat."
+    },
+    {
+      "id": "dolphin-mixtral-8x22b",
+      "name": "Dolphin Mixtral 8x22B",
+      "tag": "dolphin-mixtral:8x22b",
+      "params": "141B (39B active)",
+      "sizeGB": 80,
+      "kvKbPerTok": 224,
+      "ctxMax": 65536,
+      "tags": [
+        "text",
+        "moe",
+        "uncensored"
+      ],
+      "blurb": "The large uncensored Mixtral. Serious hardware, frontier-adjacent quality."
+    },
+    {
+      "id": "dolphin-llama3-8b",
+      "name": "Dolphin Llama 3 8B",
+      "tag": "dolphin-llama3:8b",
+      "params": "8B",
+      "sizeGB": 4.7,
+      "kvKbPerTok": 128,
+      "ctxMax": 8192,
+      "tags": [
+        "text",
+        "uncensored"
+      ],
+      "blurb": "Llama 3 with the refusal training removed. A dependable uncensored 8B."
+    },
+    {
+      "id": "dolphin-llama3-70b",
+      "name": "Dolphin Llama 3 70B",
+      "tag": "dolphin-llama3:70b",
+      "params": "70B",
+      "sizeGB": 40,
+      "kvKbPerTok": 320,
+      "ctxMax": 8192,
+      "tags": [
+        "text",
+        "uncensored"
+      ],
+      "blurb": "The large Dolphin Llama 3. Strong general model without the guardrails."
+    },
+    {
+      "id": "dolphin-phi-2.7b",
+      "name": "Dolphin Phi 2.7B",
+      "tag": "dolphin-phi:2.7b",
+      "params": "2.7B",
+      "sizeGB": 1.6,
+      "kvKbPerTok": 48,
+      "ctxMax": 2048,
+      "tags": [
+        "text",
+        "tiny",
+        "uncensored"
+      ],
+      "blurb": "Tiny uncensored model built on Phi-2. Runs on almost anything."
+    },
+    {
+      "id": "llama2-uncensored-7b",
+      "name": "Llama 2 Uncensored 7B",
+      "tag": "llama2-uncensored:7b",
+      "params": "7B",
+      "sizeGB": 3.8,
+      "kvKbPerTok": 128,
+      "ctxMax": 4096,
+      "tags": [
+        "text",
+        "uncensored"
+      ],
+      "blurb": "The original uncensored Llama 2. Dated now, but small and still widely used."
+    },
+    {
+      "id": "llama2-uncensored-70b",
+      "name": "Llama 2 Uncensored 70B",
+      "tag": "llama2-uncensored:70b",
+      "params": "70B",
+      "sizeGB": 39,
+      "kvKbPerTok": 320,
+      "ctxMax": 4096,
+      "tags": [
+        "text",
+        "uncensored"
+      ],
+      "blurb": "The large uncensored Llama 2. Superseded by Dolphin Llama 3 in most respects."
+    },
+    {
+      "id": "wizard-vicuna-unc-7b",
+      "name": "Wizard Vicuna Uncensored 7B",
+      "tag": "wizard-vicuna-uncensored:7b",
+      "params": "7B",
+      "sizeGB": 3.8,
+      "kvKbPerTok": 128,
+      "ctxMax": 2048,
+      "tags": [
+        "text",
+        "uncensored"
+      ],
+      "blurb": "An early uncensored fine-tune. Conversational and light."
+    },
+    {
+      "id": "wizard-vicuna-unc-13b",
+      "name": "Wizard Vicuna Uncensored 13B",
+      "tag": "wizard-vicuna-uncensored:13b",
+      "params": "13B",
+      "sizeGB": 7.4,
+      "kvKbPerTok": 160,
+      "ctxMax": 2048,
+      "tags": [
+        "text",
+        "uncensored"
+      ],
+      "blurb": "The mid-size Wizard Vicuna. Better prose than the 7B."
+    },
+    {
+      "id": "wizard-vicuna-unc-30b",
+      "name": "Wizard Vicuna Uncensored 30B",
+      "tag": "wizard-vicuna-uncensored:30b",
+      "params": "30B",
+      "sizeGB": 18,
+      "kvKbPerTok": 240,
+      "ctxMax": 2048,
+      "tags": [
+        "text",
+        "uncensored"
+      ],
+      "blurb": "The largest Wizard Vicuna. Short context limits its use today."
+    },
+    {
+      "id": "wizardlm-uncensored-13b",
+      "name": "WizardLM Uncensored 13B",
+      "tag": "wizardlm-uncensored:13b",
+      "params": "13B",
+      "sizeGB": 7.4,
+      "kvKbPerTok": 160,
+      "ctxMax": 2048,
+      "tags": [
+        "text",
+        "uncensored"
+      ],
+      "blurb": "Uncensored WizardLM. Follows complex instructions without refusing."
+    },
+    {
+      "id": "nous-hermes2-10.7b",
+      "name": "Nous Hermes 2 10.7B",
+      "tag": "nous-hermes2:10.7b",
+      "params": "10.7B",
+      "sizeGB": 6.1,
+      "kvKbPerTok": 160,
+      "ctxMax": 4096,
+      "tags": [
+        "text"
+      ],
+      "blurb": "Nous Research tune on Solar. Strong instruction-following for its size."
+    },
+    {
+      "id": "nous-hermes2-34b",
+      "name": "Nous Hermes 2 34B",
+      "tag": "nous-hermes2:34b",
+      "params": "34B",
+      "sizeGB": 19,
+      "kvKbPerTok": 240,
+      "ctxMax": 4096,
+      "tags": [
+        "text"
+      ],
+      "blurb": "The large Nous Hermes 2, built on Yi 34B. Excellent general chat."
+    },
+    {
+      "id": "openhermes-7b",
+      "name": "OpenHermes 2.5 7B",
+      "tag": "openhermes:7b",
+      "params": "7B",
+      "sizeGB": 4.1,
+      "kvKbPerTok": 128,
+      "ctxMax": 8192,
+      "tags": [
+        "text",
+        "tools"
+      ],
+      "blurb": "A well-rounded Mistral tune. Reliable structured output and function calling."
+    },
+    {
+      "id": "mistral-openorca-7b",
+      "name": "Mistral OpenOrca 7B",
+      "tag": "mistral-openorca:7b",
+      "params": "7B",
+      "sizeGB": 4.1,
+      "kvKbPerTok": 128,
+      "ctxMax": 32768,
+      "tags": [
+        "text"
+      ],
+      "blurb": "Mistral fine-tuned on the OpenOrca set. Good reasoning for a 7B."
+    },
+    {
+      "id": "neural-chat-7b",
+      "name": "Neural Chat 7B",
+      "tag": "neural-chat:7b",
+      "params": "7B",
+      "sizeGB": 4.1,
+      "kvKbPerTok": 128,
+      "ctxMax": 32768,
+      "tags": [
+        "text"
+      ],
+      "blurb": "Intel's Mistral tune. Solid conversational quality."
+    },
+    {
+      "id": "starling-lm-7b",
+      "name": "Starling LM 7B",
+      "tag": "starling-lm:7b",
+      "params": "7B",
+      "sizeGB": 4.1,
+      "kvKbPerTok": 128,
+      "ctxMax": 8192,
+      "tags": [
+        "text"
+      ],
+      "blurb": "RLAIF-trained 7B that punched well above its weight at release."
+    },
+    {
+      "id": "openchat-7b",
+      "name": "OpenChat 3.5 7B",
+      "tag": "openchat:7b",
+      "params": "7B",
+      "sizeGB": 4.1,
+      "kvKbPerTok": 128,
+      "ctxMax": 8192,
+      "tags": [
+        "text"
+      ],
+      "blurb": "Trained on mixed-quality data with C-RLFT. Competitive with much larger models at release."
+    },
+    {
+      "id": "zephyr-7b",
+      "name": "Zephyr 7B",
+      "tag": "zephyr:7b",
+      "params": "7B",
+      "sizeGB": 4.1,
+      "kvKbPerTok": 128,
+      "ctxMax": 32768,
+      "tags": [
+        "text"
+      ],
+      "blurb": "HuggingFace's DPO-tuned Mistral. Helpful and direct."
+    },
+    {
+      "id": "tulu3-8b",
+      "name": "Tulu 3 8B",
+      "tag": "tulu3:8b",
+      "params": "8B",
+      "sizeGB": 4.9,
+      "kvKbPerTok": 128,
+      "ctxMax": 131072,
+      "tags": [
+        "text"
+      ],
+      "blurb": "AI2's fully-open post-training recipe on Llama 3.1. Published data and code."
+    },
+    {
+      "id": "tulu3-70b",
+      "name": "Tulu 3 70B",
+      "tag": "tulu3:70b",
+      "params": "70B",
+      "sizeGB": 43,
+      "kvKbPerTok": 320,
+      "ctxMax": 131072,
+      "tags": [
+        "text"
+      ],
+      "blurb": "The large fully-open Tulu 3. Reproducible frontier-class post-training."
+    },
+    {
+      "id": "marco-o1-7b",
+      "name": "Marco-o1 7B",
+      "tag": "marco-o1:7b",
+      "params": "7B",
+      "sizeGB": 4.7,
+      "kvKbPerTok": 128,
+      "ctxMax": 32768,
+      "tags": [
+        "text",
+        "reasoning"
+      ],
+      "blurb": "Alibaba's open reasoning model. Chain-of-thought with self-reflection."
+    },
+    {
+      "id": "command-r7b",
+      "name": "Command R7B",
+      "tag": "command-r7b:7b",
+      "params": "7B",
+      "sizeGB": 5.1,
+      "kvKbPerTok": 128,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "tools"
+      ],
+      "blurb": "Cohere's smallest RAG model. Grounded generation with citations at 7B."
+    },
+    {
+      "id": "vicuna-7b",
+      "name": "Vicuna 7B",
+      "tag": "vicuna:7b",
+      "params": "7B",
+      "sizeGB": 3.8,
+      "kvKbPerTok": 128,
+      "ctxMax": 2048,
+      "tags": [
+        "text"
+      ],
+      "blurb": "A 2023 landmark tune. Historical interest mostly — newer 7Bs beat it comfortably."
+    },
+    {
+      "id": "vicuna-13b",
+      "name": "Vicuna 13B",
+      "tag": "vicuna:13b",
+      "params": "13B",
+      "sizeGB": 7.4,
+      "kvKbPerTok": 160,
+      "ctxMax": 2048,
+      "tags": [
+        "text"
+      ],
+      "blurb": "The mid-size Vicuna. Superseded, but still pulled often."
+    },
+    {
+      "id": "vicuna-33b",
+      "name": "Vicuna 33B",
+      "tag": "vicuna:33b",
+      "params": "33B",
+      "sizeGB": 18,
+      "kvKbPerTok": 240,
+      "ctxMax": 2048,
+      "tags": [
+        "text"
+      ],
+      "blurb": "The largest Vicuna. Short context and dated training."
+    },
+    {
+      "id": "orca-mini-3b",
+      "name": "Orca Mini 3B",
+      "tag": "orca-mini:3b",
+      "params": "3B",
+      "sizeGB": 2,
+      "kvKbPerTok": 48,
+      "ctxMax": 4096,
+      "tags": [
+        "text",
+        "tiny"
+      ],
+      "blurb": "A small Orca-style tune. Light and fast for basic tasks."
+    },
+    {
+      "id": "orca-mini-7b",
+      "name": "Orca Mini 7B",
+      "tag": "orca-mini:7b",
+      "params": "7B",
+      "sizeGB": 3.8,
+      "kvKbPerTok": 128,
+      "ctxMax": 4096,
+      "tags": [
+        "text"
+      ],
+      "blurb": "The 7B Orca Mini. Explanation-style answers."
+    },
+    {
+      "id": "orca-mini-13b",
+      "name": "Orca Mini 13B",
+      "tag": "orca-mini:13b",
+      "params": "13B",
+      "sizeGB": 7.4,
+      "kvKbPerTok": 160,
+      "ctxMax": 4096,
+      "tags": [
+        "text"
+      ],
+      "blurb": "The 13B Orca Mini. Dated but coherent."
+    },
+    {
+      "id": "stablelm2-1.6b",
+      "name": "StableLM 2 1.6B",
+      "tag": "stablelm2:1.6b",
+      "params": "1.6B",
+      "sizeGB": 1,
+      "kvKbPerTok": 36,
+      "ctxMax": 4096,
+      "tags": [
+        "text",
+        "tiny"
+      ],
+      "blurb": "Stability AI's compact multilingual model. Seven languages in under 1GB."
+    },
+    {
+      "id": "stablelm2-12b",
+      "name": "StableLM 2 12B",
+      "tag": "stablelm2:12b",
+      "params": "12B",
+      "sizeGB": 7,
+      "kvKbPerTok": 160,
+      "ctxMax": 4096,
+      "tags": [
+        "text"
+      ],
+      "blurb": "The larger StableLM 2. Good multilingual coverage."
+    },
+    {
+      "id": "yi-6b",
+      "name": "Yi 6B",
+      "tag": "yi:6b",
+      "params": "6B",
+      "sizeGB": 3.5,
+      "kvKbPerTok": 96,
+      "ctxMax": 4096,
+      "tags": [
+        "text"
+      ],
+      "blurb": "01.AI's small bilingual model. Strong Chinese and English."
+    },
+    {
+      "id": "yi-9b",
+      "name": "Yi 9B",
+      "tag": "yi:9b",
+      "params": "9B",
+      "sizeGB": 5,
+      "kvKbPerTok": 128,
+      "ctxMax": 4096,
+      "tags": [
+        "text"
+      ],
+      "blurb": "The mid-size Yi. A solid bilingual option."
+    },
+    {
+      "id": "llama2-7b",
+      "name": "Llama 2 7B",
+      "tag": "llama2:7b",
+      "params": "7B",
+      "sizeGB": 3.8,
+      "kvKbPerTok": 128,
+      "ctxMax": 4096,
+      "tags": [
+        "text"
+      ],
+      "blurb": "Meta's 2023 model. Kept for reproducing old results; Llama 3.2 is better in every way."
+    },
+    {
+      "id": "llama2-13b",
+      "name": "Llama 2 13B",
+      "tag": "llama2:13b",
+      "params": "13B",
+      "sizeGB": 7.4,
+      "kvKbPerTok": 160,
+      "ctxMax": 4096,
+      "tags": [
+        "text"
+      ],
+      "blurb": "The mid-size Llama 2. Historical."
+    },
+    {
+      "id": "llama2-70b",
+      "name": "Llama 2 70B",
+      "tag": "llama2:70b",
+      "params": "70B",
+      "sizeGB": 39,
+      "kvKbPerTok": 320,
+      "ctxMax": 4096,
+      "tags": [
+        "text"
+      ],
+      "blurb": "The large Llama 2. Superseded by Llama 3.3 70B."
+    },
+    {
+      "id": "wizardlm2-7b",
+      "name": "WizardLM 2 7B",
+      "tag": "wizardlm2:7b",
+      "params": "7B",
+      "sizeGB": 4.1,
+      "kvKbPerTok": 128,
+      "ctxMax": 32768,
+      "tags": [
+        "text"
+      ],
+      "blurb": "Microsoft's WizardLM 2. Strong multi-turn conversation."
+    },
+    {
+      "id": "wizardlm2-8x22b",
+      "name": "WizardLM 2 8x22B",
+      "tag": "wizardlm2:8x22b",
+      "params": "141B (39B active)",
+      "sizeGB": 80,
+      "kvKbPerTok": 224,
+      "ctxMax": 65536,
+      "tags": [
+        "text",
+        "moe"
+      ],
+      "blurb": "The large WizardLM 2 MoE. Was among the strongest open models at release."
+    },
+    {
+      "id": "deepseek-llm-7b",
+      "name": "DeepSeek LLM 7B",
+      "tag": "deepseek-llm:7b",
+      "params": "7B",
+      "sizeGB": 4,
+      "kvKbPerTok": 128,
+      "ctxMax": 4096,
+      "tags": [
+        "text"
+      ],
+      "blurb": "DeepSeek's first-gen general model. Superseded by their V2/V3 line."
+    },
+    {
+      "id": "deepseek-llm-67b",
+      "name": "DeepSeek LLM 67B",
+      "tag": "deepseek-llm:67b",
+      "params": "67B",
+      "sizeGB": 38,
+      "kvKbPerTok": 320,
+      "ctxMax": 4096,
+      "tags": [
+        "text"
+      ],
+      "blurb": "The large first-gen DeepSeek. Historical interest."
+    },
+    {
+      "id": "sqlcoder-7b",
+      "name": "SQLCoder 7B",
+      "tag": "sqlcoder:7b",
+      "params": "7B",
+      "sizeGB": 4.1,
+      "kvKbPerTok": 128,
+      "ctxMax": 8192,
+      "tags": [
+        "code"
+      ],
+      "blurb": "Purpose-built for text-to-SQL. Beats general models on schema-aware query generation."
+    },
+    {
+      "id": "sqlcoder-15b",
+      "name": "SQLCoder 15B",
+      "tag": "sqlcoder:15b",
+      "params": "15B",
+      "sizeGB": 9,
+      "kvKbPerTok": 192,
+      "ctxMax": 8192,
+      "tags": [
+        "code"
+      ],
+      "blurb": "The larger SQLCoder. Handles complex joins and nested queries."
+    },
+    {
+      "id": "codeup-13b",
+      "name": "CodeUp 13B",
+      "tag": "codeup:13b",
+      "params": "13B",
+      "sizeGB": 7.4,
+      "kvKbPerTok": 160,
+      "ctxMax": 4096,
+      "tags": [
+        "code"
+      ],
+      "blurb": "A Llama-2-based code model. Dated but light."
+    },
+    {
+      "id": "magicoder-7b",
+      "name": "Magicoder 7B",
+      "tag": "magicoder:7b",
+      "params": "7B",
+      "sizeGB": 3.8,
+      "kvKbPerTok": 128,
+      "ctxMax": 16384,
+      "tags": [
+        "code"
+      ],
+      "blurb": "Trained on OSS-Instruct synthetic data. Good at idiomatic code."
+    },
+    {
+      "id": "bakllava-7b",
+      "name": "BakLLaVA 7B",
+      "tag": "bakllava:7b",
+      "params": "7B",
+      "sizeGB": 4.7,
+      "kvKbPerTok": 128,
+      "ctxMax": 4096,
+      "tags": [
+        "vision"
+      ],
+      "blurb": "A Mistral-based vision model. An alternative to LLaVA 7B."
+    }
+  ]
+}

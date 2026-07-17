@@ -45,6 +45,230 @@ function detectShell() {
 const SHELL = detectShell();
 ipcMain.handle('shell:info', () => ({ name: SHELL.name, path: SHELL.path }));
 
+// =============== HARDWARE DETECTION ===============
+// Probes what the machine can actually run an LLM on. The Download tab uses
+// this to tell the user whether a model fits BEFORE they spend 20 minutes
+// pulling it. Cached after the first probe — hardware doesn't change mid-run.
+//
+// The key number is `budgetGB`: memory genuinely available for model weights.
+//   - Discrete GPU  -> VRAM (Ollama offloads to GPU; system RAM is a fallback)
+//   - Apple Silicon -> unified memory, ~70% is addressable by the GPU
+//   - CPU only      -> ~70% of system RAM (OS + apps need the rest)
+let HW_CACHE = null;
+
+function execOut(cmd, timeoutMs = 4000) {
+  return new Promise((resolve) => {
+    exec(cmd, { timeout: timeoutMs, windowsHide: true }, (err, stdout) => {
+      resolve(err ? '' : String(stdout || ''));
+    });
+  });
+}
+
+// NVIDIA cards report VRAM precisely via nvidia-smi. Most reliable source on
+// any platform when it's present.
+async function probeNvidia() {
+  const out = await execOut('nvidia-smi --query-gpu=name,memory.total --format=csv,noheader,nounits');
+  const line = out.split('\n').map(s => s.trim()).filter(Boolean)[0];
+  if (!line) return null;
+  const parts = line.split(',');
+  if (parts.length < 2) return null;
+  const mib = parseFloat(parts[1]);
+  if (!isFinite(mib) || mib <= 0) return null;
+  return { name: parts[0].trim(), vramGB: +(mib / 1024).toFixed(1), vendor: 'nvidia' };
+}
+
+async function probeWindowsGpu() {
+  // Win32_VideoController.AdapterRAM is a uint32 and silently caps at 4 GB, so
+  // it's useless for modern cards. The driver registry key holds the real
+  // 64-bit size. Fall back to the name alone if the registry read fails.
+  const ps = `$ErrorActionPreference='SilentlyContinue';
+    $g = Get-CimInstance Win32_VideoController | Where-Object { $_.AdapterRAM -ne $null } | Select-Object -First 1;
+    $base='HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Class\\{4d36e968-e325-11ce-bfc1-08002be10318}';
+    $vram=0;
+    Get-ChildItem $base 2>$null | ForEach-Object {
+      $q = (Get-ItemProperty $_.PSPath -Name 'HardwareInformation.qwMemorySize' -EA SilentlyContinue).'HardwareInformation.qwMemorySize';
+      if ($q -and $q -gt $vram) { $vram = $q }
+    };
+    Write-Output ("{0}|{1}" -f $g.Name, $vram)`;
+  const out = await execOut(`powershell -NoProfile -NonInteractive -Command "${ps.replace(/"/g, '\\"').replace(/\s+/g, ' ')}"`, 8000);
+  const line = out.split('\n').map(s => s.trim()).filter(Boolean).pop();
+  if (!line || !line.includes('|')) return null;
+  const [name, raw] = line.split('|');
+  const bytes = parseFloat(raw);
+  if (!name) return null;
+  const vramGB = isFinite(bytes) && bytes > 0 ? +(bytes / 1024 ** 3).toFixed(1) : 0;
+  return { name: name.trim(), vramGB, vendor: /nvidia/i.test(name) ? 'nvidia' : /amd|radeon/i.test(name) ? 'amd' : 'other' };
+}
+
+async function probeMacGpu() {
+  const out = await execOut('system_profiler SPDisplaysDataType -json', 8000);
+  try {
+    const j = JSON.parse(out);
+    const d = j?.SPDisplaysDataType?.[0];
+    if (!d) return null;
+    return { name: d.sppci_model || 'Apple GPU', vramGB: 0, vendor: 'apple' };
+  } catch { return null; }
+}
+
+async function detectHardware() {
+  if (HW_CACHE) return HW_CACHE;
+
+  const totalRamGB = +(os.totalmem() / 1024 ** 3).toFixed(1);
+  const freeRamGB = +(os.freemem() / 1024 ** 3).toFixed(1);
+  const cpus = os.cpus() || [];
+  const platform = process.platform;
+  const arch = process.arch;
+  const isAppleSilicon = platform === 'darwin' && arch === 'arm64';
+
+  let gpu = null;
+  try {
+    gpu = await probeNvidia();
+    if (!gpu && platform === 'win32') gpu = await probeWindowsGpu();
+    if (!gpu && platform === 'darwin') gpu = await probeMacGpu();
+  } catch { /* hardware probing is best-effort — never fatal */ }
+
+  // Two separate budgets, because Ollama does PARTIAL offload: it loads as
+  // many layers onto the GPU as fit and runs the remainder on the CPU. So a
+  // model bigger than VRAM isn't unrunnable — it's just slow. Collapsing both
+  // into one number would label perfectly usable models "unrunnable".
+  //
+  //   fastBudgetGB — fits entirely in GPU/unified memory: full speed
+  //   maxBudgetGB  — fits in system RAM: runs, but CPU-bound and slow
+  const sysBudget = +(totalRamGB * 0.7).toFixed(1);
+  let fastBudgetGB, budgetSource;
+  if (isAppleSilicon) {
+    // Unified memory — the GPU addresses system RAM directly, so there's no
+    // fast/slow split in the same way. Roughly 70% is usable by Metal.
+    fastBudgetGB = sysBudget;
+    budgetSource = 'unified';
+  } else if (gpu && gpu.vramGB >= 2) {
+    fastBudgetGB = gpu.vramGB;
+    budgetSource = 'vram';
+  } else {
+    fastBudgetGB = sysBudget;
+    budgetSource = 'ram';
+  }
+
+  HW_CACHE = {
+    platform, arch, isAppleSilicon,
+    totalRamGB, freeRamGB,
+    cpuModel: cpus[0]?.model?.trim() || 'Unknown CPU',
+    cpuCores: cpus.length,
+    gpuName: gpu?.name || null,
+    gpuVendor: gpu?.vendor || null,
+    vramGB: gpu?.vramGB || 0,
+    fastBudgetGB,
+    maxBudgetGB: Math.max(fastBudgetGB, sysBudget),
+    budgetSource
+  };
+  return HW_CACHE;
+}
+
+ipcMain.handle('hw:detect', () => detectHardware());
+
+// =============== FREEZE WATCHDOG ===============
+// When a model is too big for the machine, the OS starts swapping and the
+// whole desktop stops responding — the cursor barely moves and clicking Stop
+// becomes impossible. This watchdog notices that and pulls the plug itself.
+//
+// How it detects a freeze: a 1s timer that measures its own lateness. If the
+// OS is thrashing, every process gets starved of CPU, so our timer fires late.
+// A tick that arrives 15s late means the main process was descheduled for 15s
+// — that IS the freeze, observed from the inside.
+//
+// Why the main process and not the renderer: main is far lighter (no
+// rendering, no GPU work), so it's the likeliest part of the app to still get
+// scheduled under memory pressure. It also owns the abort controllers.
+//
+// Honest limits: if the machine is so far gone that this process never gets
+// scheduled at all, nothing here can run — no in-app watchdog can survive
+// that, and the only fix is the OS killing something. This handles the common
+// case (badly degraded but still creeping along), not total lockup.
+const WD_TICK_MS = 1000;
+const WD_STALL_FLOOR_MS = 1500;   // lateness below this is normal jitter, ignore
+const WD_DEFAULT_TRIP_MS = 15000; // sustained stall before we intervene
+
+let wdEnabled = true;
+let wdTripMs = WD_DEFAULT_TRIP_MS;
+let wdStallAccum = 0;
+let wdLastTick = Date.now();
+let wdTripping = false;
+
+ipcMain.handle('watchdog:config', (_e, { enabled, tripMs } = {}) => {
+  if (typeof enabled === 'boolean') wdEnabled = enabled;
+  if (Number.isFinite(tripMs) && tripMs >= 5000) wdTripMs = tripMs;
+  return { enabled: wdEnabled, tripMs: wdTripMs };
+});
+
+// Tell Ollama to drop the model NOW. Aborting the stream stops generation but
+// leaves the weights resident for keep_alive (5 min default) — and those
+// weights are the memory that froze the machine. keep_alive: 0 evicts them.
+async function unloadOllamaModel(model) {
+  if (!model) return false;
+  try {
+    const res = await fetch(`${OLLAMA_URL}/api/generate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model, keep_alive: 0 }),
+      signal: AbortSignal.timeout(5000)
+    });
+    return res.ok;
+  } catch { return false; }
+}
+
+async function wdTrip(stalledMs) {
+  if (wdTripping) return;
+  wdTripping = true;
+  const debugLog = path.join(app.getPath('userData'), 'chat-debug.log');
+  const dlog = (m) => { try { fs.appendFileSync(debugLog, `[${new Date().toISOString()}] ${m}\n`); } catch {} };
+
+  // Only local streams can be the cause — a cloud request uses no local memory.
+  const local = [...activeChatStreams.entries()].filter(([, e]) => e.local);
+  if (!local.length) { wdTripping = false; wdStallAccum = 0; return; }
+
+  const freeGB = +(os.freemem() / 1024 ** 3).toFixed(1);
+  const models = [...new Set(local.map(([, e]) => e.model).filter(Boolean))];
+  dlog(`WATCHDOG TRIP · stalled ${Math.round(stalledMs)}ms · freeRAM ${freeGB}GB · aborting ${local.length} stream(s): ${models.join(', ')}`);
+
+  for (const [, e] of local) { try { e.controller.abort(); } catch {} }
+  // Then evict the weights — this is what actually gives the machine its
+  // memory back and ends the freeze.
+  const unloaded = [];
+  for (const m of models) if (await unloadOllamaModel(m)) unloaded.push(m);
+  dlog(`WATCHDOG · unloaded: ${unloaded.join(', ') || '(none)'}`);
+
+  for (const w of BrowserWindow.getAllWindows()) {
+    try {
+      w.webContents.send('system:freeze-abort', {
+        stalledMs: Math.round(stalledMs), freeGB, models, unloaded
+      });
+    } catch {}
+  }
+  wdStallAccum = 0;
+  setTimeout(() => { wdTripping = false; }, 5000); // debounce re-trips
+}
+
+setInterval(() => {
+  const now = Date.now();
+  const late = now - wdLastTick - WD_TICK_MS; // how far behind schedule we are
+  wdLastTick = now;
+
+  // Only armed while a local model is actually generating. Nothing to abort
+  // otherwise, and it keeps the watchdog from reacting to unrelated hitches
+  // like a big file read or the machine waking from sleep.
+  const armed = wdEnabled && [...activeChatStreams.values()].some(e => e.local);
+  if (!armed) { wdStallAccum = 0; return; }
+
+  if (late > WD_STALL_FLOOR_MS) {
+    wdStallAccum += late;
+    if (wdStallAccum >= wdTripMs) wdTrip(wdStallAccum);
+  } else {
+    // Recovering — bleed the accumulator down rather than resetting, so a
+    // stuttering freeze (repeated 3s hitches) still adds up to a trip.
+    wdStallAccum = Math.max(0, wdStallAccum - WD_TICK_MS);
+  }
+}, WD_TICK_MS);
+
 // Register custom protocol for cached media (must run before app ready)
 protocol.registerSchemesAsPrivileged([
   { scheme: 'aio-media', privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true } }
@@ -151,6 +375,16 @@ ipcMain.handle('mcp:call_tool', async (_e, { name, args }) => {
 ipcMain.handle('models:catalog', () => {
   const catalogPath = path.join(__dirname, 'models.json');
   return JSON.parse(fs.readFileSync(catalogPath, 'utf-8'));
+});
+
+// The full browsable library for the Download tab. Separate from models.json
+// (the curated per-category picks) — this one is everything pullable.
+ipcMain.handle('models:download_catalog', () => {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(__dirname, 'download-catalog.json'), 'utf-8'));
+  } catch (e) {
+    return { models: [], error: e.message };
+  }
 });
 
 // Candidate locations where the official Windows installer drops ollama.exe.
@@ -410,12 +644,17 @@ ipcMain.handle('ollama:pull-abort', async (_e, { channelId, removeFiles }) => {
 });
 
 // Track in-flight chat streams so the renderer can abort them (Stop button).
+// channelId -> { controller, model, local }. The model is tracked so the
+// freeze watchdog knows which model to unload from Ollama when it trips —
+// aborting the HTTP stream alone stops generation but leaves the weights
+// resident (Ollama holds them for keep_alive, 5 min by default), which is
+// exactly the memory that froze the machine.
 const activeChatStreams = new Map();
 
 ipcMain.handle('ollama:chat', async (evt, { model, messages, images, tools, options }) => {
   const channelId = `ollama:chat:stream:${Date.now()}:${Math.random().toString(36).slice(2)}`;
   const controller = new AbortController();
-  activeChatStreams.set(channelId, controller);
+  activeChatStreams.set(channelId, { controller, model, local: true });
 
   const debugLog = path.join(app.getPath('userData'), 'chat-debug.log');
   const dlog = (msg) => { try { fs.appendFileSync(debugLog, `[${new Date().toISOString()}] ${msg}\n`); } catch {} };
@@ -495,9 +734,9 @@ ipcMain.handle('ollama:chat', async (evt, { model, messages, images, tools, opti
 });
 
 ipcMain.handle('ollama:chat-abort', (_e, channelId) => {
-  const ctrl = activeChatStreams.get(channelId);
-  if (!ctrl) return { ok: false, note: 'no active stream' };
-  try { ctrl.abort(); } catch {}
+  const entry = activeChatStreams.get(channelId);
+  if (!entry) return { ok: false, note: 'no active stream' };
+  try { entry.controller.abort(); } catch {}
   return { ok: true };
 });
 
@@ -916,7 +1155,9 @@ async function streamGoogle({ apiKey, model, messages, tools, options, controlle
 ipcMain.handle('cloud:chat', async (evt, { provider, apiKey, model, messages, tools, options }) => {
   const channelId = `cloud:chat:stream:${Date.now()}:${Math.random().toString(36).slice(2)}`;
   const controller = new AbortController();
-  activeChatStreams.set(channelId, controller);
+  // local: false — cloud streams consume no local memory, so the freeze
+  // watchdog leaves them alone. A frozen machine is never a cloud model's fault.
+  activeChatStreams.set(channelId, { controller, model, local: false });
 
   const debugLog = path.join(app.getPath('userData'), 'chat-debug.log');
   const dlog = (msg) => { try { fs.appendFileSync(debugLog, `[${new Date().toISOString()}] ${msg}\n`); } catch {} };
@@ -951,9 +1192,9 @@ ipcMain.handle('cloud:chat', async (evt, { provider, apiKey, model, messages, to
 });
 
 ipcMain.handle('cloud:chat-abort', (_e, channelId) => {
-  const ctrl = activeChatStreams.get(channelId);
-  if (!ctrl) return { ok: false, note: 'no active stream' };
-  try { ctrl.abort(); } catch {}
+  const entry = activeChatStreams.get(channelId);
+  if (!entry) return { ok: false, note: 'no active stream' };
+  try { entry.controller.abort(); } catch {}
   return { ok: true };
 });
 

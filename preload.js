@@ -33,6 +33,21 @@ contextBridge.exposeInMainWorld('api', {
   shell: SHELL_INFO,
   config: () => ipcRenderer.invoke('config:get'),
   catalog: () => ipcRenderer.invoke('models:catalog'),
+  // Hardware profile for the Download tab's fit meter. Cached in main after
+  // the first probe.
+  hardware: () => ipcRenderer.invoke('hw:detect'),
+  downloadCatalog: () => ipcRenderer.invoke('models:download_catalog'),
+
+  // Freeze watchdog: main aborts + unloads the model if the machine stalls
+  // for too long; this is how the renderer learns it happened.
+  watchdog: {
+    config: (opts) => ipcRenderer.invoke('watchdog:config', opts),
+    onFreezeAbort: (handler) => {
+      const wrapped = (_e, payload) => handler(payload);
+      ipcRenderer.on('system:freeze-abort', wrapped);
+      return () => ipcRenderer.removeListener('system:freeze-abort', wrapped);
+    }
+  },
 
   ollama: {
     detect: () => ipcRenderer.invoke('ollama:detect'),
