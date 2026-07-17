@@ -3137,6 +3137,190 @@
         "vision"
       ],
       "blurb": "A Mistral-based vision model. An alternative to LLaVA 7B."
+    },
+    {
+      "id": "qwen3-coder-30b",
+      "name": "Qwen3-Coder 30B-A3B",
+      "tag": "qwen3-coder:30b",
+      "params": "30B (3.3B active)",
+      "sizeGB": 19,
+      "kvKbPerTok": 96,
+      "ctxMax": 262144,
+      "tags": [
+        "code",
+        "tools",
+        "moe"
+      ],
+      "blurb": "The best agentic coding model that fits a consumer GPU. Only ~3.3B params active so it runs fast, with a 256K context for repository-scale work."
+    },
+    {
+      "id": "qwen3-coder-30b-q8",
+      "name": "Qwen3-Coder 30B-A3B (Q8)",
+      "tag": "qwen3-coder:30b-a3b-q8_0",
+      "params": "30B (3.3B active)",
+      "sizeGB": 32,
+      "kvKbPerTok": 96,
+      "ctxMax": 262144,
+      "tags": [
+        "code",
+        "tools",
+        "moe"
+      ],
+      "blurb": "Higher-precision Q8 build of Qwen3-Coder 30B. Noticeably better on subtle code than Q4 if you have the memory."
+    },
+    {
+      "id": "qwen3-coder-480b",
+      "name": "Qwen3-Coder 480B-A35B",
+      "tag": "qwen3-coder:480b",
+      "params": "480B (35B active)",
+      "sizeGB": 290,
+      "kvKbPerTok": 192,
+      "ctxMax": 262144,
+      "tags": [
+        "code",
+        "tools",
+        "moe"
+      ],
+      "blurb": "Qwen3-Coder at frontier scale. Multi-GPU server territory — listed for completeness."
+    },
+    {
+      "id": "hh-qwen3coder-30b",
+      "name": "Qwen3-Coder 30B-A3B (abliterated)",
+      "tag": "huihui_ai/qwen3-coder-abliterated:30b",
+      "params": "30B (3.3B active)",
+      "sizeGB": 19,
+      "kvKbPerTok": 96,
+      "ctxMax": 262144,
+      "tags": [
+        "code",
+        "tools",
+        "moe",
+        "abliterated",
+        "uncensored"
+      ],
+      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+    },
+    {
+      "id": "hh-qwen3coder-480b",
+      "name": "Qwen3-Coder 480B-A35B (abliterated)",
+      "tag": "huihui_ai/qwen3-coder-abliterated:480b",
+      "params": "480B (35B active)",
+      "sizeGB": 229,
+      "kvKbPerTok": 192,
+      "ctxMax": 262144,
+      "tags": [
+        "code",
+        "tools",
+        "moe",
+        "abliterated",
+        "uncensored"
+      ],
+      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+    },
+    {
+      "id": "hh-qwen25coder-7b",
+      "name": "Qwen2.5-Coder 7B (abliterated)",
+      "tag": "huihui_ai/qwen2.5-coder-abliterated:7b",
+      "params": "7B",
+      "sizeGB": 4.7,
+      "kvKbPerTok": 128,
+      "ctxMax": 32768,
+      "tags": [
+        "code",
+        "tools",
+        "abliterated",
+        "uncensored"
+      ],
+      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+    },
+    {
+      "id": "hh-qwen25coder-14b",
+      "name": "Qwen2.5-Coder 14B (abliterated)",
+      "tag": "huihui_ai/qwen2.5-coder-abliterated:14b",
+      "params": "14B",
+      "sizeGB": 9,
+      "kvKbPerTok": 192,
+      "ctxMax": 32768,
+      "tags": [
+        "code",
+        "tools",
+        "abliterated",
+        "uncensored"
+      ],
+      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+    },
+    {
+      "id": "hh-qwen25coder-32b",
+      "name": "Qwen2.5-Coder 32B (abliterated)",
+      "tag": "huihui_ai/qwen2.5-coder-abliterated:32b",
+      "params": "32B",
+      "sizeGB": 20,
+      "kvKbPerTok": 256,
+      "ctxMax": 32768,
+      "tags": [
+        "code",
+        "tools",
+        "abliterated",
+        "uncensored"
+      ],
+      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+    },
+    {
+      "id": "qwen3-coder-flash",
+      "name": "Qwen3-Coder Flash",
+      "tag": "qwen3-coder-flash:30b",
+      "params": "30B (3.3B active)",
+      "sizeGB": 19,
+      "kvKbPerTok": 96,
+      "ctxMax": 262144,
+      "tags": [
+        "code",
+        "tools",
+        "moe"
+      ],
+      "blurb": "Speed-tuned Qwen3-Coder. Trades some depth for markedly faster completions — good for inline suggestions."
+    },
+    {
+      "id": "devstral-small",
+      "name": "Devstral Small 24B",
+      "tag": "devstral:24b-small",
+      "params": "24B",
+      "sizeGB": 14,
+      "kvKbPerTok": 224,
+      "ctxMax": 131072,
+      "tags": [
+        "code",
+        "tools"
+      ],
+      "blurb": "Mistral agentic coder tuned to drive tools and edit real repositories rather than complete single lines."
+    },
+    {
+      "id": "granite4.1-code",
+      "name": "Granite 4.1 Code 8B",
+      "tag": "granite4.1:8b",
+      "params": "8B",
+      "sizeGB": 4.9,
+      "kvKbPerTok": 128,
+      "ctxMax": 131072,
+      "tags": [
+        "code",
+        "tools"
+      ],
+      "blurb": "IBM enterprise code model. Apache-2.0 with clean training provenance."
+    },
+    {
+      "id": "olmo2-coder",
+      "name": "OLMo 2 Coder 13B",
+      "tag": "olmo2:13b",
+      "params": "13B",
+      "sizeGB": 7.5,
+      "kvKbPerTok": 160,
+      "ctxMax": 4096,
+      "tags": [
+        "text",
+        "code"
+      ],
+      "blurb": "Fully open model with published data and training code. Reproducible by design."
     }
   ]
 }

@@ -752,7 +752,14 @@ ipcMain.handle('ollama:chat', async (evt, { model, messages, images, tools, opti
 
   const body = { model, messages, stream: true };
   if (tools) body.tools = tools;
-  if (options && typeof options === 'object') body.options = options;
+  // Ollama's native thinking switch (0.9+). Returns reasoning in a separate
+  // `message.thinking` field instead of inline <think> tags, which keeps it
+  // out of the visible answer and gives us clean start/stop timing.
+  if (options && options.think !== undefined) body.think = !!options.think;
+  if (options && typeof options === 'object') {
+    const { think, ...rest } = options;   // `think` is top-level, not an option
+    if (Object.keys(rest).length) body.options = rest;
+  }
 
   if (images && images.length && messages.length) {
     messages[messages.length - 1].images = images;
@@ -966,6 +973,7 @@ async function streamAnthropic({ apiKey, model, messages, tools, options, contro
   const decoder = new TextDecoder();
   let buf = '';
   const toolUses = new Map(); // index → { id, name, jsonAcc }
+  const thinkingBlocks = new Set(); // content-block indices that are thinking
   let inputTokens = 0;
   let outputTokens = 0;
   let frameCount = 0;
@@ -1008,6 +1016,12 @@ async function streamAnthropic({ apiKey, model, messages, tools, options, contro
             name: obj.content_block.name,
             jsonAcc: ''
           });
+        } else if (obj.content_block?.type === 'thinking') {
+          // Timing signal. Note that with display:"omitted" (the default on
+          // Opus 4.7/4.8) the thinking text streams empty — but the blocks
+          // still arrive, so start/stop remains accurate.
+          thinkingBlocks.add(obj.index);
+          evt.sender.send(channelId, { thinking: { phase: 'start' } });
         }
       } else if (obj.type === 'content_block_delta') {
         if (obj.delta?.type === 'text_delta' && obj.delta.text) {
@@ -1018,6 +1032,10 @@ async function streamAnthropic({ apiKey, model, messages, tools, options, contro
           if (tu) tu.jsonAcc += obj.delta.partial_json || '';
         }
       } else if (obj.type === 'content_block_stop') {
+        if (thinkingBlocks.has(obj.index)) {
+          thinkingBlocks.delete(obj.index);
+          evt.sender.send(channelId, { thinking: { phase: 'end' } });
+        }
         const tu = toolUses.get(obj.index);
         if (tu) {
           let parsed = {};
@@ -1186,6 +1204,7 @@ async function streamGoogle({ apiKey, model, messages, tools, options, controlle
   let inputTokens = 0;
   let outputTokens = 0;
   let frameCount = 0;
+  let inThought = false;
 
   while (true) {
     let value, done;
@@ -1218,6 +1237,14 @@ async function streamGoogle({ apiKey, model, messages, tools, options, controlle
       const parts = cand?.content?.parts;
       if (!Array.isArray(parts)) continue;
       for (const part of parts) {
+        // Gemini marks reasoning parts with thought:true. Emit start/end as
+        // the flag flips so the renderer can time it like any other provider.
+        const isThought = part.thought === true;
+        if (isThought !== inThought) {
+          inThought = isThought;
+          evt.sender.send(channelId, { thinking: { phase: isThought ? 'start' : 'end' } });
+        }
+        if (isThought) continue;   // don't leak reasoning into the answer
         if (typeof part.text === 'string' && part.text.length) {
           evt.sender.send(channelId, { message: { content: part.text } });
         }

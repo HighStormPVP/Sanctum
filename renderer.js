@@ -42,6 +42,10 @@ const state = {
 // ============== BOOT ==============
 (async function init() {
   state.catalog = await window.api.catalog();
+  // Needed at boot, not lazily: the model picker resolves installed models
+  // through this catalog, and every capability check (vision, tools,
+  // thinking) falls back to it via findPick().
+  try { state.downloadCatalog = await window.api.downloadCatalog(); } catch {}
   loadFromStorage();
   loadSettings();
   applyTheme(state.settings.theme || 'sanctum');
@@ -88,7 +92,6 @@ const state = {
   wireAgentOpts();
   wireInstallBanner();
   renderChatList();
-  renderCatalog();
 })();
 
 // Surface any uncaught renderer errors so silent failures stop being silent.
@@ -543,9 +546,17 @@ function modalityForModel(modelId) {
   return 'chat';
 }
 
+// "Can this model natively read images?" — used to decide whether the vision
+// bridge (caption-with-a-local-VL-model-first) is needed at all.
+//
+// Two sources, because the catalogs disagree in vocabulary: models.json marks
+// its vision routers with `multimodal: true`, while download-catalog marks
+// natively-multimodal models with a `vision` tag. A downloaded Gemma 3 or
+// Qwen3-VL can see images directly, so captioning it first would be pure loss.
 function isMultimodal(modelId) {
   const pick = findPick(modelId);
-  return !!pick?.multimodal;
+  if (!pick) return false;
+  return !!pick.multimodal || (pick.tags || []).includes('vision');
 }
 
 // Whether a model's quality-of-tool-calling is good enough to expose web tools
@@ -558,7 +569,7 @@ function modelSupportsTools(modelId) {
   return pick.tools_capable !== false;
 }
 
-// Whether the model has a "thinking" mode — either Qwen3-family /think soft
+// Whether the model has a "thinking" mode — Ollama models with a native
 // switches (Ollama) or adaptive thinking (Anthropic / Google). The catalog
 // pick opts in via `thinking_capable: true`.
 function modelSupportsThinking(modelId) {
@@ -583,37 +594,8 @@ function getVisionRouter(chatModel) {
   return null;
 }
 
-// ============== CODE AUTO-ROUTING ==============
-// Heuristic detector for "the user is asking for code" — used in general chat
-// mode to transparently forward the turn to an installed coding model.
-// Strong signals: code fences in the user's message, "write a function",
-// language names paired with action verbs, "fix this code", etc.
-function isLikelyCodeRequest(text) {
-  if (!text) return false;
-  // Fenced code block in the prompt — almost always means "look at this code"
-  if (/```[\s\S]*?```/.test(text)) return true;
-  const patterns = [
-    /\b(write|build|create|implement|generate|make|give\s+me|show\s+me|code)\s+(?:me\s+)?(?:a|an|the|some)?\s*(function|class|method|module|script|program|component|widget|app|api|endpoint|loop|algorithm|regex|query|snippet)\b/i,
-    /\b(fix|debug|refactor|rewrite|optimize|improve|explain|review)\s+(?:this|my|the|some)?\s*(code|function|bug|script|method|class|file)\b/i,
-    /\b(in|using|with)\s+(python|javascript|typescript|java|c\+\+|rust|go(?:lang)?|ruby|php|swift|kotlin|sql|html|css|bash|powershell|node(?:\.?js)?|react|vue|svelte|dart|scala|elixir|haskell)\b/i,
-    /\b(python|javascript|typescript|rust|go|ruby|java|c\+\+|sql|html|css|bash|powershell|react|vue|svelte)\s+(code|script|function|method|program|file|module|snippet)\b/i,
-    /\bcode\s+(it|this|that|me|in)\b/i,
-    /\bhow\s+(do|can|to)\s+i\s+(code|write|implement|build|make)\b/i
-  ];
-  return patterns.some(p => p.test(text));
-}
-
-// Find the first installed coding model from the catalog's `code` category.
-function pickInstalledCodeModel() {
-  const picks = state.catalog?.categories.code?.picks || [];
-  for (const p of picks) {
-    if (p.tag && state.installed.has(p.tag)) return p.tag;
-  }
-  return null;
-}
-
 // Friendly display name for a model tag — pulled from the catalog so the
-// routing badge can show "Routed to Qwen2.5-Coder 32B" not "qwen2.5-coder:32b".
+// routing badge can show "Routed to Qwen2.5-VL 7B" not "qwen2.5vl:7b".
 function prettyModelName(tag) {
   for (const cat of Object.values(state.catalog?.categories || {})) {
     const pick = (cat.picks || []).find(p => p.tag === tag);
@@ -1277,7 +1259,6 @@ async function refreshOllama() {
   }
   populateModelPicker();
   renderInstallBanner();
-  renderCatalog();
 }
 
 async function detectOllama() {
@@ -1296,7 +1277,6 @@ async function detectOllama() {
 function wireSidebar() {
   $('#new-chat').addEventListener('click', () => createChat());
   $('#new-agentic-chat').addEventListener('click', () => createAgenticChat());
-  $('#open-models').addEventListener('click', () => switchView('models'));
   $('#open-downloads')?.addEventListener('click', () => openDownloads());
   $('#open-settings').addEventListener('click', () => openSettings());
 
@@ -1611,7 +1591,10 @@ function renderDownloadTab() {
     const action = m.cloudOnly
       ? `<span class="dl-cloudnote">Runs on Ollama&nbsp;Cloud</span>`
       : installed
-        ? `<span class="dl-installed">Installed</span>`
+        ? `<div class="dl-have">
+             <span class="dl-installed">Installed</span>
+             <button class="dl-remove" data-uninstall="${escapeAttr(m.tag)}" title="Uninstall — frees ${fmtGB(m.sizeGB)} of disk">Uninstall</button>
+           </div>`
         : pulling
           ? `<span class="dl-installed pulling">Downloading…</span>`
           : `<button class="dl-get" data-tag="${escapeAttr(m.tag)}">Download</button>`;
@@ -1643,17 +1626,34 @@ function renderDownloadTab() {
 
   if (!list.dataset.wired) {
     list.dataset.wired = '1';
-    list.addEventListener('click', (e) => {
-      const btn = e.target.closest('.dl-get');
-      if (!btn) return;
-      pullModelInline(btn.dataset.tag);
-      btn.outerHTML = `<span class="dl-installed pulling">Downloading…</span>`;
+    list.addEventListener('click', async (e) => {
+      const get = e.target.closest('.dl-get');
+      if (get) {
+        pullModelInline(get.dataset.tag);
+        get.outerHTML = `<span class="dl-installed pulling">Downloading…</span>`;
+        return;
+      }
+      const rm = e.target.closest('.dl-remove');
+      if (rm) {
+        const tag = rm.dataset.uninstall;
+        if (!confirm(`Uninstall ${tag}?\n\nThis frees the disk space Ollama is using for it. You can download it again any time.`)) return;
+        rm.disabled = true;
+        rm.textContent = 'Uninstalling…';
+        try {
+          const res = await window.api.ollama.delete(tag);
+          if (res.error) alert(`Uninstall failed: ${res.error}`);
+        } catch (err) { alert(`Uninstall failed: ${err.message}`); }
+        await refreshOllama();
+        renderDownloadTab();
+        populateModelPicker();
+      }
     });
   }
 }
 
 function wireModelsView() {
-  $('#close-models').addEventListener('click', () => switchView('chat'));
+  // The old Models registry view is gone — Downloads supersedes it (it lists
+  // the same models plus 200 more, with hardware fit and uninstall).
   $('#close-downloads')?.addEventListener('click', () => switchView('chat'));
 }
 
@@ -1661,9 +1661,6 @@ function wireModelsView() {
 // hardware probe so boot stays fast for people who never open it.
 function openDownloads() {
   switchView('downloads');
-  if (!state.downloadCatalog) {
-    window.api.downloadCatalog().then(c => { state.downloadCatalog = c; renderDownloadTab(); });
-  }
   if (!state.hardware) {
     window.api.hardware().then(hw => { state.hardware = hw; renderDownloadTab(); });
   }
@@ -2227,7 +2224,12 @@ function wireModelPicker() {
 // them, but clicking the row doesn't change the chat — coding requests
 // auto-route to a code model, image attachments auto-route through a vision
 // router.
-const SELECTABLE_CATEGORIES = new Set(['chat', 'agent', 'cloud']);
+// Categories whose picks the user can select directly. `code` is included:
+// coding models used to be reachable only via a silent auto-route, which
+// meant you could never deliberately choose one. `vision` stays out because
+// its entries are hidden routers for the image bridge, not chat models.
+// `installed` holds anything pulled from the Downloads tab.
+const SELECTABLE_CATEGORIES = new Set(['chat', 'agent', 'cloud', 'code', 'installed']);
 
 // Returns the provider for a given pick. Default 'ollama' so existing rows
 // keep working without a provider field in models.json.
@@ -2245,11 +2247,40 @@ function pickReady(pick) {
 }
 
 // Find the catalog pick for a model id (Ollama tag OR cloud id/model_id).
+// Adapt a download-catalog entry into the shape the rest of the app expects
+// from a models.json pick. The two catalogs describe capability differently:
+// models.json uses explicit booleans, download-catalog uses tags.
+//
+// NOTE `multimodal` is deliberately NOT set here. In models.json that flag
+// means "this is a hidden vision ROUTER, keep it out of the picker" — not
+// merely "can see images". Setting it would make every downloaded vision
+// model unselectable. Native image support is expressed via the `vision` tag
+// and read by isMultimodal().
+function downloadPickFor(modelId) {
+  const m = (state.downloadCatalog?.models || []).find(x => x.tag === modelId);
+  if (!m) return null;
+  const tags = m.tags || [];
+  return {
+    ...m,
+    category: 'installed',
+    categoryLabel: 'Installed',
+    backend: 'ollama',
+    context: m.ctxMax,
+    tools_capable: tags.includes('tools'),
+    thinking_capable: tags.includes('reasoning')
+  };
+}
+
+// Canonical model lookup. Checks the curated picks (models.json) first, then
+// falls back to the full download catalog — otherwise anything pulled from
+// the Downloads tab would be invisible to every capability check and to the
+// picker itself.
 function findPick(modelId) {
-  return allPicks().find(p =>
+  const pick = allPicks().find(p =>
     (p.tag || p.model_id || p.id || p.file) === modelId ||
     p.id === modelId
   );
+  return pick || downloadPickFor(modelId);
 }
 
 // Refresh the cached install status for the Video Analysis tools. Called from
@@ -2290,11 +2321,29 @@ function populateModelPicker() {
   const activePick = findPick(activeModel);
   current.textContent = activePick?.name || activeModel || 'Select a model';
 
+  // Anything pulled from the Downloads tab lives in download-catalog.json, not
+  // models.json, so it would never reach the picker — you could download 200
+  // models and select none of them. Surface every installed model that the
+  // curated categories don't already cover, under its own "Installed" group.
+  const curatedTags = new Set();
+  for (const cat of Object.values(state.catalog.categories)) {
+    for (const p of cat.picks) if (p.tag) curatedTags.add(p.tag);
+  }
+  const extraInstalled = [...state.installed]
+    .filter(tag => !curatedTags.has(tag))
+    .map(tag => downloadPickFor(tag) || { tag, name: tag, tags: [], context: 8192 })
+    .sort((a, b) => a.name.localeCompare(b.name));
+
+  const categories = { ...state.catalog.categories };
+  if (extraInstalled.length) {
+    categories.installed = { label: 'Installed', backend: 'ollama', picks: extraInstalled };
+  }
+
   // Build menu items. Cloud picks sort to the BOTTOM — Sanctum is local-first,
   // so the local models a user already has on disk should be what they see
   // first; cloud is the deliberate opt-in below them.
   menu.innerHTML = '';
-  const orderedCategories = Object.entries(state.catalog.categories)
+  const orderedCategories = Object.entries(categories)
     .sort(([aKey], [bKey]) => (aKey === 'cloud' ? 1 : 0) - (bKey === 'cloud' ? 1 : 0));
   for (const [key, cat] of orderedCategories) {
     const visiblePicks = cat.picks;
@@ -2577,7 +2626,7 @@ function renderActiveChat() {
   const wb = $('#toggle-web');
   if (wb) wb.setAttribute('aria-pressed', c.webEnabled === true ? 'true' : 'false');
 
-  // Think toggle — only visible when the model has Qwen3-style /think soft
+  // Think toggle — only visible when the model has a native thinking
   // switches (currently just qwen3:30b-a3b).
   const supportsThinking = modelSupportsThinking(c.model);
   $('#toggle-think').hidden = !textLike || !supportsThinking;
@@ -2805,7 +2854,9 @@ function renderMessage(m) {
   if (m.role === 'assistant' && m.routedTo) {
     const badge = document.createElement('div');
     badge.className = 'msg-routed-badge';
-    const why = m.routedReason === 'code' ? 'coding intent' : 'vision' ;
+    // Vision is the only remaining auto-route — the code one was removed
+    // because being answered by a model you didn't pick is a bad surprise.
+    const why = 'vision';
     badge.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg><span>Routed to <strong>${escapeHtml(prettyModelName(m.routedTo))}</strong> · ${why}</span>`;
     el.appendChild(badge);
   }
@@ -2864,7 +2915,7 @@ function renderMessage(m) {
 
   // Loading indicator — shown while the model has produced no content,
   // no tool calls, and no media yet. The "Thinking" label + star are only
-  // shown if the chat is actually in Qwen3 /think mode; otherwise it's just
+  // shown if the chat actually has thinking enabled; otherwise it's just
   // bouncing bubbles so we don't misrepresent what the model is doing.
   if (m.thinking && !m.content && !(m.toolEvents && m.toolEvents.length) && !m.videoState) {
     const t = document.createElement('div');
@@ -2915,10 +2966,31 @@ function renderToolEvent(ev) {
   // status dot, the tool label, the relevant argument (file path / URL /
   // query), and the status text on the right — same family of designs, no
   // pill chip anywhere.
+  if (ev.name === '__think') return renderThinkEvent(ev);
   if (ev.name === 'run_command' || ev.name === 'run_command_async') {
     return renderShellToolEvent(ev);
   }
   return renderCompactToolEvent(ev);
+}
+
+// The reasoning row. Lives in the toolEvents stream so it renders in the
+// order it happened and stays there — "Thought for 4s" marks a moment in the
+// transcript, so moving it to the end of the message would misreport when the
+// model actually thought.
+function renderThinkEvent(ev) {
+  const el = document.createElement('div');
+  const running = ev.status === 'running';
+  el.className = `think-row${running ? ' running' : ''}`;
+  const secs = ev.ms != null ? Math.max(1, Math.round(ev.ms / 1000)) : null;
+  const label = running
+    ? 'Thinking'
+    : (secs != null ? `Thought for ${secs}s` : 'Thought');
+  el.innerHTML = `
+    <svg class="think-star" viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M12 2 14.39 8.26 21 9.27 16 14.14 17.18 21.02 12 17.77 6.82 21.02 8 14.14 3 9.27 9.61 8.26z"/></svg>
+    <span class="think-label">${escapeHtml(label)}</span>
+    ${running ? '<span class="think-dots"><span></span><span></span><span></span></span>' : ''}
+  `;
+  return el;
 }
 
 function renderCompactToolEvent(ev) {
@@ -3945,21 +4017,11 @@ async function _runOllamaChatInner(c, attachments) {
     history[history.length - 1].content = (history[history.length - 1].content || '') + fileBlock;
   }
 
-  // Qwen3 thinking-mode soft switch — append /think or /no_think to the
-  // latest user turn. The model honours the most recent directive in history.
-  // GATE: this is Qwen3-SPECIFIC. Cloud models (Claude / Gemini) have native
-  // thinking parameters in their APIs — sending them '/think' as plain text
-  // makes them explain what the tag would mean (a confused-bystander
-  // response) instead of actually thinking. Cloud thinking is wired through
-  // payload.options.thinking_enabled below and translated to provider-
-  // native params in main.js.
-  if (modelSupportsThinking(c.model) && history.length) {
-    const _thinkingPick = findPick(c.model);
-    if (pickProvider(_thinkingPick) === 'ollama') {
-      const directive = c.thinkingEnabled ? ' /think' : ' /no_think';
-      history[history.length - 1].content = (history[history.length - 1].content || '') + directive;
-    }
-  }
+  // Ollama thinking is passed as the native `think` parameter (see the
+  // payload build below), not by appending /think to the user's message.
+  // The old text-directive approach polluted the prompt and left the
+  // reasoning inline in the answer as <think> tags; the native switch
+  // returns it in a separate field with clean start/stop timing.
   let imageAttachments = (attachments || []).filter(a => a.kind === 'image');
   let imgs = imageAttachments.map(a => a.base64);
 
@@ -4019,30 +4081,13 @@ ollama pull qwen2.5vl:7b
   const tools = buildTools(c.modality, c.webEnabled === true, c.model, c);
   const useTools = !!tools;
 
-  // Code auto-route: if the user is in plain chat and asks a code question,
-  // silently swap to an installed coding model for this turn. Surfaced via
-  // the routedTo badge on the assistant message.
-  //
-  // SKIP the auto-route when the user explicitly picked a cloud model (Opus,
-  // Sonnet, Haiku) — those are deliberate choices and they handle code at
-  // least as well as any local coder. Swapping a $0.015/M token cloud pick
-  // for a local 7B every time the message looks code-shaped was a surprise
-  // bug, not a feature.
-  let effectiveModel = c.model;
-  const currentPick = findPick(c.model);
-  const currentIsCloud = pickProvider(currentPick) !== 'ollama';
-  if (c.modality === 'chat' && !currentIsCloud) {
-    const lastUser = [...c.messages].reverse().find(m => m.role === 'user');
-    if (lastUser && isLikelyCodeRequest(lastUser.content)) {
-      const codeModel = pickInstalledCodeModel();
-      if (codeModel && codeModel !== c.model) {
-        effectiveModel = codeModel;
-        assistantMsg.routedTo = codeModel;
-        assistantMsg.routedReason = 'code';
-        renderActiveChat();
-      }
-    }
-  }
+  // The model you picked is the model that answers. There used to be a code
+  // auto-route here that silently swapped in a local coding model whenever a
+  // message looked code-shaped — it guessed wrong often, and being answered
+  // by a model you didn't choose is worse than a slightly weaker answer from
+  // the one you did. Coding models are selectable in the picker now, so the
+  // choice is yours to make explicitly.
+  const effectiveModel = c.model;
 
   const MAX_ROUNDS = Math.max(1, Math.min(50, c.maxSteps || 5));
   let round = 0;
@@ -4086,12 +4131,27 @@ ollama pull qwen2.5vl:7b
       // Oversizing here is what makes big models OOM — the KV cache for 32K on
       // a 30B model is several GB on its own.
       payload.options = { num_ctx: c.contextWindow || contextWindowFor(effectiveModel) };
+      // Native Ollama thinking switch — only for models that actually have a
+      // thinking mode, or Ollama rejects the request.
+      if (modelSupportsThinking(effectiveModel)) {
+        payload.options.think = !!c.thinkingEnabled;
+      }
       if (tools) payload.tools = tools;
       if (round === 1 && imgs.length) payload.images = imgs;
     }
 
     let acc = '';
     let collectedToolCalls = [];
+    // The in-flight "Thinking…" row, if this round has one. Closed out by
+    // endThinking() when reasoning finishes, which stamps the elapsed time so
+    // the row becomes a permanent "Thought for Ns".
+    let thinkEvent = null;
+    const endThinking = () => {
+      if (!thinkEvent || thinkEvent.status !== 'running') return;
+      thinkEvent.status = 'done';
+      thinkEvent.ms = Date.now() - thinkEvent.startedAt;
+      patchLastMessage(assistantMsg);
+    };
 
     const chatFn = isCloud ? window.api.cloud?.chat : window.api.ollama.chat;
     if (typeof chatFn !== 'function') {
@@ -4173,8 +4233,30 @@ ollama pull qwen2.5vl:7b
         };
         patchLastMessageContent(assistantMsg);
       }
+      // Thinking timing. Providers signal it differently (Anthropic sends
+      // thinking content blocks, Gemini flags thought parts, Ollama returns a
+      // separate `thinking` field) — main.js normalises all three into
+      // { thinking: { phase } } / { message: { thinking } }.
+      //
+      // The record is pushed into toolEvents so it renders INLINE, in
+      // sequence, and stays where it happened rather than jumping to the end
+      // of the message.
+      if (chunk.thinking?.phase === 'start' || (chunk.message?.thinking != null && !thinkEvent)) {
+        if (!thinkEvent) {
+          thinkEvent = { name: '__think', status: 'running', startedAt: Date.now() };
+          assistantMsg.toolEvents.push(thinkEvent);
+          assistantMsg.thinking = false;   // the inline row is the indicator now
+          patchLastMessage(assistantMsg);
+        }
+      }
+      if (chunk.thinking?.phase === 'end') endThinking();
+      // Ollama has no explicit end signal — the first real content token after
+      // a thinking field means reasoning is done.
+      if (chunk.message?.content && thinkEvent?.status === 'running') endThinking();
+
       if (chunk.message?.tool_calls?.length) {
         if (assistantMsg.thinking) assistantMsg.thinking = false;
+        endThinking();
         collectedToolCalls.push(...chunk.message.tool_calls);
       }
       // Final stream chunk carries Ollama's tokenizer counts. In multi-round
@@ -4208,6 +4290,11 @@ ollama pull qwen2.5vl:7b
       aborted = true;
       patchLastMessageContent(assistantMsg);
     }
+
+    // Stream over — if the model was still "thinking" (aborted mid-reason, or
+    // a provider that never sent an end signal), close the row out so it can
+    // never be left spinning forever.
+    endThinking();
 
     if (aborted) break;
     lastContent = acc;
@@ -5120,68 +5207,6 @@ function patchLastMessageContent(msg) {
 }
 
 // ============== CATALOG ==============
-function renderCatalog() {
-  const c = $('#catalog');
-  if (!c || !state.catalog) return;
-  c.innerHTML = '';
-  for (const [key, cat] of Object.entries(state.catalog.categories)) {
-    const card = document.createElement('div');
-    card.className = 'cat-card';
-    card.innerHTML = `
-      <div class="cat-label">${escapeHtml(key)}</div>
-      <h2>${escapeHtml(cat.label)}</h2>
-      ${cat.picks.map((p, i) => {
-        const installed = state.installed.has(p.tag);
-        const tagText = p.tag;
-        const tagClass = installed ? 'cat-tag installed' : 'cat-tag';
-        const ranks = ['i.', 'ii.', 'iii.', 'iv.', 'v.'];
-        const rank = ranks[i] || `${i + 1}.`;
-        const mmBadge = p.multimodal ? `<span class="cat-badge router">vision · auto</span>` : '';
-        const uninstallBtn = installed
-          ? `<button type="button" class="cat-uninstall" data-cat-uninstall="${escapeAttr(p.tag)}" title="Uninstall this model (frees disk)">Uninstall</button>`
-          : '';
-        return `
-          <div class="cat-pick">
-            <div class="cat-pick-head">
-              <span class="cat-rank">${rank}</span>
-              <span class="cat-name">${escapeHtml(p.name)}</span>
-              ${mmBadge}
-            </div>
-            <div class="cat-tag-row">
-              <span class="${tagClass}">${escapeHtml(tagText)}</span>
-              ${uninstallBtn}
-            </div>
-            <p class="cat-why">${escapeHtml(p.why)}</p>
-            <div class="cat-meta">
-              ${p.ram_gb ? `<span>RAM <strong>${p.ram_gb} GB</strong></span>` : ''}
-              ${p.vram_gb ? `<span>VRAM <strong>${p.vram_gb} GB</strong></span>` : ''}
-              ${p.context ? `<span>Context <strong>${(p.context / 1024).toFixed(0)}K</strong></span>` : ''}
-            </div>
-          </div>
-        `;
-      }).join('')}
-    `;
-    c.appendChild(card);
-  }
-  // Wire uninstall buttons (delegated would be cleaner, but the catalog
-  // re-renders rarely enough that this is fine).
-  c.querySelectorAll('[data-cat-uninstall]').forEach(btn => {
-    btn.addEventListener('click', async () => {
-      const tag = btn.dataset.catUninstall;
-      if (!confirm(`Uninstall ${tag}?\n\nThis frees the disk blobs Ollama is keeping for this model. You can reinstall it any time from the model picker.`)) return;
-      btn.disabled = true;
-      const orig = btn.textContent;
-      btn.textContent = 'Uninstalling…';
-      try {
-        const res = await window.api.ollama.delete(tag);
-        if (res.error) { alert(`Uninstall failed: ${res.error}`); }
-      } catch (e) { alert(`Uninstall failed: ${e.message}`); }
-      await refreshOllama();
-      renderCatalog();
-      populateModelPicker();
-    });
-  });
-}
 
 // Delegated click handler for video-bubble actions: dep installer, retry,
 // click-a-thumbnail-to-ask-about-that-moment. One listener on the thread.
