@@ -166,6 +166,57 @@ async function detectHardware() {
 
 ipcMain.handle('hw:detect', () => detectHardware());
 
+// Live counters for the debug overlay. Polled ~1s while the overlay is open
+// and never otherwise — spawning nvidia-smi on a timer isn't free.
+// Everything is best-effort: a machine with no NVIDIA card still gets RAM
+// and CPU, with the GPU fields simply absent.
+let lastCpu = null;
+function cpuLoadPercent() {
+  // os.loadavg() is meaningless on Windows, so derive load from the delta in
+  // cumulative CPU times between polls instead.
+  const cpus = os.cpus();
+  let idle = 0, total = 0;
+  for (const c of cpus) {
+    for (const t of Object.values(c.times)) total += t;
+    idle += c.times.idle;
+  }
+  if (!lastCpu) { lastCpu = { idle, total }; return null; }
+  const dIdle = idle - lastCpu.idle;
+  const dTotal = total - lastCpu.total;
+  lastCpu = { idle, total };
+  if (dTotal <= 0) return null;
+  return Math.max(0, Math.min(100, Math.round(100 * (1 - dIdle / dTotal))));
+}
+
+ipcMain.handle('hw:live', async () => {
+  const totalRamGB = os.totalmem() / 1024 ** 3;
+  const freeRamGB = os.freemem() / 1024 ** 3;
+  const out = {
+    ramUsedGB: +(totalRamGB - freeRamGB).toFixed(1),
+    ramTotalGB: +totalRamGB.toFixed(1),
+    cpuPct: cpuLoadPercent(),
+    gpu: null
+  };
+  // utilization.gpu = SM busy %, memory.used/total in MiB.
+  const raw = await execOut('nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits', 2500);
+  const line = raw.split('\n').map(s => s.trim()).filter(Boolean)[0];
+  if (line) {
+    const p = line.split(',').map(s => s.trim());
+    if (p.length >= 4) {
+      const used = parseFloat(p[2]), total = parseFloat(p[3]), util = parseFloat(p[1]);
+      if (isFinite(used) && isFinite(total)) {
+        out.gpu = {
+          name: p[0],
+          utilPct: isFinite(util) ? util : null,
+          vramUsedGB: +(used / 1024).toFixed(1),
+          vramTotalGB: +(total / 1024).toFixed(1)
+        };
+      }
+    }
+  }
+  return out;
+});
+
 // =============== FREEZE WATCHDOG ===============
 // When a model is too big for the machine, the OS starts swapping and the
 // whole desktop stops responding — the cursor barely moves and clicking Stop
@@ -335,8 +386,48 @@ app.whenReady().then(() => {
   mcpManager.startAll().catch(e => console.error('[mcp] startAll:', e));
 });
 
-app.on('before-quit', async () => {
-  if (mcpManager) { try { await mcpManager.stopAll(); } catch {} }
+// Ask Ollama which models are resident, then evict every one of them.
+// Ollama holds weights for keep_alive (5 min) after the last request, so
+// closing Sanctum would otherwise leave tens of GB pinned in RAM/VRAM long
+// after the app is gone. A local-first app shouldn't squat on your memory.
+async function unloadAllOllamaModels() {
+  let names = [];
+  try {
+    const res = await fetch(`${OLLAMA_URL}/api/ps`, { signal: AbortSignal.timeout(2500) });
+    if (!res.ok) return [];
+    const j = await res.json();
+    names = (j.models || []).map(m => m.name || m.model).filter(Boolean);
+  } catch { return []; }             // Ollama not running — nothing to unload
+  const done = [];
+  await Promise.all(names.map(async (n) => { if (await unloadOllamaModel(n)) done.push(n); }));
+  return done;
+}
+
+// Quit cleanup. The previous handler was `async` but never called
+// preventDefault(), so Electron tore the process down without waiting for it
+// — the await was effectively ignored. This does it properly: block the
+// quit, run cleanup, then quit for real. Capped so a hung Ollama or MCP
+// server can't strand the app in a permanently-unquittable state.
+let quitCleanupRan = false;
+app.on('before-quit', (e) => {
+  if (quitCleanupRan) return;        // second pass: let the quit through
+  e.preventDefault();
+  const debugLog = path.join(app.getPath('userData'), 'chat-debug.log');
+  const dlog = (m) => { try { fs.appendFileSync(debugLog, `[${new Date().toISOString()}] ${m}\n`); } catch {} };
+
+  const cleanup = (async () => {
+    // Kill in-flight generations first so nothing reloads a model behind us.
+    for (const [, entry] of activeChatStreams) { try { entry.controller.abort(); } catch {} }
+    const unloaded = await unloadAllOllamaModels();
+    if (unloaded.length) dlog(`quit · unloaded ${unloaded.length} model(s): ${unloaded.join(', ')}`);
+    if (mcpManager) { try { await mcpManager.stopAll(); } catch {} }
+  })();
+
+  const timeout = new Promise(r => setTimeout(r, 6000));
+  Promise.race([cleanup, timeout]).catch(() => {}).then(() => {
+    quitCleanupRan = true;
+    app.quit();
+  });
 });
 
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });

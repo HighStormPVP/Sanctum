@@ -36,6 +36,9 @@ contextBridge.exposeInMainWorld('api', {
   // Hardware profile for the Download tab's fit meter. Cached in main after
   // the first probe.
   hardware: () => ipcRenderer.invoke('hw:detect'),
+  // Live GPU/VRAM/RAM counters for the debug overlay. Polled only while the
+  // overlay is visible.
+  hardwareLive: () => ipcRenderer.invoke('hw:live'),
   downloadCatalog: () => ipcRenderer.invoke('models:download_catalog'),
 
   // Freeze watchdog: main aborts + unloads the model if the machine stalls

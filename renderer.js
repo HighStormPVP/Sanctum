@@ -73,6 +73,7 @@ const state = {
   wireDragDrop();
   wireSidebar();
   wireFreezeWatchdog();
+  wireDebugOverlay();
   wireComposer();
   wireAttachments();
   wireTitleEdit();
@@ -328,6 +329,66 @@ Title:`;
 }
 
 // ============== MODELS ==============
+// ============== DEBUG OVERLAY ==============
+// Live hardware counters. Polls main once a second, but only while visible —
+// each poll spawns nvidia-smi, so an always-on timer would be wasteful.
+let dbgTimer = null;
+
+function dbgBar(label, used, total, unit, pct) {
+  const p = pct != null ? pct : (total ? Math.min(100, (used / total) * 100) : 0);
+  const tone = p >= 90 ? 'crit' : p >= 70 ? 'warn' : 'ok';
+  const readout = total != null
+    ? `${used} / ${total} ${unit}`
+    : `${Math.round(p)}%`;
+  return `
+    <div class="dbg-row">
+      <div class="dbg-label"><span>${escapeHtml(label)}</span><span class="dbg-val">${escapeHtml(readout)}</span></div>
+      <div class="dbg-track"><div class="dbg-fill ${tone}" style="width:${p.toFixed(1)}%"></div></div>
+    </div>`;
+}
+
+async function dbgTick() {
+  const body = $('#dbg-body');
+  if (!body) return;
+  let s;
+  try { s = await window.api.hardwareLive(); }
+  catch { body.innerHTML = `<div class="dbg-empty">Couldn't read hardware stats.</div>`; return; }
+
+  let html = '';
+  if (s.gpu) {
+    if (s.gpu.utilPct != null) html += dbgBar('GPU', null, null, '', s.gpu.utilPct);
+    html += dbgBar('VRAM', s.gpu.vramUsedGB, s.gpu.vramTotalGB, 'GB');
+  }
+  html += dbgBar('RAM', s.ramUsedGB, s.ramTotalGB, 'GB');
+  if (s.cpuPct != null) html += dbgBar('CPU', null, null, '', s.cpuPct);
+  if (!s.gpu) html += `<div class="dbg-note">No NVIDIA GPU detected — GPU and VRAM unavailable.</div>`;
+  body.innerHTML = html;
+}
+
+function setDebugOverlay(on) {
+  const el = $('#dbg-overlay');
+  if (!el) return;
+  el.hidden = !on;
+  clearInterval(dbgTimer);
+  dbgTimer = null;
+  if (on) { dbgTick(); dbgTimer = setInterval(dbgTick, 1000); }
+}
+
+function wireDebugOverlay() {
+  const close = $('#dbg-close');
+  if (close && !close.dataset.wired) {
+    close.dataset.wired = '1';
+    close.addEventListener('click', () => {
+      state.settings.debugOverlay = false;
+      saveSettings();
+      setDebugOverlay(false);
+      const cb = $('#setting-dbg-enabled');
+      if (cb) cb.checked = false;
+    });
+  }
+  setDebugOverlay(state.settings.debugOverlay === true);
+}
+
 // Main aborted a run because the machine locked up. Explain it in the chat —
 // a run that just stops with no reason reads like a bug.
 function wireFreezeWatchdog() {
@@ -1659,6 +1720,17 @@ function wireSettings() {
   };
   wireApiKey('setting-anthropic-key', 'setting-anthropic-reveal', 'anthropic');
   wireApiKey('setting-google-key',    'setting-google-reveal',    'google');
+
+  // Debug overlay toggle.
+  const dbgOn = $('#setting-dbg-enabled');
+  if (dbgOn) {
+    dbgOn.checked = state.settings.debugOverlay === true;
+    dbgOn.addEventListener('change', () => {
+      state.settings.debugOverlay = dbgOn.checked;
+      saveSettings();
+      setDebugOverlay(dbgOn.checked);
+    });
+  }
 
   // Freeze protection — pushed to main on every change so the watchdog in the
   // main process reflects the setting immediately.

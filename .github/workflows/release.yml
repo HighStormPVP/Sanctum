@@ -1,8 +1,8 @@
-# Build Sanctum for Windows + macOS on every tagged release.
+# Build Sanctum for Windows + macOS + Linux on every tagged release.
 #
 # Trigger: push a git tag matching `v*` (e.g. `v0.1.0`, `v0.2.0-beta1`).
-# Output: a GitHub Release with `Sanctum-<version>.dmg` (universal, Intel + Apple Silicon)
-#         and `Sanctum Setup <version>.exe` attached.
+# Output: a GitHub Release with the Mac zips (Apple Silicon + Intel),
+#         `Sanctum.Setup.<version>.exe`, and `Sanctum-<version>.AppImage`.
 #
 # No Mac required — GitHub provides macOS runners. The DMG is built unsigned;
 # users will see Gatekeeper's "unidentified developer" warning on first launch
@@ -38,6 +38,9 @@ jobs:
           - os: windows-latest
             artifact_glob: dist/*.exe
             build_cmd: dist:win
+          - os: ubuntu-latest
+            artifact_glob: dist/*.AppImage
+            build_cmd: dist:linux
 
     steps:
       - name: Checkout
@@ -82,7 +85,10 @@ jobs:
       - name: Flatten artifact tree
         run: |
           mkdir -p release
-          find artifacts -type f \( -name '*.dmg' -o -name '*.exe' -o -name '*.zip' \) -exec cp {} release/ \;
+          # Every extension we produce must be listed here — a missing one
+          # silently ships an incomplete release (the build passes, the
+          # artifact just never reaches the Release page).
+          find artifacts -type f \( -name '*.dmg' -o -name '*.exe' -o -name '*.zip' -o -name '*.AppImage' \) -exec cp {} release/ \;
           ls -lah release
 
       - name: Create / update GitHub Release

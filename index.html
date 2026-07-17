@@ -28,6 +28,18 @@
     </div>
   </div>
 
+  <!-- DEBUG OVERLAY — live hardware counters, toggled in Settings -->
+  <div class="dbg" id="dbg-overlay" hidden>
+    <div class="dbg-head">
+      <span class="dbg-dot"></span>
+      <span class="dbg-title">Hardware</span>
+      <button class="dbg-close" id="dbg-close" aria-label="Hide debug overlay">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
+    <div class="dbg-body" id="dbg-body"></div>
+  </div>
+
   <div class="app">
 
     <!-- SIDEBAR -->
@@ -420,6 +432,13 @@
               </div>
             </button>
           </div>
+        </section>
+        <section class="setting-group">
+          <h3>Debug overlay</h3>
+          <label class="wd-row">
+            <input type="checkbox" id="setting-dbg-enabled" />
+            <span class="wd-label">Show live GPU, VRAM and memory usage</span>
+          </label>
         </section>
         <section class="setting-group">
           <h3>Freeze protection</h3>
