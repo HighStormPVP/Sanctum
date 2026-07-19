@@ -21,6 +21,7 @@ const state = {
   hardware: null,          // hw:detect result — probed lazily when Download opens
   downloadCatalog: null,   // download-catalog.json — lazy-loaded, ~86 models
   dlFilters: null,   // Set of active download-filter keys; lazily created
+  space: 'home',     // 'home' (normal chats) | 'code' (agentic projects)
   dlQuery: '',
   settings: { instructions: '' },
   ollamaDetected: null,
@@ -69,8 +70,14 @@ const state = {
   if (!state.order.length) {
     createChat();
   } else {
+    // Open into the workspace the most-recent chat belongs to, so a reload
+    // doesn't strand you in Home looking at nothing while your last project
+    // sits in Code.
+    const first = state.chats[state.order[0]];
+    state.space = chatSpace(first);
     setActive(state.order[0]);
   }
+  applySpaceChrome();
 
   wireCodeBlockActions();
   wireVideoBubbleActions();
@@ -201,6 +208,10 @@ function createChat(modelOverride, modalityOverride, extraFields) {
     ...(extraFields || {})
   };
   state.order.unshift(id);
+  // A normal chat belongs to Home; a project (modalityOverride 'agent') to
+  // Code. Align the workspace so the new chat is actually visible in the list.
+  state.space = modality === 'agent' ? 'code' : 'home';
+  applySpaceChrome();
   setActive(id);
   saveToStorage();
   renderChatList();
@@ -261,8 +272,11 @@ function deleteChat(id) {
   delete state.chats[id];
   state.order = state.order.filter(x => x !== id);
   if (state.activeId === id) {
-    if (state.order.length) setActive(state.order[0]);
-    else createChat();
+    // Stay in the current workspace: activate the next chat that belongs to it,
+    // or fall to that space's empty state (null) — never jump to the other
+    // workspace's chats.
+    const next = chatsInCurrentSpace()[0];
+    setActive(next?.id || null);
   }
   saveToStorage();
   renderChatList();
@@ -1306,7 +1320,9 @@ async function detectOllama() {
 // ============== SIDEBAR ==============
 function wireSidebar() {
   $('#new-chat').addEventListener('click', () => createChat());
-  $('#new-agentic-chat').addEventListener('click', () => createAgenticChat());
+  $('#new-project')?.addEventListener('click', () => createAgenticChat());
+  $('#space-toggle')?.addEventListener('click', () =>
+    switchSpace(state.space === 'code' ? 'home' : 'code'));
   $('#open-downloads')?.addEventListener('click', () => openDownloads());
   $('#open-settings').addEventListener('click', () => openSettings());
 
@@ -1437,11 +1453,59 @@ function saveAgentOpts() {
   saveToStorage();
 }
 
+// A chat belongs to the Code workspace iff it's agentic; everything else is a
+// Home chat. This is the single source of truth for the space split.
+function chatSpace(c) { return c?.modality === 'agent' ? 'code' : 'home'; }
+
+// Chats in the currently-active workspace, newest-first order preserved.
+function chatsInCurrentSpace() {
+  return state.order.map(id => state.chats[id]).filter(c => c && chatSpace(c) === state.space);
+}
+
+// Switch workspace: update the sidebar chrome, filter the chat list, and move
+// the active chat to one that belongs to the new space (or none, which shows
+// that space's empty state).
+function switchSpace(space) {
+  if (space !== 'home' && space !== 'code') return;
+  state.space = space;
+  // If we're parked on a view (Downloads/Settings), come back to the chat view
+  // so the workspace switch is actually visible.
+  switchView('chat');
+  applySpaceChrome();
+  const inSpace = chatsInCurrentSpace();
+  const active = currentChat();
+  if (!active || chatSpace(active) !== space) {
+    state.activeId = inSpace[0]?.id || null;
+  }
+  state.pendingAttachments = [];
+  renderAttachments();
+  saveToStorage();
+  renderChatList();
+  renderActiveChat();
+}
+
+// Reflect the current workspace in the sidebar: the toggle label/title and
+// which "new" button is shown.
+function applySpaceChrome() {
+  const code = state.space === 'code';
+  const label = $('#space-toggle-label');
+  const btn = $('#space-toggle');
+  if (label) label.textContent = code ? 'Home' : 'Code';
+  if (btn) {
+    btn.title = code ? 'Back to your normal chats' : 'Open the Code workspace';
+    btn.classList.toggle('in-code', code);
+  }
+  const newChat = $('#new-chat');
+  const newProject = $('#new-project');
+  if (newChat) newChat.hidden = code;
+  if (newProject) newProject.hidden = !code;
+}
+
 function renderChatList() {
   const list = $('#chat-list');
   if (!list) return;
   list.innerHTML = '';
-  const groups = groupChatsByDate(state.order.map(id => state.chats[id]).filter(Boolean));
+  const groups = groupChatsByDate(chatsInCurrentSpace());
   for (const [label, chats] of groups) {
     const header = document.createElement('div');
     header.className = 'list-header';
@@ -2638,7 +2702,15 @@ function refreshDownloadsIfOpen() {
 // ============== ACTIVE CHAT RENDER ==============
 function renderActiveChat() {
   const c = currentChat();
-  if (!c) return;
+  // No active chat (e.g. an empty workspace) — show that space's empty state
+  // and hide the chat chrome, rather than leaving stale content on screen.
+  if (!c) {
+    renderThread();
+    $('#agent-bar')?.setAttribute('hidden', '');
+    const title = $('#chat-title');
+    if (title) { title.value = ''; title.placeholder = 'New chat'; }
+    return;
+  }
 
   $('#chat-title').value = c.title || '';
   $('#chat-title').placeholder = c.title || 'New chat';
@@ -2712,12 +2784,15 @@ function renderActiveChat() {
   const supportsTools = modelSupportsTools(c.model);
   const supportsThinking = modelSupportsThinking(c.model);
 
-  // Silently turn a feature off if the newly-selected model can't do it, so we
-  // never send tools/think to a model that will mishandle them.
-  if (!supportsTools && c.webEnabled) { c.webEnabled = false; saveToStorage(); }
+  // Web search works for EVERY text model now: tool-capable models call the
+  // web_search tool themselves; the rest get an automatic search-and-inject
+  // (Sanctum runs the search and feeds the results in as context). So the web
+  // toggle is never disabled — only thinking is gated on real support.
   if (!supportsThinking && c.thinkingEnabled) { c.thinkingEnabled = false; saveToStorage(); }
-  // Default web search ON for tools-capable models (new + legacy chats).
-  if (supportsTools && c.webEnabled === undefined) { c.webEnabled = true; saveToStorage(); }
+  // Default web ON for capable models (they only search when they decide to).
+  // For weaker models it stays OFF by default — with them, "on" means a search
+  // on every message, so opting in should be the user's explicit choice.
+  if (c.webEnabled === undefined) { c.webEnabled = supportsTools; saveToStorage(); }
 
   const setToggle = (id, supported, on) => {
     const btn = $(`#${id}`);
@@ -2728,7 +2803,8 @@ function renderActiveChat() {
     btn.setAttribute('aria-pressed', on ? 'true' : 'false');
     btn.title = supported ? '' : 'This model doesn’t support this.';
   };
-  setToggle('toggle-web', supportsTools, c.webEnabled === true);
+  // Web: always usable on a text chat. Think: only when the model supports it.
+  setToggle('toggle-web', true, c.webEnabled === true);
   setToggle('toggle-think', supportsThinking, c.thinkingEnabled === true);
 
   // The abilities menu stays available for any text chat — both options live
@@ -2750,7 +2826,8 @@ function wireWebToggle() {
   btn.addEventListener('click', () => {
     const c = currentChat();
     if (!c) return;
-    if (btn.classList.contains('disabled') || !modelSupportsTools(c.model)) return;
+    // Web works for every model now (tool-calling or search-and-inject), so
+    // it's never disabled — no support gate here.
     c.webEnabled = !c.webEnabled;
     btn.setAttribute('aria-pressed', c.webEnabled ? 'true' : 'false');
     $('#tools-menu-btn')?.classList.toggle('has-active', !!(c.webEnabled || c.thinkingEnabled));
@@ -2847,6 +2924,26 @@ function renderEmptyState() {
   // like Claude Code.
   if (c?.modality === 'agent') return renderAgenticEmptyState(c);
 
+  // Code workspace with no project open (or none exist yet) — point the user
+  // at New Project rather than the general chat chips.
+  if (state.space === 'code') {
+    const wrap = document.createElement('div');
+    wrap.className = 'empty';
+    wrap.innerHTML = `
+      <div class="empty-orb"></div>
+      <h2>Code workspace</h2>
+      <p>Agentic coding projects live here — each one is scoped to a project folder and can read, write, and run commands with your approval. Start one with <strong>New Project</strong>.</p>
+      <button type="button" class="empty-folder-btn" id="empty-new-project">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg>
+        <span>New Project</span>
+      </button>
+    `;
+    setTimeout(() => {
+      wrap.querySelector('#empty-new-project')?.addEventListener('click', () => createAgenticChat());
+    }, 0);
+    return wrap;
+  }
+
   const wrap = document.createElement('div');
   wrap.className = 'empty';
   wrap.innerHTML = `
@@ -2865,6 +2962,9 @@ function renderEmptyState() {
     // STARTING modality, so don't show a "Cloud Models" chip here; users
     // switch to Claude via the model picker instead.
     if (key === 'cloud') continue;
+    // Agentic chats live in the Code workspace now, reached via New Project —
+    // don't offer an "agent" starting chip in the Home empty state.
+    if (key === 'agent') continue;
     const chip = document.createElement('button');
     chip.className = 'chip';
     chip.textContent = cat.label;
@@ -3058,10 +3158,34 @@ function renderToolEvent(ev) {
   // query), and the status text on the right — same family of designs, no
   // pill chip anywhere.
   if (ev.name === '__think') return renderThinkEvent(ev);
+  if (ev.name === 'web_search') return renderSearchEvent(ev);
   if (ev.name === 'run_command' || ev.name === 'run_command_async') {
     return renderShellToolEvent(ev);
   }
   return renderCompactToolEvent(ev);
+}
+
+// Web-search row — a permanent past-tense marker in the transcript, styled to
+// match the "Thought for Ns" row. "Searched the web" stays put where the
+// search happened; it reads as a record of what the model did, not a
+// transient status.
+function renderSearchEvent(ev) {
+  const el = document.createElement('div');
+  const running = ev.status === 'running';
+  const err = ev.status === 'error';
+  el.className = `search-row${running ? ' running' : ''}${err ? ' error' : ''}`;
+  const label = running
+    ? 'Searching the web'
+    : err
+      ? (ev.resultSummary ? `Web search — ${ev.resultSummary}` : 'Web search failed')
+      : (ev.resultSummary ? `Searched the web · ${ev.resultSummary}` : 'Searched the web');
+  el.innerHTML = `
+    <svg class="search-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+    <span class="search-label">${escapeHtml(label)}</span>
+    ${ev.argSummary ? `<span class="search-q">${escapeHtml(ev.argSummary)}</span>` : ''}
+    ${running ? '<span class="think-dots"><span></span><span></span><span></span></span>' : ''}
+  `;
+  return el;
 }
 
 // The reasoning row. Lives in the toolEvents stream so it renders in the
@@ -4011,6 +4135,52 @@ async function dispatchSend() {
   }
 }
 
+// Run a web search for the user's latest message and append the results to
+// that message as context. Used for models that can't reliably emit tool
+// calls — it gives them the same web-search ability without needing them to
+// call anything. Shows a Search tool-event so the user sees it happened.
+async function autoWebSearchInject(c, assistantMsg, history) {
+  const lastUser = [...c.messages].reverse().find(m => m.role === 'user');
+  const query = (lastUser?.content || '').trim().replace(/\s+/g, ' ').slice(0, 400);
+  if (!query || !history.length) return;
+
+  const ev = {
+    name: 'web_search',
+    argSummary: query.length > 64 ? query.slice(0, 64) + '…' : query,
+    status: 'running'
+  };
+  assistantMsg.toolEvents.push(ev);
+  patchLastMessage(assistantMsg);
+
+  let res;
+  try { res = await window.api.web.search(query); }
+  catch (e) { res = { error: e.message }; }
+
+  if (!res || res.error || !res.results?.length) {
+    // A failed search shouldn't block the answer — the model just replies from
+    // its own knowledge, same as web-off. Mark the event so it's visible.
+    ev.status = 'error';
+    ev.resultSummary = res?.error ? 'search failed' : 'no results';
+    patchLastMessage(assistantMsg);
+    return;
+  }
+
+  const top = res.results.slice(0, 5);
+  ev.status = 'done';
+  ev.resultSummary = `${top.length} result${top.length === 1 ? '' : 's'}`;
+  patchLastMessage(assistantMsg);
+
+  const block = top.map((r, i) => `[${i + 1}] ${r.title}\n${r.url}\n${r.snippet}`).join('\n\n');
+  // Append to the user's turn (not a separate system message) — small models
+  // follow "here's my question + here are the facts" far more reliably than a
+  // detached system block.
+  const idx = history.length - 1;
+  history[idx] = {
+    ...history[idx],
+    content: `${history[idx].content || ''}\n\n---\nWeb search results (retrieved just now — answer using these and cite the sources; do NOT say you can't access current information):\n\n${block}`
+  };
+}
+
 // ============== OLLAMA CHAT (with tool loop + vision bridge) ==============
 async function runOllamaChat(c, attachments) {
   // Defensive wrapper: any unhandled exception inside the chat loop would
@@ -4187,6 +4357,15 @@ ollama pull qwen2.5vl:7b
 
   const tools = buildTools(c.modality, c.webEnabled === true, c.model, c);
   const useTools = !!tools;
+
+  // Search-and-inject fallback: models that can't emit tool calls still get
+  // web search — Sanctum runs the search itself and appends the results to the
+  // user's message as context. This is why web search works on EVERY model,
+  // not just the tool-capable ones. Tool-capable models skip this (they call
+  // web_search on their own, only when they decide it's needed).
+  if (c.webEnabled && !modelSupportsTools(c.model) && c.modality !== 'agent') {
+    await autoWebSearchInject(c, assistantMsg, history);
+  }
 
   // The model you picked is the model that answers. There used to be a code
   // auto-route here that silently swapped in a local coding model whenever a
@@ -5935,14 +6114,24 @@ function renderMarkdown(text) {
   // promoted to their own list right after the parent item.
   const lines = src.split('\n');
   const out = [];
-  let listType = null; // 'ul' | 'ol' | null
-  const closeList = () => { if (listType) { out.push(`</${listType}>`); listType = null; } };
+  let listType = null;  // 'ul' | 'ol' | null
+  // Blank lines INSIDE a list are deferred rather than closing it: many models
+  // (especially small ones) write "loose" lists with a blank line between every
+  // item. Closing the list on each blank produced a separate <ol> per item,
+  // and every fresh <ol> restarts at 1 — which is the "1. 1. 1." bug. We only
+  // actually close when a non-list line arrives.
+  let pendingBlank = false;
+  const closeList = () => { if (listType) { out.push(`</${listType}>`); listType = null; } pendingBlank = false; };
 
   for (const raw of lines) {
     const line = raw.replace(/\s+$/, '');
     const trimmed = line.trim();
 
-    if (!trimmed) { closeList(); continue; }
+    if (!trimmed) {
+      if (listType) pendingBlank = true;   // maybe a loose list — wait and see
+      else closeList();
+      continue;
+    }
 
     const h = trimmed.match(/^(#{1,3})\s+(.+)$/);
     if (h) { closeList(); const lvl = h[1].length; out.push(`<h${lvl}>${h[2]}</h${lvl}>`); continue; }
@@ -5950,13 +6139,18 @@ function renderMarkdown(text) {
     const ul = trimmed.match(/^[*\-]\s+(.+)$/);
     if (ul) {
       if (listType !== 'ul') { closeList(); out.push('<ul>'); listType = 'ul'; }
+      pendingBlank = false;
       out.push(`<li>${ul[1]}</li>`);
       continue;
     }
-    const ol = trimmed.match(/^\d+\.\s+(.+)$/);
+    // Capture the actual ordinal so the rendered number matches what the model
+    // wrote (value="N"), regardless of how the <ol>s end up grouped. This is a
+    // second guard against mis-numbering on top of the loose-list fix.
+    const ol = trimmed.match(/^(\d+)\.\s+(.+)$/);
     if (ol) {
       if (listType !== 'ol') { closeList(); out.push('<ol>'); listType = 'ol'; }
-      out.push(`<li>${ol[1]}</li>`);
+      pendingBlank = false;
+      out.push(`<li value="${ol[1]}">${ol[2]}</li>`);
       continue;
     }
 

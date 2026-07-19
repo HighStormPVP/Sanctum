@@ -199,6 +199,7 @@ button { font-family: inherit; }
 }
 .app.sidebar-collapsed .brand-mark,
 .app.sidebar-collapsed .brand-name,
+.app.sidebar-collapsed .space-toggle,
 .app.sidebar-collapsed .new-chat,
 .app.sidebar-collapsed .chat-list,
 .app.sidebar-collapsed .sidebar-foot { display: none; }
@@ -215,6 +216,31 @@ button { font-family: inherit; }
   letter-spacing: -0.025em;
   line-height: 1;
 }
+
+/* Workspace switch (Code / Home) — sits above the new-chat button, styled as a
+   quiet pill so it reads as navigation, distinct from the primary new-chat
+   action. Turns accent-tinted when you're inside the Code workspace. */
+.space-toggle {
+  display: flex; align-items: center; gap: 9px;
+  width: 100%;
+  padding: 9px 14px;
+  margin-bottom: 10px;
+  background: transparent;
+  border: 1px solid var(--border-1);
+  border-radius: var(--r-sm);
+  color: var(--text-2);
+  font-family: inherit; font-size: 13.5px; font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s var(--ease), color 0.15s var(--ease), border-color 0.15s var(--ease);
+}
+.space-toggle:hover { background: var(--surface-2); color: var(--text-1); border-color: var(--border-2); }
+.space-toggle svg { width: 16px; height: 16px; opacity: 0.85; }
+.space-toggle.in-code {
+  background: var(--accent-soft);
+  border-color: rgba(139, 92, 246, 0.4);
+  color: var(--text-1);
+}
+.space-toggle.in-code svg { color: var(--accent-1); opacity: 1; }
 
 .new-chat {
   display: flex; align-items: center; gap: 10px;
@@ -401,8 +427,12 @@ button { font-family: inherit; }
 .empty.agentic-empty .empty-orb {
   background: linear-gradient(135deg, rgba(139,92,246,0.7), rgba(6,182,212,0.5));
 }
-.empty.agentic-empty .empty-folder-btn {
-  margin-top: 20px;
+/* Shared by the agentic and Code-workspace empty states. Scoped to .empty
+   (not .agentic-empty) so both get the pill treatment — otherwise the Code
+   workspace button fell back to a bare, unsized button, which rendered as a
+   giant white box with an oversized plus. */
+.empty .empty-folder-btn {
+  margin: 20px auto 0;
   background: var(--accent);
   color: #fff;
   border: 0;
@@ -418,8 +448,8 @@ button { font-family: inherit; }
   box-shadow: 0 6px 20px rgba(139,92,246,0.35);
   transition: transform 0.12s var(--ease);
 }
-.empty.agentic-empty .empty-folder-btn:hover { transform: translateY(-1px); }
-.empty.agentic-empty .empty-folder-btn svg { width: 16px; height: 16px; }
+.empty .empty-folder-btn:hover { transform: translateY(-1px); }
+.empty .empty-folder-btn svg { width: 16px; height: 16px; }
 
 .agent-opts-chat-title { font-family: 'DM Mono', ui-monospace, monospace; font-size: 13px; color: var(--text-3); font-weight: 500; }
 .agent-opts-num {
@@ -1673,6 +1703,29 @@ button { font-family: inherit; }
 }
 .tool-event.done .te-status { color: var(--ok); }
 .tool-event.error .te-status { color: var(--err); }
+
+/* Web-search row — permanent "Searched the web" marker, same quiet treatment
+   as the reasoning row so the two read as a consistent transcript of what the
+   model did. */
+.search-row {
+  display: flex; align-items: center; gap: 7px;
+  align-self: stretch;
+  padding: 3px 0;
+  font-size: 12.5px;
+  color: var(--text-4);
+}
+.search-ico { width: 12px; height: 12px; flex-shrink: 0; color: var(--text-4); }
+.search-row.running .search-ico { color: var(--accent-2); animation: thinkPulse 1.7s ease-in-out infinite; }
+.search-row.running .search-label { color: var(--text-3); }
+.search-row.error .search-label { color: var(--err); }
+.search-q {
+  color: var(--text-4); opacity: 0.8;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  max-width: 340px;
+  font-style: italic;
+}
+.search-q::before { content: '“'; }
+.search-q::after { content: '”'; }
 
 /* Reasoning row — "Thinking…" while it runs, "Thought for 4s" once done.
    Deliberately quiet: it's a timestamp on the transcript, not a result. */
