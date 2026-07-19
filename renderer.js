@@ -20,7 +20,7 @@ const state = {
   pendingAttachments: [],
   hardware: null,          // hw:detect result — probed lazily when Download opens
   downloadCatalog: null,   // download-catalog.json — lazy-loaded, ~86 models
-  dlFilter: 'all',
+  dlFilters: null,   // Set of active download-filter keys; lazily created
   dlQuery: '',
   settings: { instructions: '' },
   ollamaDetected: null,
@@ -204,6 +204,9 @@ function createChat(modelOverride, modalityOverride, extraFields) {
   setActive(id);
   saveToStorage();
   renderChatList();
+  // Starting a new chat from the Downloads (or any) view should drop you into
+  // that chat, not leave you staring at the model list.
+  switchView('chat');
 }
 
 // Spin up an Agent-modality chat with Plan + Approval modes enabled by default.
@@ -520,6 +523,33 @@ function fmtCtx(n) {
 function fmtGB(n) {
   if (n == null) return '—';
   return n < 1 ? `${Math.round(n * 1024)} MB` : `${n} GB`;
+}
+
+function fmtBytes(b) {
+  if (!b) return '0 MB';
+  const gb = b / 1024 ** 3;
+  return gb >= 1 ? `${gb.toFixed(1)} GB` : `${Math.round(b / 1024 ** 2)} MB`;
+}
+
+// Patch the Downloads card's progress in place. Ollama streams progress many
+// times a second, so re-rendering the whole 226-model list per chunk would
+// thrash the DOM and fight the user's scroll position.
+function patchDlProgress(tag) {
+  const wrap = $('#dl-list');
+  if (!wrap || $('#dl-wrap')?.hidden) return;
+  let el;
+  try { el = wrap.querySelector(`.dl-prog[data-prog-tag="${CSS.escape(tag)}"]`); } catch { el = null; }
+  if (!el) return;
+  const prog = state.pullProgress[tag];
+  if (!prog) return;
+  const paused = state.paused.has(tag);
+  const pct = Math.round(prog.pct ?? (prog.total ? (prog.received / prog.total) * 100 : 0));
+  const pctEl = el.querySelector('.dl-prog-pct');
+  const byteEl = el.querySelector('.dl-prog-bytes');
+  const fill = el.querySelector('.dl-prog-fill');
+  if (pctEl) pctEl.textContent = paused ? `Paused · ${pct}%` : `${pct}%`;
+  if (byteEl) byteEl.textContent = `${fmtBytes(prog.received)} / ${fmtBytes(prog.total)}`;
+  if (fill) { fill.style.width = `${pct}%`; fill.classList.toggle('paused', paused); }
 }
 
 function allPicks() {
@@ -1466,15 +1496,19 @@ function switchView(name) {
   $$('.view').forEach(v => v.classList.toggle('active', v.dataset.view === name));
 }
 // ============== DOWNLOAD TAB ==============
+// Filters are multi-select and AND together — pick "Thinking" + "Web search"
+// to get models that do both. 'all' and 'runnable' are special (see below);
+// the rest match a tag on the model. Labels are phrased the way a user thinks
+// about the feature: "Thinking" for the reasoning tag, "Web search" for tool
+// use (web search is the headline tool).
 const DL_FILTERS = [
-  { key: 'all',       label: 'All' },
-  { key: 'runnable',  label: 'Runs on this machine' },
-  { key: 'text',      label: 'Text' },
-  { key: 'code',      label: 'Code' },
-  { key: 'vision',    label: 'Vision' },
-  { key: 'reasoning', label: 'Reasoning' },
-  { key: 'tools',     label: 'Tool use' },
-  { key: 'tiny',      label: 'Tiny' },
+  { key: 'runnable',    label: 'Runs on this machine' },
+  { key: 'text',        label: 'Text' },
+  { key: 'code',        label: 'Code' },
+  { key: 'vision',      label: 'Vision' },
+  { key: 'reasoning',   label: 'Thinking' },
+  { key: 'tools',       label: 'Web search' },
+  { key: 'tiny',        label: 'Tiny' },
   { key: 'abliterated', label: 'Abliterated' },
   { key: 'uncensored',  label: 'Uncensored' }
 ];
@@ -1485,9 +1519,23 @@ function renderHwBar() {
   const hw = state.hardware;
   if (!hw) { el.innerHTML = `<div class="hw-probing">Checking your hardware…</div>`; return; }
 
-  const gpu = hw.gpuName
-    ? `${escapeHtml(hw.gpuName)}${hw.vramGB ? ` · ${hw.vramGB} GB VRAM` : ''}`
-    : 'No dedicated GPU detected';
+  // Build the chip list, de-duplicating identical entries. On Apple Silicon
+  // the CPU and GPU are the same chip, so os.cpus() and system_profiler both
+  // report e.g. "Apple M2" — which showed up as two identical chips. When the
+  // GPU name matches (or is contained in) the CPU name, collapse to one.
+  const chips = [];
+  const cpu = (hw.cpuModel || '').trim();
+  const gpuName = (hw.gpuName || '').trim();
+  if (cpu) chips.push(cpu);
+  if (gpuName) {
+    const dupOfCpu = cpu && (gpuName === cpu || cpu.includes(gpuName) || gpuName.includes(cpu));
+    if (!dupOfCpu) chips.push(`${gpuName}${hw.vramGB ? ` · ${hw.vramGB} GB VRAM` : ''}`);
+    else if (hw.vramGB) chips.push(`${hw.vramGB} GB VRAM`);
+  } else if (hw.budgetSource === 'ram') {
+    chips.push('No dedicated GPU');
+  }
+  chips.push(`${hw.totalRamGB} GB RAM`);
+
   const basis = hw.budgetSource === 'vram'
     ? `Models up to <strong>${hw.fastBudgetGB} GB</strong> run at full speed on the GPU. Larger ones spill into system RAM and slow down; the ceiling is about <strong>${hw.maxBudgetGB} GB</strong>.`
     : hw.budgetSource === 'unified'
@@ -1496,9 +1544,7 @@ function renderHwBar() {
 
   el.innerHTML = `
     <div class="hw-head">
-      <span class="hw-chip">${escapeHtml(hw.cpuModel)}</span>
-      <span class="hw-chip">${gpu}</span>
-      <span class="hw-chip">${hw.totalRamGB} GB RAM</span>
+      ${chips.map(ch => `<span class="hw-chip">${escapeHtml(ch)}</span>`).join('')}
     </div>
     <p class="hw-note">${basis}</p>
   `;
@@ -1530,20 +1576,26 @@ function renderDownloadTab() {
   if (!list) return;
   renderHwBar();
 
+  const active = state.dlFilters || (state.dlFilters = new Set());
   const filters = $('#dl-filters');
-  if (filters && !filters.dataset.wired) {
-    filters.innerHTML = DL_FILTERS.map(f =>
-      `<button class="dl-chip${f.key === state.dlFilter ? ' active' : ''}" data-filter="${f.key}">${escapeHtml(f.label)}</button>`
+  if (filters) {
+    const chips = DL_FILTERS.map(f =>
+      `<button class="dl-chip${active.has(f.key) ? ' active' : ''}" data-filter="${f.key}">${escapeHtml(f.label)}</button>`
     ).join('');
-    filters.dataset.wired = '1';
-    filters.addEventListener('click', (e) => {
-      const btn = e.target.closest('.dl-chip');
-      if (!btn) return;
-      state.dlFilter = btn.dataset.filter;
-      filters.querySelectorAll('.dl-chip').forEach(c =>
-        c.classList.toggle('active', c.dataset.filter === state.dlFilter));
-      renderDownloadTab();
-    });
+    // An "All" chip clears every filter; it's active only when nothing else is.
+    filters.innerHTML = `<button class="dl-chip${active.size === 0 ? ' active' : ''}" data-filter="__all">All</button>` + chips;
+    if (!filters.dataset.wired) {
+      filters.dataset.wired = '1';
+      filters.addEventListener('click', (e) => {
+        const btn = e.target.closest('.dl-chip');
+        if (!btn) return;
+        const key = btn.dataset.filter;
+        if (key === '__all') active.clear();
+        else if (active.has(key)) active.delete(key);
+        else active.add(key);
+        renderDownloadTab();
+      });
+    }
   }
   const search = $('#dl-search');
   if (search && !search.dataset.wired) {
@@ -1555,10 +1607,12 @@ function renderDownloadTab() {
   const q = state.dlQuery || '';
   let models = (state.downloadCatalog?.models || []).filter(m => {
     if (q && !(`${m.name} ${m.tag} ${m.blurb}`.toLowerCase().includes(q))) return false;
-    const f = state.dlFilter || 'all';
-    if (f === 'all') return true;
-    if (f === 'runnable') return hw ? fitFor(m, hw).verdict !== 'unrunnable' : true;
-    return (m.tags || []).includes(f);
+    // AND every active filter. 'runnable' is a fit check; the rest are tags.
+    for (const f of active) {
+      if (f === 'runnable') { if (hw && fitFor(m, hw).verdict === 'unrunnable') return false; }
+      else if (!(m.tags || []).includes(f)) return false;
+    }
+    return true;
   });
 
   // Runnable first, then biggest-usable first — the models worth their
@@ -1588,16 +1642,36 @@ function renderDownloadTab() {
     const tagChips = (m.tags || []).map(t => `<span class="dl-tag t-${t}">${escapeHtml(t)}</span>`).join('');
     // Cloud-only models have no weights to pull — the Download button would
     // just fail, so offer the pull command for an ollama.com account instead.
-    const action = m.cloudOnly
-      ? `<span class="dl-cloudnote">Runs on Ollama&nbsp;Cloud</span>`
-      : installed
-        ? `<div class="dl-have">
-             <span class="dl-installed">Installed</span>
-             <button class="dl-remove" data-uninstall="${escapeAttr(m.tag)}" title="Uninstall — frees ${fmtGB(m.sizeGB)} of disk">Uninstall</button>
-           </div>`
-        : pulling
-          ? `<span class="dl-installed pulling">Downloading…</span>`
-          : `<button class="dl-get" data-tag="${escapeAttr(m.tag)}">Download</button>`;
+    const paused = state.paused.has(m.tag);
+    let action;
+    if (m.cloudOnly) {
+      action = `<span class="dl-cloudnote">Runs on Ollama&nbsp;Cloud</span>`;
+    } else if (installed) {
+      action = `<div class="dl-have">
+           <span class="dl-installed">Installed</span>
+           <button class="dl-remove" data-uninstall="${escapeAttr(m.tag)}" title="Uninstall — frees ${fmtGB(m.sizeGB)} of disk">Uninstall</button>
+         </div>`;
+    } else if (pulling || paused) {
+      // Live progress. The bar and label are patched in place by
+      // patchDlProgress() rather than re-rendering the whole list on every
+      // chunk — Ollama emits progress many times a second.
+      const prog = state.pullProgress[m.tag] || { received: 0, total: 0 };
+      const pct = Math.round(prog.pct ?? (prog.total ? (prog.received / prog.total) * 100 : 0));
+      action = `
+        <div class="dl-prog" data-prog-tag="${escapeAttr(m.tag)}">
+          <div class="dl-prog-head">
+            <span class="dl-prog-pct">${paused ? `Paused · ${pct}%` : `${pct}%`}</span>
+            <span class="dl-prog-bytes">${fmtBytes(prog.received)} / ${fmtBytes(prog.total)}</span>
+          </div>
+          <div class="dl-prog-track"><div class="dl-prog-fill${paused ? ' paused' : ''}" style="width:${pct}%"></div></div>
+          <div class="dl-prog-btns">
+            <button class="dl-prog-btn" data-pull-toggle="${escapeAttr(m.tag)}" title="${paused ? 'Resume download' : 'Pause download'}">${paused ? 'Resume' : 'Pause'}</button>
+            <button class="dl-prog-btn cancel" data-pull-cancel="${escapeAttr(m.tag)}" title="Cancel and delete what's downloaded">Cancel</button>
+          </div>
+        </div>`;
+    } else {
+      action = `<button class="dl-get" data-tag="${escapeAttr(m.tag)}">Download</button>`;
+    }
     return `
       <article class="dl-card ${f.verdict}">
         <div class="dl-main">
@@ -1629,8 +1703,27 @@ function renderDownloadTab() {
     list.addEventListener('click', async (e) => {
       const get = e.target.closest('.dl-get');
       if (get) {
+        // Kick off the pull, then re-render so the card swaps to the progress
+        // UI. pullModel is fire-and-forget — it drives its own updates.
         pullModelInline(get.dataset.tag);
-        get.outerHTML = `<span class="dl-installed pulling">Downloading…</span>`;
+        renderDownloadTab();
+        return;
+      }
+      const toggle = e.target.closest('[data-pull-toggle]');
+      if (toggle) {
+        const tag = toggle.dataset.pullToggle;
+        if (state.paused.has(tag)) pullModelInline(tag);   // resume
+        else await pausePull(tag);
+        renderDownloadTab();
+        return;
+      }
+      const cancel = e.target.closest('[data-pull-cancel]');
+      if (cancel) {
+        const tag = cancel.dataset.pullCancel;
+        cancel.disabled = true;
+        cancel.textContent = 'Cancelling…';
+        await cancelPull(tag);
+        renderDownloadTab();
         return;
       }
       const rm = e.target.closest('.dl-remove');
@@ -2419,7 +2512,7 @@ function populateModelPicker() {
         // the right row.
         item.dataset.pullTag = id;
         const prog = state.pullProgress[id];
-        const pct = (prog && prog.total) ? Math.round((prog.received / prog.total) * 100) : 0;
+        const pct = Math.round(prog?.pct ?? ((prog && prog.total) ? (prog.received / prog.total) * 100 : 0));
         const progEl = document.createElement('span');
         progEl.className = 'cs-item-progress';
         progEl.textContent = state.paused.has(id) ? `paused · ${pct}%` : `${pct}%`;
@@ -2535,6 +2628,13 @@ async function pullModelInline(tag) {
   pullModel(tag);
 }
 
+// Re-render the Downloads list, but only when it's actually on screen —
+// pullModel runs regardless of which view the user is looking at.
+function refreshDownloadsIfOpen() {
+  const wrap = $('#dl-wrap');
+  if (wrap && !wrap.hidden && typeof renderDownloadTab === 'function') renderDownloadTab();
+}
+
 // ============== ACTIVE CHAT RENDER ==============
 function renderActiveChat() {
   const c = currentChat();
@@ -2605,47 +2705,37 @@ function renderActiveChat() {
     }
   }
 
-  // Web toggle only makes sense when the model actually supports tool calls.
+  // Both toggles stay VISIBLE for any text-like chat and are greyed out when
+  // the model can't do that thing — rather than disappearing. A toggle that
+  // vanishes leaves the user guessing whether the feature exists; a greyed
+  // one says "this model can't, but the option is real."
   const supportsTools = modelSupportsTools(c.model);
-  $('#toggle-web').hidden = !textLike || !supportsTools;
-
-  // If user had Web on for a previous tool-capable model and switched to one
-  // that isn't, silently turn it off so we don't send tools the model will
-  // mishandle.
-  if (!supportsTools && c.webEnabled) {
-    c.webEnabled = false;
-    saveToStorage();
-  }
-  // Default web search ON for tools-capable models. Covers new chats and
-  // older chats from before this default existed (webEnabled === undefined).
-  if (supportsTools && c.webEnabled === undefined) {
-    c.webEnabled = true;
-    saveToStorage();
-  }
-
-  const wb = $('#toggle-web');
-  if (wb) wb.setAttribute('aria-pressed', c.webEnabled === true ? 'true' : 'false');
-
-  // Think toggle — only visible when the model has a native thinking
-  // switches (currently just qwen3:30b-a3b).
   const supportsThinking = modelSupportsThinking(c.model);
-  $('#toggle-think').hidden = !textLike || !supportsThinking;
-  if (!supportsThinking && c.thinkingEnabled) {
-    c.thinkingEnabled = false;
-    saveToStorage();
-  }
-  const tb = $('#toggle-think');
-  if (tb) tb.setAttribute('aria-pressed', c.thinkingEnabled ? 'true' : 'false');
 
-  // Hide the abilities-menu button entirely if neither toggle is available
-  // for this model+modality. If one is visible, keep the dropdown so the user
-  // sees the remaining option in there.
+  // Silently turn a feature off if the newly-selected model can't do it, so we
+  // never send tools/think to a model that will mishandle them.
+  if (!supportsTools && c.webEnabled) { c.webEnabled = false; saveToStorage(); }
+  if (!supportsThinking && c.thinkingEnabled) { c.thinkingEnabled = false; saveToStorage(); }
+  // Default web search ON for tools-capable models (new + legacy chats).
+  if (supportsTools && c.webEnabled === undefined) { c.webEnabled = true; saveToStorage(); }
+
+  const setToggle = (id, supported, on) => {
+    const btn = $(`#${id}`);
+    if (!btn) return;
+    btn.hidden = !textLike;                          // only hide for non-text modalities
+    btn.classList.toggle('disabled', !supported);    // grey, non-interactive
+    btn.setAttribute('aria-disabled', supported ? 'false' : 'true');
+    btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+    btn.title = supported ? '' : 'This model doesn’t support this.';
+  };
+  setToggle('toggle-web', supportsTools, c.webEnabled === true);
+  setToggle('toggle-think', supportsThinking, c.thinkingEnabled === true);
+
+  // The abilities menu stays available for any text chat — both options live
+  // inside it, greyed when unsupported.
   const menuBtn = $('#tools-menu-btn');
   if (menuBtn) {
-    const webShown = !($('#toggle-web')?.hidden);
-    const thinkShown = !($('#toggle-think')?.hidden);
-    menuBtn.hidden = !webShown && !thinkShown;
-    // Reflect "any ability on" with a subtle highlight on the menu button.
+    menuBtn.hidden = !textLike;
     menuBtn.classList.toggle('has-active', !!(c.webEnabled || c.thinkingEnabled));
   }
 
@@ -2660,6 +2750,7 @@ function wireWebToggle() {
   btn.addEventListener('click', () => {
     const c = currentChat();
     if (!c) return;
+    if (btn.classList.contains('disabled') || !modelSupportsTools(c.model)) return;
     c.webEnabled = !c.webEnabled;
     btn.setAttribute('aria-pressed', c.webEnabled ? 'true' : 'false');
     $('#tools-menu-btn')?.classList.toggle('has-active', !!(c.webEnabled || c.thinkingEnabled));
@@ -2673,7 +2764,7 @@ function wireThinkToggle() {
   btn.addEventListener('click', () => {
     const c = currentChat();
     if (!c) return;
-    if (!modelSupportsThinking(c.model)) return;
+    if (btn.classList.contains('disabled') || !modelSupportsThinking(c.model)) return;
     c.thinkingEnabled = !c.thinkingEnabled;
     btn.setAttribute('aria-pressed', c.thinkingEnabled ? 'true' : 'false');
     $('#tools-menu-btn')?.classList.toggle('has-active', !!(c.webEnabled || c.thinkingEnabled));
@@ -3202,7 +3293,7 @@ function renderInstallBanner() {
   // In-flight pull (downloading or paused) — show progress + pause/cancel.
   if (state.pulling.has(tag) || state.paused.has(tag)) {
     const prog = state.pullProgress[tag] || { received: 0, total: 0 };
-    const pct = prog.total ? Math.round((prog.received / prog.total) * 100) : 0;
+    const pct = Math.round(prog.pct ?? (prog.total ? (prog.received / prog.total) * 100 : 0));
     const mb = (prog.received / (1024 * 1024)).toFixed(0);
     const totalMb = (prog.total / (1024 * 1024)).toFixed(0);
     const isPaused = state.paused.has(tag);
@@ -3353,9 +3444,20 @@ async function pullModel(tag /* banner is read fresh via DOM */) {
         per[digestKey] = { received: chunk.completed || 0, total: chunk.total };
         let received = 0, total = 0;
         for (const d of Object.values(per)) { received += d.received; total += d.total; }
-        state.pullProgress[tag] = { received, total };
+
+        // Ollama only reveals a layer's size when that layer STARTS, so the
+        // denominator grows as the pull proceeds. Summing per-digest fixed the
+        // old drop-to-zero, but the percentage still went BACKWARDS whenever a
+        // new layer appeared (finish a 4GB layer at 100%, a 1GB layer starts,
+        // and 4/4 becomes 4/5 = 80%). Ratchet it instead: never regress, and
+        // hold at 99 until the pull actually completes so 100% never lies.
+        const rawPct = total ? (received / total) * 100 : 0;
+        const prevPct = state.pullProgress[tag]?.pct || 0;
+        const pct = Math.min(99, Math.max(prevPct, rawPct));
+        state.pullProgress[tag] = { received, total, pct };
         patchPullProgress(tag);
         patchInstallBannerProgress(tag);
+        patchDlProgress(tag);
       }
     });
   } catch (e) {
@@ -3370,6 +3472,7 @@ async function pullModel(tag /* banner is read fresh via DOM */) {
   if (state.paused.has(tag)) {
     renderInstallBanner();
     populateModelPicker();
+    refreshDownloadsIfOpen();
     return;
   }
   // CANCELLED — clear progress, refresh installed list (the DELETE may have run),
@@ -3379,6 +3482,7 @@ async function pullModel(tag /* banner is read fresh via DOM */) {
     delete state.pullProgress[tag];
     delete state.pullDigests[tag];
     await refreshOllama();
+    refreshDownloadsIfOpen();
     return;
   }
 
@@ -3390,6 +3494,7 @@ async function pullModel(tag /* banner is read fresh via DOM */) {
   if (installedNow) {
     state.recentlyInstalled.add(tag);
     await refreshOllama();
+    refreshDownloadsIfOpen();   // swap the progress UI for Installed/Uninstall
     setTimeout(() => {
       state.recentlyInstalled.delete(tag);
       populateModelPicker();
@@ -3414,6 +3519,8 @@ async function pullModel(tag /* banner is read fresh via DOM */) {
       <button type="button" data-action="install" data-tag="${escapeHtml(tag)}">Try again</button>
     `;
   }
+  // A failed pull leaves the card stuck on its progress bar otherwise.
+  refreshDownloadsIfOpen();
   setTimeout(() => { renderInstallBanner(); }, 8000);
 }
 
@@ -3472,7 +3579,7 @@ function patchPullProgress(tag) {
   if (!prog) return;
   const progEl = item.querySelector('.cs-item-progress');
   if (progEl) {
-    const pct = prog.total ? Math.round((prog.received / prog.total) * 100) : 0;
+    const pct = Math.round(prog.pct ?? (prog.total ? (prog.received / prog.total) * 100 : 0));
     progEl.textContent = state.paused.has(tag) ? `paused · ${pct}%` : `${pct}%`;
   }
 }
@@ -3487,7 +3594,7 @@ function patchInstallBannerProgress(tag) {
   const bar = banner.querySelector('.progress-bar');
   const sub = banner.querySelector('.ib-progress-sub');
   if (bar && prog.total) {
-    const pct = Math.round((prog.received / prog.total) * 100);
+    const pct = Math.round(prog.pct ?? ((prog.received / prog.total) * 100));
     bar.style.width = pct + '%';
     if (sub) {
       const mb = (prog.received / (1024 * 1024)).toFixed(0);

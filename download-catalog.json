@@ -1612,70 +1612,6 @@
       "blurb": "The large Llama 4. Frontier multimodal quality at 17B active params — but 245GB of weights to hold."
     },
     {
-      "id": "qwen3.5-0.8b",
-      "name": "Qwen3.5 0.8B",
-      "tag": "qwen3.5:0.8b",
-      "params": "0.8B",
-      "sizeGB": 0.6,
-      "kvKbPerTok": 24,
-      "ctxMax": 131072,
-      "tags": [
-        "text",
-        "tiny",
-        "reasoning",
-        "tools"
-      ],
-      "blurb": "The smallest Qwen3.5. Multimodal-capable family with thinking mode, at a size that runs anywhere."
-    },
-    {
-      "id": "qwen3.5-9b",
-      "name": "Qwen3.5 9B",
-      "tag": "qwen3.5:9b",
-      "params": "9B",
-      "sizeGB": 5.6,
-      "kvKbPerTok": 128,
-      "ctxMax": 131072,
-      "tags": [
-        "text",
-        "vision",
-        "reasoning",
-        "tools"
-      ],
-      "blurb": "The everyday Qwen3.5. Vision, thinking, and tool use in a package that fits a 12GB card comfortably."
-    },
-    {
-      "id": "qwen3.5-32b",
-      "name": "Qwen3.5 32B",
-      "tag": "qwen3.5:32b",
-      "params": "32B",
-      "sizeGB": 20,
-      "kvKbPerTok": 256,
-      "ctxMax": 131072,
-      "tags": [
-        "text",
-        "vision",
-        "reasoning",
-        "tools"
-      ],
-      "blurb": "The dense Qwen3.5 flagship for single-GPU rigs. Strong across vision, reasoning, and agentic work."
-    },
-    {
-      "id": "qwen3.5-122b",
-      "name": "Qwen3.5 122B",
-      "tag": "qwen3.5:122b",
-      "params": "122B",
-      "sizeGB": 73,
-      "kvKbPerTok": 320,
-      "ctxMax": 131072,
-      "tags": [
-        "text",
-        "vision",
-        "reasoning",
-        "tools"
-      ],
-      "blurb": "The largest local Qwen3.5. Workstation-class, but genuinely frontier-adjacent."
-    },
-    {
       "id": "qwen3.6-27b",
       "name": "Qwen3.6 27B",
       "tag": "qwen3.6:27b",
@@ -2037,11 +1973,122 @@
       "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
     },
     {
+      "id": "qwen3.5-0.8b",
+      "name": "Qwen3.5 0.8B",
+      "tag": "qwen3.5:0.8b",
+      "params": "0.8B",
+      "sizeGB": 1,
+      "kvKbPerTok": 24,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "tiny",
+        "reasoning",
+        "tools"
+      ],
+      "blurb": "Qwen3.5 — multimodal family with toggleable thinking and strong tool use. Vision arrives at 9B and up."
+    },
+    {
+      "id": "qwen3.5-2b",
+      "name": "Qwen3.5 2B",
+      "tag": "qwen3.5:2b",
+      "params": "2B",
+      "sizeGB": 2.7,
+      "kvKbPerTok": 44,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "tiny",
+        "reasoning",
+        "tools"
+      ],
+      "blurb": "Qwen3.5 — multimodal family with toggleable thinking and strong tool use. Vision arrives at 9B and up."
+    },
+    {
+      "id": "qwen3.5-4b",
+      "name": "Qwen3.5 4B",
+      "tag": "qwen3.5:4b",
+      "params": "4B",
+      "sizeGB": 3.4,
+      "kvKbPerTok": 56,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "reasoning",
+        "tools"
+      ],
+      "blurb": "Qwen3.5 — multimodal family with toggleable thinking and strong tool use. Vision arrives at 9B and up."
+    },
+    {
+      "id": "qwen3.5-9b",
+      "name": "Qwen3.5 9B",
+      "tag": "qwen3.5:9b",
+      "params": "9B",
+      "sizeGB": 6.6,
+      "kvKbPerTok": 128,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "vision",
+        "reasoning",
+        "tools"
+      ],
+      "blurb": "Qwen3.5 — multimodal family with toggleable thinking and strong tool use. Vision arrives at 9B and up."
+    },
+    {
+      "id": "qwen3.5-27b",
+      "name": "Qwen3.5 27B",
+      "tag": "qwen3.5:27b",
+      "params": "27B",
+      "sizeGB": 17,
+      "kvKbPerTok": 240,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "vision",
+        "reasoning",
+        "tools"
+      ],
+      "blurb": "Qwen3.5 — multimodal family with toggleable thinking and strong tool use. Vision arrives at 9B and up."
+    },
+    {
+      "id": "qwen3.5-35b",
+      "name": "Qwen3.5 35B",
+      "tag": "qwen3.5:35b",
+      "params": "35B",
+      "sizeGB": 24,
+      "kvKbPerTok": 256,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "vision",
+        "reasoning",
+        "tools"
+      ],
+      "blurb": "Qwen3.5 — multimodal family with toggleable thinking and strong tool use. Vision arrives at 9B and up."
+    },
+    {
+      "id": "qwen3.5-122b",
+      "name": "Qwen3.5 122B",
+      "tag": "qwen3.5:122b",
+      "params": "122B",
+      "sizeGB": 81,
+      "kvKbPerTok": 320,
+      "ctxMax": 131072,
+      "tags": [
+        "text",
+        "vision",
+        "reasoning",
+        "tools"
+      ],
+      "blurb": "Qwen3.5 — multimodal family with toggleable thinking and strong tool use. Vision arrives at 9B and up."
+    },
+    {
       "id": "hh-qwen35-0.8b",
       "name": "Qwen3.5 0.8B (abliterated)",
       "tag": "huihui_ai/qwen3.5-abliterated:0.8b",
       "params": "0.8B",
-      "sizeGB": 0.6,
+      "sizeGB": 1,
       "kvKbPerTok": 24,
       "ctxMax": 131072,
       "tags": [
@@ -2059,7 +2106,7 @@
       "name": "Qwen3.5 2B (abliterated)",
       "tag": "huihui_ai/qwen3.5-abliterated:2b",
       "params": "2B",
-      "sizeGB": 1.5,
+      "sizeGB": 2.7,
       "kvKbPerTok": 44,
       "ctxMax": 131072,
       "tags": [
@@ -2077,7 +2124,7 @@
       "name": "Qwen3.5 4B (abliterated)",
       "tag": "huihui_ai/qwen3.5-abliterated:4b",
       "params": "4B",
-      "sizeGB": 2.7,
+      "sizeGB": 3.4,
       "kvKbPerTok": 56,
       "ctxMax": 131072,
       "tags": [
@@ -2094,7 +2141,7 @@
       "name": "Qwen3.5 9B (abliterated)",
       "tag": "huihui_ai/qwen3.5-abliterated:9b",
       "params": "9B",
-      "sizeGB": 5.6,
+      "sizeGB": 6.6,
       "kvKbPerTok": 128,
       "ctxMax": 131072,
       "tags": [
@@ -2130,7 +2177,7 @@
       "name": "Qwen3.5 35B (abliterated)",
       "tag": "huihui_ai/qwen3.5-abliterated:35b",
       "params": "35B",
-      "sizeGB": 21,
+      "sizeGB": 24,
       "kvKbPerTok": 256,
       "ctxMax": 131072,
       "tags": [
@@ -2148,7 +2195,7 @@
       "name": "Qwen3.5 122B (abliterated)",
       "tag": "huihui_ai/qwen3.5-abliterated:122b",
       "params": "122B",
-      "sizeGB": 73,
+      "sizeGB": 81,
       "kvKbPerTok": 320,
       "ctxMax": 131072,
       "tags": [

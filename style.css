@@ -1559,6 +1559,13 @@ button { font-family: inherit; }
 }
 .tools-menu-item:hover { background: var(--surface-2); }
 .tools-menu-item[hidden] { display: none; }
+/* Unsupported by the current model — visible but inert, so the user sees the
+   option exists rather than wondering where it went. */
+.tools-menu-item.disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.tools-menu-item.disabled:hover { background: transparent; }
 .tools-menu-icon {
   width: 32px;
   height: 32px;
@@ -1993,6 +2000,44 @@ button { font-family: inherit; }
   background: rgba(52,211,153,0.08);
 }
 .dl-installed.pulling { color: var(--accent-2); border-color: rgba(6,182,212,0.3); background: rgba(6,182,212,0.08); }
+/* In-flight download: percentage, byte readout, bar, and pause/cancel.
+   Patched in place by patchDlProgress() — Ollama streams progress many times
+   a second, so re-rendering the list per chunk would thrash the DOM. */
+.dl-prog { margin-top: auto; display: flex; flex-direction: column; gap: 6px; }
+.dl-prog-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.dl-prog-pct {
+  font-family: 'DM Mono', ui-monospace, monospace;
+  font-size: 13px; font-weight: 500; color: var(--accent-2);
+  font-feature-settings: 'tnum';
+}
+.dl-prog-bytes {
+  font-family: 'DM Mono', ui-monospace, monospace;
+  font-size: 10.5px; color: var(--text-4); font-feature-settings: 'tnum';
+}
+.dl-prog-track {
+  height: 5px; border-radius: 999px;
+  background: var(--bg-2); border: 1px solid var(--border-1);
+  overflow: hidden;
+}
+.dl-prog-fill {
+  height: 100%; border-radius: 999px;
+  background: linear-gradient(90deg, var(--accent-1), var(--accent-2));
+  transition: width 0.3s var(--ease);
+}
+.dl-prog-fill.paused { background: linear-gradient(90deg, #6b7280, #4b5563); }
+.dl-prog-btns { display: flex; gap: 6px; }
+.dl-prog-btn {
+  flex: 1;
+  background: transparent; border: 1px solid var(--border-2); color: var(--text-3);
+  padding: 5px 8px; border-radius: 7px;
+  font-family: inherit; font-size: 11.5px; font-weight: 500;
+  cursor: pointer;
+  transition: color 0.15s var(--ease), border-color 0.15s var(--ease), background 0.15s var(--ease);
+}
+.dl-prog-btn:hover { background: var(--surface-3); color: var(--text-1); border-color: var(--border-3); }
+.dl-prog-btn.cancel:hover { background: rgba(244,63,94,0.12); border-color: rgba(244,63,94,0.45); color: #ffb4b4; }
+.dl-prog-btn:disabled { opacity: 0.5; cursor: default; }
+
 /* Installed state pairs the badge with an uninstall action — Downloads is the
    only model-management surface now that the Models registry is gone. */
 .dl-have { margin-top: auto; display: flex; flex-direction: column; gap: 6px; }
@@ -2315,6 +2360,78 @@ button { font-family: inherit; }
 }
 .mcp-save-btn:hover { filter: brightness(1.1); }
 .mcp-save-btn:disabled { opacity: 0.6; cursor: not-allowed; }
+
+/* ====== SETTINGS / DIALOG MODAL CHROME ======
+   Restored: a bad cleanup regex in v0.4.2 deleted this whole block along with
+   the CATALOG rules it was meant to remove, which made every modal (Settings,
+   MCP editor, etc.) render as a plain page block instead of a centered
+   overlay. That's the "Settings broken on Mac" report — it was broken
+   everywhere, Mac just made it obvious. */
+.modal-overlay {
+  position: fixed; inset: 0;
+  background: rgba(2, 3, 6, 0.6);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  display: grid;
+  place-items: center;
+  z-index: 100;
+  animation: overlay-in 0.18s var(--ease) both;
+}
+@keyframes overlay-in { from { opacity: 0; } to { opacity: 1; } }
+
+.modal {
+  width: min(560px, calc(100vw - 48px));
+  max-height: min(78vh, 760px);
+  background: var(--bg-1);
+  border: 1px solid var(--border-2);
+  border-radius: var(--r-xl);
+  box-shadow: var(--shadow-2);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  animation: modal-in 0.28s var(--ease) both;
+}
+@keyframes modal-in { from { opacity: 0; transform: translateY(12px) scale(0.98); } to { opacity: 1; transform: translateY(0) scale(1); } }
+
+.modal-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 20px 22px;
+  border-bottom: 1px solid var(--border-1);
+}
+.modal-head h2 { font-size: 18px; font-weight: 600; letter-spacing: -0.015em; }
+.modal-close {
+  width: 32px; height: 32px;
+  display: grid; place-items: center;
+  background: transparent; border: 0;
+  border-radius: 8px; cursor: pointer;
+  color: var(--text-3);
+  transition: background 0.15s var(--ease), color 0.15s var(--ease);
+}
+.modal-close:hover { background: var(--surface-2); color: var(--text-1); }
+.modal-close svg { width: 16px; height: 16px; }
+
+.modal-body { padding: 22px; overflow-y: auto; }
+
+.setting-group h3 { font-size: 14px; font-weight: 600; margin-bottom: 4px; }
+.setting-group + .setting-group { margin-top: 22px; }
+.setting-group textarea {
+  width: 100%;
+  background: var(--surface-2);
+  border: 1px solid var(--border-2);
+  border-radius: var(--r);
+  padding: 14px 16px;
+  font-family: inherit;
+  font-size: 14px;
+  color: var(--text-1);
+  line-height: 1.5;
+  resize: vertical;
+  min-height: 140px;
+  outline: none;
+  transition: border-color 0.18s var(--ease);
+}
+.setting-group textarea:focus { border-color: var(--accent-1); box-shadow: 0 0 0 3px rgba(139,92,246,0.15); }
+.setting-group textarea::placeholder { color: var(--text-4); }
+.setting-meta { display: flex; justify-content: flex-end; margin-top: 8px; min-height: 18px; }
 
 /* APPROVAL MODAL */
 .approval-modal { width: min(680px, calc(100vw - 48px)); }
