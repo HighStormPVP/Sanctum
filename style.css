@@ -113,6 +113,64 @@
   color: var(--text-3);
 }
 
+/* ============================================================
+   LIGHT THEME — a warm off-white palette (not stark white), with
+   dark text and slightly deeper accent colours so the violet/cyan
+   stay legible on a bright background. Activated by
+   [data-theme="light"] on <html>.
+   ============================================================ */
+:root[data-theme="light"] {
+  --bg-0:        #e7e9ee;
+  --bg-1:        #f6f7f9;
+  --bg-2:        #eceef2;
+
+  /* Surfaces/borders flip to dark overlays on a light base */
+  --surface-1:   rgba(0, 0, 0, 0.022);
+  --surface-2:   rgba(0, 0, 0, 0.045);
+  --surface-3:   rgba(0, 0, 0, 0.075);
+
+  --border-1:    rgba(0, 0, 0, 0.08);
+  --border-2:    rgba(0, 0, 0, 0.13);
+  --border-3:    rgba(0, 0, 0, 0.20);
+
+  --text-1:      #1b1e26;
+  --text-2:      #434a57;
+  --text-3:      #6a7180;
+  --text-4:      #949ba9;
+
+  --accent-1:    #7c3aed;
+  --accent-2:    #0891b2;
+  --accent:      linear-gradient(135deg, #7c3aed 0%, #0891b2 100%);
+  --accent-soft: linear-gradient(135deg, rgba(124,58,237,0.12) 0%, rgba(8,145,178,0.12) 100%);
+  --glow:        0 0 22px rgba(124, 58, 237, 0.18);
+
+  --ok:          #059669;
+  --warn:        #b45309;
+  --err:         #dc2626;
+
+  --shadow-1: 0 1px 2px rgba(15,23,42,0.07), 0 8px 24px rgba(15,23,42,0.08);
+  --shadow-2: 0 1px 2px rgba(15,23,42,0.09), 0 16px 40px rgba(15,23,42,0.13);
+}
+/* Structural overrides for the few elements that hardcode dark backgrounds. */
+:root[data-theme="light"] .aurora { display: none; }
+/* .main hardcodes a dark navy scrim (rgba(13,15,21,0.55)) to sit over the
+   aurora in the dark themes. Light has no aurora, so that scrim just greyed
+   the chat area — override to a bright glass instead. */
+:root[data-theme="light"] .main { background: rgba(255, 255, 255, 0.45); }
+:root[data-theme="light"] .sidebar { background: rgba(255, 255, 255, 0.72); }
+:root[data-theme="light"] .dbg { background: rgba(255, 255, 255, 0.92); }
+:root[data-theme="light"] .dl-search-float { background: rgba(255, 255, 255, 0.85); }
+:root[data-theme="light"] .drag-overlay { background: rgba(236, 238, 242, 0.6); }
+:root[data-theme="light"] .msg pre,
+:root[data-theme="light"] .code-block,
+:root[data-theme="light"] .code-block-head { background: rgba(0, 0, 0, 0.045); }
+:root[data-theme="light"] .cs-item-badge {
+  background: rgba(0,0,0,0.05);
+  border-color: rgba(0,0,0,0.12);
+  color: var(--text-3);
+}
+/* User bubble keeps the accent gradient + white text; nothing to change. */
+
 html, body {
   height: 100%;
   overflow: hidden;
@@ -128,7 +186,7 @@ html, body {
 }
 
 em {
-  font-family: 'Instrument Serif', Georgia, serif;
+  font-family: 'Hanken Grotesk', system-ui, sans-serif;
   font-style: italic;
   font-weight: 400;
   letter-spacing: -0.01em;
@@ -677,6 +735,12 @@ button { font-family: inherit; }
   transition: border-color 0.18s var(--ease), background-color 0.18s var(--ease);
 }
 .cs-trigger:hover { background: var(--surface-3); border-color: var(--border-3); }
+/* Pulses when the user tries to send without a usable model selected. */
+.cs-trigger.pulse-attention { animation: pickerPulse 0.6s var(--ease) 2; }
+@keyframes pickerPulse {
+  0%, 100% { border-color: var(--border-2); box-shadow: none; }
+  50% { border-color: var(--accent-1); box-shadow: 0 0 0 4px rgba(139, 92, 246, 0.28); }
+}
 .cs-trigger[aria-expanded="true"] {
   border-color: var(--accent-1);
   box-shadow: 0 0 0 3px rgba(139,92,246,0.18);
@@ -2198,7 +2262,40 @@ button { font-family: inherit; }
 /* Freeze protection */
 .wd-row { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; cursor: pointer; }
 .wd-row.indent { padding-left: 26px; cursor: default; }
-.wd-row input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--accent-1); cursor: pointer; flex-shrink: 0; }
+/* Custom checkbox — native ones render inconsistently across platforms (the
+   white box vs accent box on Mac). appearance:none + a drawn checkmark keeps
+   them on-theme and identical everywhere. */
+.wd-row input[type="checkbox"] {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 18px; height: 18px;
+  margin: 0;
+  border: 1.5px solid var(--border-3);
+  border-radius: 5px;
+  background: var(--surface-2);
+  cursor: pointer;
+  flex-shrink: 0;
+  position: relative;
+  transition: background 0.15s var(--ease), border-color 0.15s var(--ease);
+}
+.wd-row input[type="checkbox"]:hover { border-color: var(--accent-1); }
+.wd-row input[type="checkbox"]:checked {
+  background: var(--accent);
+  border-color: transparent;
+}
+.wd-row input[type="checkbox"]:checked::after {
+  content: '';
+  position: absolute;
+  left: 5.5px; top: 2px;
+  width: 4px; height: 8px;
+  border: solid #fff;
+  border-width: 0 2px 2px 0;
+  transform: rotate(45deg);
+}
+.wd-row input[type="checkbox"]:focus-visible {
+  outline: 2px solid var(--accent-1);
+  outline-offset: 2px;
+}
 .wd-label { font-size: 13px; color: var(--text-1); }
 .wd-label.dim { color: var(--text-3); }
 #setting-wd-trip { min-width: 130px; }
@@ -2722,7 +2819,7 @@ button { font-family: inherit; }
   letter-spacing: 0.01em;
 }
 .video-state-title {
-  font-family: 'Instrument Serif', Georgia, serif;
+  font-family: 'Hanken Grotesk', system-ui, sans-serif;
   font-size: 22px;
   letter-spacing: -0.01em;
   margin-bottom: 4px;
@@ -2955,7 +3052,7 @@ button { font-family: inherit; }
    ============================================================ */
 .theme-picker {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: 1fr 1fr 1fr;
   gap: 10px;
 }
 @media (max-width: 600px) {
@@ -2963,9 +3060,9 @@ button { font-family: inherit; }
 }
 .theme-card {
   display: flex;
-  flex-direction: column;
+  align-items: center;
   gap: 12px;
-  padding: 14px;
+  padding: 12px 14px;
   background: var(--surface-1);
   border: 1.5px solid var(--border-2);
   border-radius: var(--r);
@@ -2975,6 +3072,20 @@ button { font-family: inherit; }
   color: var(--text-2);
   transition: border-color 0.15s var(--ease), background 0.15s var(--ease), transform 0.08s var(--ease);
 }
+/* Colour circle = the theme's own accent gradient (the same colours used to
+   highlight the active settings section). Hardcoded per theme rather than
+   var(--accent) because both swatches are visible at once, regardless of which
+   theme is active. Sanctum = violet→cyan, Dark = violet→emerald — clearly
+   distinct at a glance. */
+.theme-swatch {
+  width: 34px; height: 34px;
+  border-radius: 50%;
+  border: 1px solid var(--border-3);
+  flex-shrink: 0;
+}
+.theme-swatch.sw-sanctum { background: linear-gradient(135deg, #8b5cf6 0%, #06b6d4 100%); }  /* Sanctum accent */
+.theme-swatch.sw-dark    { background: #141414; }  /* Dark --bg-1 (its actual background) */
+.theme-swatch.sw-light   { background: #f6f7f9; }  /* Light --bg-1 (its actual background) */
 .theme-card:hover {
   border-color: var(--border-3);
   background: var(--surface-2);
@@ -2998,68 +3109,6 @@ button { font-family: inherit; }
   color: var(--text-3);
   line-height: 1.45;
 }
-.theme-preview {
-  position: relative;
-  width: 100%;
-  height: 84px;
-  border-radius: 8px;
-  overflow: hidden;
-  border: 1px solid var(--border-1);
-}
-/* Sanctum preview — blobs are painted with radial gradients on the
-   background itself so we don't rely on absolute child elements rendering. */
-.theme-preview-sanctum {
-  background:
-    radial-gradient(80px circle at 18% 22%, rgba(139, 92, 246, 0.85) 0%, transparent 70%),
-    radial-gradient(80px circle at 82% 82%, rgba(6, 182, 212, 0.75) 0%, transparent 70%),
-    #08090c;
-}
-.theme-preview-dark { background: #0a0a0a; }
-
-/* Card bar (top) — explicit width via calc avoids left+right edge-case bugs */
-.theme-preview .tp-card {
-  display: block;
-  position: absolute;
-  top: 14px;
-  left: 14px;
-  width: calc(100% - 28px);
-  height: 18px;
-  background: rgba(255, 255, 255, 0.10);
-  border: 1px solid rgba(255, 255, 255, 0.22);
-  border-radius: 5px;
-}
-
-/* Sanctum gradient accent dot (bottom-right) */
-.theme-preview-sanctum .tp-accent {
-  display: block;
-  position: absolute;
-  bottom: 12px;
-  right: 14px;
-  width: 28px;
-  height: 28px;
-  border-radius: 50%;
-  background: linear-gradient(135deg, #8b5cf6 0%, #06b6d4 100%);
-  box-shadow: 0 0 16px rgba(139, 92, 246, 0.7);
-}
-
-/* Dark solid accent dots — violet + emerald, side-by-side bottom-right */
-.theme-preview-dark .tp-accent {
-  display: block;
-  position: absolute;
-  bottom: 12px;
-  width: 28px;
-  height: 28px;
-  border-radius: 50%;
-}
-.theme-preview-dark .tp-accent.dark-violet {
-  right: 14px;
-  background: #8b5cf6;
-}
-.theme-preview-dark .tp-accent.dark-green {
-  right: 52px;
-  background: #10b981;
-}
-
 /* SCROLLBARS */
 ::-webkit-scrollbar { width: 10px; height: 10px; }
 ::-webkit-scrollbar-track { background: transparent; }
@@ -3267,7 +3316,7 @@ button { font-family: inherit; }
   animation: modal-in 0.22s var(--ease) both;
 }
 .editor-confirm-card h3 {
-  font-family: 'Instrument Serif', Georgia, serif;
+  font-family: 'Hanken Grotesk', system-ui, sans-serif;
   font-size: 22px;
   margin-bottom: 8px;
   letter-spacing: -0.01em;

@@ -275,11 +275,13 @@ function deleteChat(id) {
   delete state.chats[id];
   state.order = state.order.filter(x => x !== id);
   if (state.activeId === id) {
-    // Stay in the current workspace: activate the next chat that belongs to it,
-    // or fall to that space's empty state (null) — never jump to the other
-    // workspace's chats.
+    // Activate the next chat in this workspace. If that was the LAST one,
+    // don't leave an empty view — refresh with a fresh chat of the same kind
+    // (a normal chat in Home, a project in Code).
     const next = chatsInCurrentSpace()[0];
-    setActive(next?.id || null);
+    if (next) setActive(next.id);
+    else if (state.space === 'code') createAgenticChat();
+    else createChat();
   }
   saveToStorage();
   renderChatList();
@@ -1470,6 +1472,8 @@ function chatsInCurrentSpace() {
 // that space's empty state).
 function switchSpace(space) {
   if (space !== 'home' && space !== 'code') return;
+  // Remember the model you were just on so the switch doesn't change it.
+  const prevModel = currentChat()?.model || state.settings.lastModel;
   state.space = space;
   // If we're parked on a view (Downloads/Settings), come back to the chat view
   // so the workspace switch is actually visible.
@@ -1479,6 +1483,14 @@ function switchSpace(space) {
   const active = currentChat();
   if (!active || chatSpace(active) !== space) {
     state.activeId = inSpace[0]?.id || null;
+  }
+  // Carry your model across the switch. If the now-active chat is a fresh one
+  // (no messages yet), adopt the model you were just using — switching
+  // workspaces should never silently change your selected model. A chat with
+  // real messages keeps its own model; that's a deliberate thread.
+  const now = currentChat();
+  if (now && prevModel && now.messages.length === 0 && findPick(prevModel)) {
+    now.model = prevModel;
   }
   state.pendingAttachments = [];
   renderAttachments();
@@ -1840,7 +1852,7 @@ function openDownloads() {
 // state.settings.theme so it persists across sessions.
 function applyTheme(theme) {
   const root = document.documentElement;
-  if (theme === 'dark') root.setAttribute('data-theme', 'dark');
+  if (theme === 'dark' || theme === 'light') root.setAttribute('data-theme', theme);
   else root.removeAttribute('data-theme'); // Sanctum is the default :root
 }
 
@@ -1932,7 +1944,8 @@ function wireSettings() {
   // Theme picker: reflect current theme + wire clicks
   const themePicker = $('#theme-picker');
   if (themePicker) {
-    const currentTheme = state.settings.theme === 'dark' ? 'dark' : 'sanctum';
+    const validThemes = new Set(['sanctum', 'dark', 'light']);
+    const currentTheme = validThemes.has(state.settings.theme) ? state.settings.theme : 'sanctum';
     themePicker.querySelectorAll('.theme-card').forEach(card => {
       card.setAttribute('aria-pressed', card.dataset.theme === currentTheme ? 'true' : 'false');
       card.addEventListener('click', () => {
@@ -4023,6 +4036,18 @@ async function processNextQueued(c) {
   await runOllamaChat(c, attachments);
 }
 
+// Flash the model picker to draw the eye there — used when the user tries to
+// send but hasn't got a usable model selected.
+function pulseModelPicker() {
+  const t = $('#cs-trigger');
+  if (!t) return;
+  t.classList.remove('pulse-attention');
+  // Force reflow so re-adding the class restarts the animation on repeat sends.
+  void t.offsetWidth;
+  t.classList.add('pulse-attention');
+  setTimeout(() => t.classList.remove('pulse-attention'), 1200);
+}
+
 async function dispatchSend() {
   const c = currentChat();
   if (!c) return;
@@ -4037,9 +4062,18 @@ async function dispatchSend() {
   const modality = c.modality;
   const backend = backendForModel(c.model);
 
-  if (backend === 'ollama' && !state.installed.has(c.model)) {
-    const banner = $('#install-banner');
-    if (banner) banner.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  // Model not usable to send with? Pulse the picker to point the user at it.
+  // Two cases: an Ollama model that isn't installed, or a cloud model with no
+  // API key. Both mean "you haven't got a working model selected."
+  const pick = findPick(c.model);
+  const cloudNotReady = pick && pickProvider(pick) !== 'ollama' && !pickReady(pick);
+  const ollamaNotInstalled = backend === 'ollama' && !state.installed.has(c.model);
+  if (ollamaNotInstalled || cloudNotReady) {
+    pulseModelPicker();
+    if (ollamaNotInstalled) {
+      const banner = $('#install-banner');
+      if (banner) banner.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
     return;
   }
 

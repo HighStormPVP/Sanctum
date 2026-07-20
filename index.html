@@ -7,7 +7,7 @@
 
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,200..800&family=Hanken+Grotesk:wght@400;500;600;700;800&family=Instrument+Serif:ital@0;1&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,200..800&family=Hanken+Grotesk:ital,wght@0,400;0,500;0,600;0,700;0,800;1,400;1,500&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
 
   <link rel="stylesheet" href="style.css" />
 </head>
@@ -273,7 +273,7 @@
         </section>
         <section class="setting-group">
           <h3>Context window</h3>
-          <p class="setting-help">How many tokens of conversation the model can remember. <strong>Bigger uses more memory.</strong> The KV cache for a 32K window on Qwen3 30B-A3B alone eats ~13 GB.<br><br><strong>4096</strong> — tightest, ~10 GB total for Qwen3<br><strong>8192</strong> — safe default for 32 GB systems<br><strong>16384</strong> — good for ~48 GB systems<br><strong>32768</strong> — Qwen3's native max, needs ~36 GB</p>
+          <p class="setting-help">How many tokens of conversation the model can remember. <strong>Bigger uses more memory.</strong><br><br><strong>4096</strong> — tightest, ~10 GB total for Qwen3<br><strong>8192</strong> — safe default for 32 GB systems<br><strong>16384</strong> — good for ~48 GB systems<br><strong>32768</strong> — Qwen3's native max, needs ~36 GB</p>
           <input type="number" id="agent-opts-ctx" min="2048" max="131072" step="1024" value="8192" class="agent-opts-num">
         </section>
         <section class="setting-group">
@@ -404,22 +404,21 @@
           <h3>Theme</h3>
           <div class="theme-picker" id="theme-picker">
             <button type="button" class="theme-card" data-theme="sanctum" aria-pressed="true">
-              <div class="theme-preview theme-preview-sanctum">
-                <div class="tp-card"></div>
-                <div class="tp-accent"></div>
-              </div>
+              <span class="theme-swatch sw-sanctum"></span>
               <div class="theme-info">
                 <strong>Sanctum</strong>
               </div>
             </button>
             <button type="button" class="theme-card" data-theme="dark" aria-pressed="false">
-              <div class="theme-preview theme-preview-dark">
-                <div class="tp-card"></div>
-                <div class="tp-accent dark-violet"></div>
-                <div class="tp-accent dark-green"></div>
-              </div>
+              <span class="theme-swatch sw-dark"></span>
               <div class="theme-info">
                 <strong>Dark</strong>
+              </div>
+            </button>
+            <button type="button" class="theme-card" data-theme="light" aria-pressed="false">
+              <span class="theme-swatch sw-light"></span>
+              <div class="theme-info">
+                <strong>Light</strong>
               </div>
             </button>
           </div>
