@@ -1973,9 +1973,58 @@ function stripTags(s) {
     .trim();
 }
 
+// Parse the html.duckduckgo.com results page.
+function parseDdgHtml(html) {
+  const results = [];
+  const blockRe = /<a[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>[\s\S]*?<a[^>]*class="[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)<\/a>/g;
+  let m;
+  while ((m = blockRe.exec(html)) && results.length < 8) {
+    let link = m[1].replace(/&amp;/g, '&');
+    if (/^(\/\/|https?:\/\/)duckduckgo\.com\/y\.js/.test(link)) continue;   // ads
+    const udd = link.match(/uddg=([^&]+)/);
+    if (udd) link = decodeURIComponent(udd[1]);
+    if (link.startsWith('//')) link = 'https:' + link;
+    const title = stripTags(m[2]);
+    const snippet = stripTags(m[3]);
+    if (title && link.startsWith('http')) results.push({ url: link, title, snippet });
+  }
+  return results;
+}
+
+// Parse the lite.duckduckgo.com fallback page — a much simpler table layout
+// that tends to succeed when the html endpoint returns an empty/blocked page.
+function parseDdgLite(html) {
+  const results = [];
+  // lite.duckduckgo.com emits single-quoted class attributes and puts the
+  // href before the class, so match on class alone and grab href separately.
+  const linkRe = /<a[^>]*class=['"]result-link['"][^>]*>([\s\S]*?)<\/a>/g;
+  const hrefRe = /href=['"]([^'"]+)['"]/;
+  const snipRe = /<td[^>]*class=['"]result-snippet['"][^>]*>([\s\S]*?)<\/td>/g;
+  const links = []; let m;
+  while ((m = linkRe.exec(html)) && links.length < 8) {
+    const hrefM = m[0].match(hrefRe);
+    if (!hrefM) continue;
+    let link = hrefM[1].replace(/&amp;/g, '&');
+    const udd = link.match(/uddg=([^&]+)/);
+    if (udd) link = decodeURIComponent(udd[1]);
+    if (link.startsWith('//')) link = 'https:' + link;
+    links.push({ url: link, title: stripTags(m[1]) });
+  }
+  const snips = []; let s;
+  while ((s = snipRe.exec(html))) snips.push(stripTags(s[1]));
+  links.forEach((l, i) => {
+    if (l.title && l.url.startsWith('http')) results.push({ ...l, snippet: snips[i] || '' });
+  });
+  return results;
+}
+
 ipcMain.handle('web:search', async (_evt, query) => {
+  if (!query || typeof query !== 'string') return { error: 'query required' };
+  // Two endpoints, tried in order. The html one is richer but intermittently
+  // returns an empty page (rate-limiting / anti-scrape); the lite one is
+  // plainer but far more reliable, so it's the fallback. A search that just
+  // "failed" was usually the html endpoint coming back empty with no retry.
   try {
-    if (!query || typeof query !== 'string') return { error: 'query required' };
     const res = await fetch('https://html.duckduckgo.com/html/', {
       method: 'POST',
       headers: {
@@ -1984,26 +2033,32 @@ ipcMain.handle('web:search', async (_evt, query) => {
         'Content-Type': 'application/x-www-form-urlencoded',
         'Referer': 'https://html.duckduckgo.com/'
       },
-      body: `q=${encodeURIComponent(query)}&b=&kl=us-en`
+      body: `q=${encodeURIComponent(query)}&b=&kl=us-en`,
+      signal: AbortSignal.timeout(12000)
     });
-    if (!res.ok) return { error: `DDG ${res.status}` };
-    const html = await res.text();
-
-    const results = [];
-    const blockRe = /<a[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>[\s\S]*?<a[^>]*class="[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)<\/a>/g;
-    let m;
-    while ((m = blockRe.exec(html)) && results.length < 8) {
-      let link = m[1].replace(/&amp;/g, '&');
-      // Skip ad results — these route through duckduckgo.com/y.js?ad_domain=...
-      if (/^(\/\/|https?:\/\/)duckduckgo\.com\/y\.js/.test(link)) continue;
-      const udd = link.match(/uddg=([^&]+)/);
-      if (udd) link = decodeURIComponent(udd[1]);
-      if (link.startsWith('//')) link = 'https:' + link;
-      const title = stripTags(m[2]);
-      const snippet = stripTags(m[3]);
-      if (title && link.startsWith('http')) results.push({ url: link, title, snippet });
+    if (res.ok) {
+      const results = parseDdgHtml(await res.text());
+      if (results.length) return { results };
     }
-    return { results };
+  } catch { /* fall through to lite */ }
+
+  try {
+    const res = await fetch('https://lite.duckduckgo.com/lite/', {
+      method: 'POST',
+      headers: {
+        'User-Agent': UA,
+        'Accept': 'text/html,application/xhtml+xml',
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Referer': 'https://lite.duckduckgo.com/'
+      },
+      body: `q=${encodeURIComponent(query)}&kl=us-en`,
+      signal: AbortSignal.timeout(12000)
+    });
+    if (res.ok) {
+      const results = parseDdgLite(await res.text());
+      if (results.length) return { results };
+    }
+    return { results: [], error: 'no results' };
   } catch (e) {
     return { error: e.message };
   }

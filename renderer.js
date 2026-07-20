@@ -22,6 +22,7 @@ const state = {
   downloadCatalog: null,   // download-catalog.json — lazy-loaded, ~86 models
   dlFilters: null,   // Set of active download-filter keys; lazily created
   space: 'home',     // 'home' (normal chats) | 'code' (agentic projects)
+  pullError: null,   // { tag, msg } of the last failed Downloads pull
   dlQuery: '',
   settings: { instructions: '' },
   ollamaDetected: null,
@@ -229,19 +230,21 @@ function createAgenticChat() {
   //    swap to Qwen3 — the user already chose a capable model.
   // 2) Fall back to the agent catalog: prefer an installed Ollama pick over
   //    the first listed.
-  let model = null;
-  const curModel = currentChat()?.model;
-  if (curModel) {
-    const curPick = findPick(curModel);
-    if (curPick && modelSupportsTools(curModel) && pickReady(curPick)) {
-      model = curPick.tag || curPick.model_id || curPick.id;
-    }
-  }
-  if (!model) {
-    const picks = state.catalog.categories.agent?.picks || [];
-    const installedPick = picks.find(p => p.tag && state.installed.has(p.tag));
-    const fallback = picks[0];
-    model = (installedPick || fallback)?.tag;
+  // Keep whatever model is currently selected. Never silently swap in a
+  // heavier one — the old fallback loaded qwen3:30b-a3b (a 30B model) whenever
+  // the current model wasn't flagged tools-capable, which pinned 19GB+ on an
+  // 8GB Mac and froze it. A project can run any model the user picked; if it's
+  // not great at tools that's the user's call, not a reason to auto-load a
+  // giant. Only fall back when there's genuinely no current model, and then to
+  // the SMALLEST installed model, not the catalog's flagship.
+  let model = currentChat()?.model || state.settings.lastModel || null;
+  if (!model || !(findPick(model))) {
+    const installed = [...state.installed];
+    // Smallest installed model by catalog size, so the fallback is never heavy.
+    const bySize = installed
+      .map(tag => ({ tag, gb: (state.downloadCatalog?.models || []).find(m => m.tag === tag)?.sizeGB || 999 }))
+      .sort((a, b) => a.gb - b.gb);
+    model = bySize[0]?.tag || installed[0] || firstAvailableModel();
   }
   if (!model) return;
   createChat(model, 'agent', {
@@ -1733,6 +1736,13 @@ function renderDownloadTab() {
             <button class="dl-prog-btn cancel" data-pull-cancel="${escapeAttr(m.tag)}" title="Cancel and delete what's downloaded">Cancel</button>
           </div>
         </div>`;
+    } else if (state.pullError && state.pullError.tag === m.tag) {
+      // Last pull of this model failed — show why, right on the card.
+      action = `
+        <div class="dl-failed">
+          <span class="dl-failed-msg" title="${escapeAttr(state.pullError.msg)}">${escapeHtml(state.pullError.msg)}</span>
+          <button class="dl-get" data-tag="${escapeAttr(m.tag)}">Try again</button>
+        </div>`;
     } else {
       action = `<button class="dl-get" data-tag="${escapeAttr(m.tag)}">Download</button>`;
     }
@@ -1767,8 +1777,9 @@ function renderDownloadTab() {
     list.addEventListener('click', async (e) => {
       const get = e.target.closest('.dl-get');
       if (get) {
-        // Kick off the pull, then re-render so the card swaps to the progress
-        // UI. pullModel is fire-and-forget — it drives its own updates.
+        // Clear any prior failure for this tag, then kick off the pull and
+        // re-render so the card swaps to the progress UI.
+        if (state.pullError?.tag === get.dataset.tag) state.pullError = null;
         pullModelInline(get.dataset.tag);
         renderDownloadTab();
         return;
@@ -2336,14 +2347,15 @@ function wireModelPicker() {
     if (!c) return;
 
     c.model = value;
-    // Cloud picks can be used in EITHER chat OR agent mode — keep whatever
-    // modality the chat is already in. modalityForModel would return 'cloud'
-    // which isn't a valid runtime mode.
-    const newMod = modalityForModel(value);
-    if (newMod !== 'cloud') {
-      c.modality = newMod;
-    } else if (c.modality !== 'chat' && c.modality !== 'agent') {
-      c.modality = 'chat';
+    // Changing the model must NOT change what kind of chat this is. An agent
+    // chat (a Code-workspace project) stays an agent chat no matter which
+    // model you pick — otherwise picking a normal model flipped its modality
+    // to 'chat', which moved it out of the Code workspace and made it look
+    // deleted. Only derive modality for non-agent chats, and never let the
+    // 'cloud'/'code' catalog categories (not runtime modes) leak in.
+    if (c.modality !== 'agent') {
+      const newMod = modalityForModel(value);
+      c.modality = (newMod === 'chat' || newMod === 'vision') ? newMod : 'chat';
     }
     // No API key configured? Prompt the user to add one before they try.
     const picked = findPick(value);
@@ -3066,6 +3078,14 @@ function renderMessage(m) {
     el.appendChild(att);
   }
 
+  // Tool events (thinking, reads, searches, shell) render BEFORE the content.
+  // All of a turn's tool activity happens before the final answer, so this
+  // keeps "Thought for Ns" and "Searched the web" in the place they happened —
+  // above the answer — instead of sinking to the bottom of the message.
+  if (m.toolEvents?.length) {
+    for (const ev of m.toolEvents) el.appendChild(renderToolEvent(ev));
+  }
+
   if (m.content) {
     const body = document.createElement('div');
     body.className = 'msg-body';
@@ -3077,18 +3097,8 @@ function renderMessage(m) {
     el.appendChild(body);
   }
 
-  if (m.toolEvents?.length) {
-    for (const ev of m.toolEvents) el.appendChild(renderToolEvent(ev));
-  }
-
-  // Token-count badge for assistant turns. While streaming we approximate
-  // (Ollama doesn't expose per-chunk counts) and show "~N tokens"; the final
-  // `done` chunk replaces it with the exact "P in · O out" from the model.
-  // Shown from message creation so the user sees a placeholder even during
-  // the silent thinking / tool-call phase where no content streams in.
-  if (m.role === 'assistant' && m.tokenStats) {
-    el.appendChild(tokenBadgeEl(m.tokenStats));
-  }
+  // (The old "N in · N out" token badge was removed — token counts now live
+  // only on the thinking row as "Thought for Ns · N tokens".)
 
   // Video Analysis status card — appears inside the placeholder assistant
   // bubble while extraction/transcription/captioning runs, plus the deps
@@ -3200,9 +3210,14 @@ function renderThinkEvent(ev) {
   const label = running
     ? 'Thinking'
     : (secs != null ? `Thought for ${secs}s` : 'Thought');
+  // Live token count for the thinking phase, approximated from the streamed
+  // reasoning text. Only shown when we actually have a count (Anthropic's
+  // omitted thinking streams no text, so nothing to show there).
+  const tok = ev.tokens ? `<span class="think-tokens">${ev.tokens.toLocaleString()} tokens</span>` : '';
   el.innerHTML = `
     <svg class="think-star" viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M12 2 14.39 8.26 21 9.27 16 14.14 17.18 21.02 12 17.77 6.82 21.02 8 14.14 3 9.27 9.61 8.26z"/></svg>
     <span class="think-label">${escapeHtml(label)}</span>
+    ${tok ? `<span class="think-sep">·</span>${tok}` : ''}
     ${running ? '<span class="think-dots"><span></span><span></span><span></span></span>' : ''}
   `;
   return el;
@@ -3228,60 +3243,6 @@ function renderCompactToolEvent(ev) {
 
 // Legacy pill renderer — kept for any path I might have missed, but the
 // dispatcher above routes through the new compact / shell renderers.
-function renderToolEventLegacyPill(ev) {
-  const el = document.createElement('div');
-  el.className = `tool-event ${ev.status || 'done'}`;
-  const argSummary = ev.argSummary || '';
-  const icons = {
-    web_search:     `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>`,
-    web_fetch:      `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.5 1.5"/><path d="M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.5-1.5"/></svg>`,
-    describe_image: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8Z"/><circle cx="12" cy="12" r="3"/></svg>`,
-    calc:           `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="3" width="14" height="18" rx="2"/><path d="M8 7h8M8 11h2M12 11h4M8 15h2M12 15h4M8 19h2M12 19h4"/></svg>`,
-    read_file:      `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>`,
-    list_dir:       `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>`,
-    write_file:     `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2Z"/><path d="M17 21v-8H7v8M7 3v5h8"/></svg>`,
-    apply_patch:    `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9M16.5 3.5a2.121 2.121 0 1 1 3 3L7 19l-4 1 1-4z"/></svg>`,
-    run_command:    `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m4 17 6-6-6-6M12 19h8"/></svg>`,
-    run_command_async: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><polygon points="10 8 16 12 10 16" fill="currentColor" stroke="none"/></svg>`,
-    glob:           `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/><circle cx="13" cy="14" r="3"/><path d="m17 18-1.5-1.5"/></svg>`,
-    grep:           `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5M8 11h6M11 8v6"/></svg>`,
-    task_status:    `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>`,
-    task_list:      `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/></svg>`,
-    task_kill:      `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M9 9l6 6M15 9l-6 6"/></svg>`
-  };
-  const icon = icons[ev.name] || icons.web_fetch;
-  const prettyName = ({
-    web_search: 'web_search',
-    web_fetch: 'web_fetch',
-    describe_image: 'reading image',
-    calc: 'calc',
-    read_file: 'read_file',
-    list_dir: 'list_dir',
-    write_file: 'write_file',
-    apply_patch: 'apply_patch',
-    run_command: 'run_command',
-    run_command_async: 'run_command · async',
-    glob: 'glob',
-    grep: 'grep',
-    task_status: 'task_status',
-    task_list: 'task_list',
-    task_kill: 'task_kill'
-  })[ev.name] || ev.name;
-  // Show the result summary even on error so the user can see WHY it failed
-  // (e.g. "timeout", "denied by user") instead of an
-  // opaque "error".
-  let statusText;
-  if (ev.status === 'running') statusText = 'running';
-  else if (ev.status === 'error') statusText = ev.resultSummary ? `error · ${ev.resultSummary}` : 'error';
-  else statusText = ev.resultSummary || 'done';
-  el.innerHTML = `
-    ${icon}
-    <span class="te-name">${escapeHtml(prettyName)}</span>
-    <span class="te-arg">${escapeHtml(argSummary)}</span>
-    <span class="te-status">${escapeHtml(statusText)}</span>
-  `;
-  return el;
-}
 
 // Claude Code / VS Code style shell-command card. Header row with a status
 // dot + tool name + truncated command, then a bordered IN/OUT box that shows
@@ -3627,14 +3588,18 @@ async function pullModel(tag /* banner is read fresh via DOM */) {
   }
 
   // Surface a friendly error in the install banner.
+  let msg;
+  if (sawError) msg = `Pull failed: ${lastErrorMessage}`;
+  else if (chunkCount === 0) msg = `No data received from Ollama. Try again, or check that Ollama isn't being blocked by antivirus / firewall.`;
+  else if (!receivedAnyProgress) msg = `Pull stalled after manifest fetch. Try \`ollama pull ${tag}\` in a terminal to see the underlying error.`;
+  else msg = `Stream ended early after ${chunkCount} chunks. Try again.`;
+  // Also record it so the Downloads tab (which doesn't show the install
+  // banner) can display the failure on the model's card instead of silently
+  // snapping back to a Download button.
+  state.pullError = { tag, msg };
   const banner = $('#install-banner');
   if (banner) {
     banner.hidden = false;
-    let msg;
-    if (sawError) msg = `Pull failed: ${lastErrorMessage}`;
-    else if (chunkCount === 0) msg = `No data received from Ollama. Try again, or check that Ollama isn't being blocked by antivirus / firewall.`;
-    else if (!receivedAnyProgress) msg = `Pull stalled after manifest fetch. Try \`ollama pull ${tag}\` in a terminal to see the underlying error.`;
-    else msg = `Stream ended early after ${chunkCount} chunks. Try again.`;
     banner.innerHTML = `
       <div class="ib-text">
         <strong>${escapeHtml(tag)} didn't finish installing.</strong>
@@ -3956,11 +3921,9 @@ function wireComposer() {
   const input = $('#composer-input');
   input.addEventListener('input', () => {
     input.style.height = 'auto';
-    // 5 lines × ~21.75px line-height + ~14px vertical padding ≈ 130px. Past
-    // that the textarea scrolls internally instead of growing. Matches the
-    // CSS max-height so the cap is consistent whether you grew into it by
-    // typing or pasted in a long block.
-    input.style.height = Math.min(input.scrollHeight, 130) + 'px';
+    // Grow up to 6 lines (~145px), matching the CSS max-height; past that the
+    // textarea scrolls internally instead of pushing the thread off-screen.
+    input.style.height = Math.min(input.scrollHeight, 145) + 'px';
   });
   input.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); form.requestSubmit(); }
@@ -4438,6 +4401,21 @@ ollama pull qwen2.5vl:7b
       thinkEvent.ms = Date.now() - thinkEvent.startedAt;
       patchLastMessage(assistantMsg);
     };
+    // Approximate tokens from streamed thinking text (~4 chars/token). Ollama
+    // and Gemini stream the reasoning text so we can count it live; Anthropic
+    // at display:"omitted" streams empty thinking, so its count stays 0.
+    const addThinkingText = (txt) => {
+      if (!thinkEvent || !txt) return;
+      thinkEvent.chars = (thinkEvent.chars || 0) + txt.length;
+      thinkEvent.tokens = Math.max(1, Math.round(thinkEvent.chars / 4));
+      // Patch the count in place — Ollama streams reasoning token-by-token, so
+      // a full re-render per chunk would flicker. Fall back to a full render
+      // only if the running row isn't mounted yet.
+      const row = $('#thread')?.querySelector('.think-row.running');
+      const span = row?.querySelector('.think-tokens');
+      if (span) span.textContent = `${thinkEvent.tokens.toLocaleString()} tokens`;
+      else patchLastMessage(assistantMsg);
+    };
 
     const chatFn = isCloud ? window.api.cloud?.chat : window.api.ollama.chat;
     if (typeof chatFn !== 'function') {
@@ -4529,12 +4507,16 @@ ollama pull qwen2.5vl:7b
       // of the message.
       if (chunk.thinking?.phase === 'start' || (chunk.message?.thinking != null && !thinkEvent)) {
         if (!thinkEvent) {
-          thinkEvent = { name: '__think', status: 'running', startedAt: Date.now() };
+          thinkEvent = { name: '__think', status: 'running', startedAt: Date.now(), chars: 0, tokens: 0 };
           assistantMsg.toolEvents.push(thinkEvent);
           assistantMsg.thinking = false;   // the inline row is the indicator now
           patchLastMessage(assistantMsg);
         }
       }
+      // Accumulate streamed reasoning text for the live token count.
+      if (typeof chunk.message?.thinking === 'string') addThinkingText(chunk.message.thinking);
+      if (typeof chunk.thinking?.text === 'string') addThinkingText(chunk.thinking.text);
+
       if (chunk.thinking?.phase === 'end') endThinking();
       // Ollama has no explicit end signal — the first real content token after
       // a thinking field means reasoning is done.
@@ -4804,37 +4786,19 @@ When the user says "the project folder" or "this folder", they mean: ${c.project
 
 const PLAN_MODE_PROMPT = `PLAN MODE IS ACTIVE.
 
-You are in Plan Mode. READ-ONLY tools (read_file, list_dir, glob, grep, web_search, web_fetch, calc, mcp_list_servers, task_status, task_list) ARE allowed — use them freely to investigate the codebase, gather evidence, and ground your plan in facts. WRITE tools (write_file, apply_patch, run_command, run_command_async, mcp_add_server, mcp_remove_server, task_kill) are BLOCKED by the executor; calling them returns an error. Do not bother calling them yet.
+You are in Plan Mode. You CANNOT run commands or write files here — those tools are blocked. Your job is to help plan the work, and only once the user has actually asked for a task.
 
-Your workflow:
+If the user is just greeting you (e.g. "hi", "hey", "hello"), making small talk, or hasn't asked for anything concrete yet: simply greet them back in one short sentence and ask what they'd like to work on. Do NOT investigate, do NOT read files, do NOT draft a plan, do NOT call any tools. There is nothing to plan yet.
 
-1. Investigate first. Use the read tools to map out the relevant code, files, and state. Do not guess — go look.
-2. Draft a concrete plan. A numbered list of steps, each naming the specific tool you'll call and the key arguments, plus the files/state that would be touched and any risks.
-3. When the plan is ready for the user to review, call \`exit_plan_mode\` with the plan text. This pops a modal showing the user your plan with Approve / Reject buttons.
-   - On Approve: the chat flips to Approval Mode and you can start executing. Each write tool call will still require per-call approval — that's by design.
-   - On Reject: the tool returns "rejected by user". Refine the plan and call \`exit_plan_mode\` again when ready.
+Only when the user asks for an actual task (fix a bug, add a feature, change something):
+1. Optionally use the read-only tools (read_file, list_dir, glob, grep, web_search, web_fetch) to check the relevant files first — briefly, only what you need.
+2. Write a short, concrete plan: the steps you'd take and the files you'd change.
+3. Call \`exit_plan_mode\` with that plan. It shows the user an Approve / Reject dialog. On Approve the chat switches to Approval Mode and you can start doing the work (each change still needs approval). On Reject, refine and call it again.
 
-Do NOT write the plan as chat text and ask the user to manually toggle modes — call \`exit_plan_mode\` so the formal approval gate fires.
-
-If the user pushes you to "just do it" / "go ahead" / "stop planning" before you've called \`exit_plan_mode\`, explain that the formal gate is the only way to start writing and offer to surface your plan via \`exit_plan_mode\` now.`;
+Keep it proportional: a one-line change needs a one-line plan, not a full investigation. Write tools (write_file, apply_patch, run_command, etc.) return an error until the user approves your plan — don't call them yet.`;
 
 // Auto-route: given the user's current chat/agent model, find the tier-matched
 // model in another category. So "smartest chat" → "smartest image", etc.
-function tierMatchedModel(currentModelId, targetCategory) {
-  if (!state.catalog) return null;
-  const target = state.catalog.categories[targetCategory];
-  if (!target?.picks?.length) return null;
-
-  let sourceTier = 0;
-  for (const sourceKey of ['chat', 'agent']) {
-    const picks = (state.catalog.categories[sourceKey]?.picks || []).filter(p => !p.multimodal);
-    const idx = picks.findIndex(p => (p.tag || p.file) === currentModelId);
-    if (idx >= 0) { sourceTier = idx; break; }
-  }
-  const clamped = Math.min(sourceTier, target.picks.length - 1);
-  const matched = target.picks[clamped];
-  return matched?.tag || matched?.file || null;
-}
 
 function buildTools(modality, webEnabled, modelId, chat) {
   // Don't send tools to a model that can't reliably emit them.
@@ -5434,18 +5398,6 @@ function patchLastMessage(msg) {
 // Build the small per-message token-count element. Shared by renderMessage and
 // patchLastMessageContent so the badge appears (and updates live) without
 // rebuilding the whole bubble on every streamed token.
-function tokenBadgeEl(stats) {
-  const t = document.createElement('div');
-  t.className = 'msg-tokens' + (stats.live ? ' live' : '');
-  const co = stats.completion || 0;
-  const pr = stats.prompt || 0;
-  if (stats.live) {
-    t.innerHTML = `~<strong>${co.toLocaleString()}</strong> tokens`;
-  } else {
-    t.innerHTML = `<strong>${pr.toLocaleString()}</strong> in · <strong>${co.toLocaleString()}</strong> out`;
-  }
-  return t;
-}
 
 function patchLastMessageContent(msg) {
   const list = $('#thread');
@@ -5461,10 +5413,11 @@ function patchLastMessageContent(msg) {
   if (!body) {
     body = document.createElement('div');
     body.className = 'msg-body';
-    // Place body after any existing attachments/tool-events so order matches
-    // the full renderer's output.
-    const pending = lastEl.querySelector(':scope > .msg-pending');
-    if (pending) lastEl.insertBefore(body, pending);
+    // Body goes AFTER the tool events (thinking/search/etc.) and before the
+    // token badge / pending indicator, matching renderMessage's order so the
+    // answer sits below "Thought for Ns" rather than above it.
+    const after = lastEl.querySelector(':scope > .msg-tokens, :scope > .msg-pending');
+    if (after) lastEl.insertBefore(body, after);
     else lastEl.appendChild(body);
   }
   // Assistant streams are rendered with markdown so **bold** etc. transitions
@@ -5477,14 +5430,7 @@ function patchLastMessageContent(msg) {
     if (t) t.remove();
   }
 
-  // Live-update the token badge in place — append on first appearance, mutate
-  // in place after that, so the number ticks up smoothly without flicker.
-  if (msg.role === 'assistant' && msg.tokenStats) {
-    const existing = lastEl.querySelector(':scope > .msg-tokens');
-    const fresh = tokenBadgeEl(msg.tokenStats);
-    if (existing) existing.replaceWith(fresh);
-    else lastEl.appendChild(fresh);
-  }
+  // (No more token badge — thinking-phase token counts live on the think row.)
 
   // Only auto-scroll when the user is already near the bottom so we don't
   // hijack them mid-scroll.
@@ -6073,6 +6019,14 @@ function renderMarkdown(text) {
   if (!text) return '';
   let src = String(text);
 
+  // 0. Strip leaked reasoning. Some local models (Qwen3 among them) emit their
+  // chain-of-thought inline as <think>…</think> even when thinking is off,
+  // instead of via Ollama's separate thinking field. Drop those blocks — and a
+  // stray orphan </think> — so the user sees the answer, not the model
+  // thinking aloud at them.
+  src = src.replace(/<think>[\s\S]*?<\/think>/gi, '');
+  src = src.replace(/^[\s\S]*?<\/think>/i, (m) => m.includes('<think>') ? m : '');
+
   // 1. Pull out fenced code blocks first.
   const codeBlocks = [];
   src = src.replace(/```(\w*)\n?([\s\S]*?)```/g, (_m, lang, code) => {
@@ -6132,6 +6086,10 @@ function renderMarkdown(text) {
       else closeList();
       continue;
     }
+
+    // Horizontal rule — models use --- (or *** / ___) as a section divider.
+    // Render it as an <hr> instead of leaking literal dashes into the text.
+    if (/^(-{3,}|\*{3,}|_{3,})$/.test(trimmed)) { closeList(); out.push('<hr>'); continue; }
 
     const h = trimmed.match(/^(#{1,3})\s+(.+)$/);
     if (h) { closeList(); const lvl = h[1].length; out.push(`<h${lvl}>${h[2]}</h${lvl}>`); continue; }
