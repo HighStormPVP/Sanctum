@@ -611,3 +611,205 @@ test('makes the folder if it does not exist yet', async (t) => {
   assert.deepStrictEqual(await ks.setPin(PIN), { ok: true });
   assert.ok(fs.existsSync(file));
 });
+
+
+// --- transient Windows file locks -------------------------------------------
+
+function lockError(code) {
+  return Object.assign(new Error(`${code}: resource busy or locked`), { code });
+}
+
+// Throws `code` for the first `failures` calls, then behaves normally.
+function flaky(failures, code, counter) {
+  return (real) => (...args) => {
+    counter.calls++;
+    if (counter.calls <= failures) throw lockError(code);
+    return real(...args);
+  };
+}
+
+test('a rename that fails briefly with EPERM, EBUSY or EACCES is retried', async (t) => {
+  for (const code of ['EPERM', 'EBUSY', 'EACCES']) {
+    const { dir, file, make } = fixture(t);
+    const ks = make();
+    await ks.setPin(PIN);
+    const counter = { calls: 0 };
+    patched(fs, 'renameSync', flaky(4, code, counter), () => ks.addPeer(peer(1)));
+    assert.strictEqual(counter.calls, 5, `${code}: four failures then success`);
+    assert.deepStrictEqual(fs.readdirSync(dir), ['remote.keys']);
+    ks.lock();
+    const reopened = make();
+    await reopened.unlock(PIN);
+    assert.deepStrictEqual(reopened.listPeers(), [peer(1)], code);
+    assert.ok(fs.existsSync(file));
+  }
+});
+
+test('a brief lock while recording an attempt does not stop the right PIN', async (t) => {
+  const { make } = fixture(t);
+  const ks = make();
+  await ks.setPin(PIN);
+  ks.lock();
+  const counter = { calls: 0 };
+  const result = await patched(fs, 'renameSync', flaky(2, 'EPERM', counter), () => ks.unlock(PIN));
+  assert.deepStrictEqual(result, { ok: true });
+});
+
+test('setPin survives a brief lock too', async (t) => {
+  const { make } = fixture(t);
+  const ks = make();
+  const counter = { calls: 0 };
+  const result = await patched(fs, 'renameSync', flaky(3, 'EBUSY', counter), () => ks.setPin(PIN));
+  assert.deepStrictEqual(result, { ok: true });
+});
+
+test('a rename that never succeeds fails cleanly: old file, memory and folder untouched', async (t) => {
+  const { dir, file, make } = fixture(t);
+  const ks = make();
+  await ks.setPin(PIN);
+  ks.addPeer(peer(1));
+  const before = fs.readFileSync(file);
+  const counter = { calls: 0 };
+  patched(fs, 'renameSync', flaky(Infinity, 'EPERM', counter), () => {
+    assert.throws(() => ks.addPeer(peer(2)), /EPERM/);
+  });
+  assert.strictEqual(counter.calls, 5, 'one try plus four retries');
+  assert.deepStrictEqual(fs.readFileSync(file), before);
+  assert.deepStrictEqual(fs.readdirSync(dir), ['remote.keys']);
+  assert.deepStrictEqual(ks.listPeers(), [peer(1)]);
+});
+
+test('other rename errors are not retried', async (t) => {
+  const { make } = fixture(t);
+  const ks = make();
+  await ks.setPin(PIN);
+  const counter = { calls: 0 };
+  patched(fs, 'renameSync', flaky(Infinity, 'ENOSPC', counter), () => {
+    assert.throws(() => ks.setControlAllowed(true), /ENOSPC/);
+  });
+  assert.strictEqual(counter.calls, 1);
+});
+
+test('the wipe retries its fallback delete when the rewrite is blocked', async (t) => {
+  const { file, clock, make } = fixture(t);
+  const ks = make();
+  await ks.setPin(PIN);
+  ks.lock();
+  await failTimes(ks, clock, 9);
+  const renames = { calls: 0 };
+  const unlinks = { calls: 0 };
+  // The first rename records the attempt; every later one (the wipe's rewrite) is blocked.
+  const blockAfterFirst = (real) => (...args) => {
+    renames.calls++;
+    if (renames.calls > 1) throw lockError('EPERM');
+    return real(...args);
+  };
+  const result = await patched(fs, 'renameSync', blockAfterFirst, () =>
+    patched(fs, 'unlinkSync', (real) => (target, ...rest) => {
+      // Temp-file clean-up also uses unlinkSync; only the keystore itself is locked.
+      if (target !== file) return real(target, ...rest);
+      unlinks.calls++;
+      if (unlinks.calls <= 2) throw lockError('EBUSY');
+      return real(target, ...rest);
+    }, () => ks.unlock(WRONG)));
+  // The rewrite could not land, but the delete got through on the third try.
+  assert.deepStrictEqual(result, { ok: false, wiped: true });
+  assert.strictEqual(unlinks.calls, 3);
+  assert.ok(!fs.existsSync(file));
+  assert.strictEqual(ks.hasPin(), false);
+  assert.strictEqual(make().hasPin(), false);
+});
+
+// --- secure storage not available yet ---------------------------------------
+
+test('while protection is unavailable the file is left alone and everything is refused', async (t) => {
+  const { dir, file, make } = fixture(t);
+  const first = make();
+  await first.setPin(PIN);
+  first.addPeer(peer(1));
+  first.setControlAllowed(true);
+  const before = fs.readFileSync(file);
+
+  const ks = make({
+    isProtectionAvailable: () => false,
+    unprotect: () => { throw new Error('keychain locked'); }
+  });
+  assert.strictEqual(ks.isAvailable(), false);
+  assert.strictEqual(ks.getControlAllowed(), false);
+  assert.strictEqual(ks.hasPin(), false);
+  assert.strictEqual(ks.isUnlocked(), false);
+  assert.strictEqual(ks.getIdentity(), null);
+  assert.deepStrictEqual(ks.listPeers(), []);
+  assert.throws(() => ks.setControlAllowed(false), /secure storage/i);
+  assert.throws(() => ks.addPeer(peer(2)), /secure storage/i);
+  assert.throws(() => ks.removePeer(peer(1).deviceId), /secure storage/i);
+  for (const result of [await ks.setPin('987654'), await ks.unlock(PIN)]) {
+    assert.strictEqual(result.ok, false);
+    assert.match(result.error, /secure storage/i);
+  }
+  assert.deepStrictEqual(fs.readFileSync(file), before, 'byte-identical');
+  assert.deepStrictEqual(fs.readdirSync(dir), ['remote.keys'], 'nothing set aside');
+});
+
+test('reload brings the pairing back once protection is available', async (t) => {
+  const { dir, file, make } = fixture(t);
+  const first = make();
+  await first.setPin(PIN);
+  first.addPeer(peer(1));
+  first.setControlAllowed(true);
+  const identity = first.getIdentity();
+  const before = fs.readFileSync(file);
+
+  let ready = false;
+  const ks = make({
+    isProtectionAvailable: () => ready,
+    unprotect: (bytes) => {
+      if (!ready) throw new Error('keychain locked');
+      return bytes;
+    }
+  });
+  assert.strictEqual(ks.isAvailable(), false);
+  assert.strictEqual(ks.reload(), false);
+  assert.deepStrictEqual(fs.readFileSync(file), before);
+
+  ready = true;
+  assert.strictEqual(ks.reload(), true);
+  assert.strictEqual(ks.isAvailable(), true);
+  assert.strictEqual(ks.hasPin(), true);
+  assert.strictEqual(ks.getControlAllowed(), true);
+  assert.deepStrictEqual(await ks.unlock(PIN), { ok: true });
+  assert.deepStrictEqual(ks.getIdentity().publicKey, identity.publicKey);
+  assert.deepStrictEqual(ks.listPeers(), [peer(1)]);
+  assert.deepStrictEqual(fs.readdirSync(dir), ['remote.keys']);
+});
+
+test('reload locks the store and re-reads the file', async (t) => {
+  const { make } = fixture(t);
+  const ks = make();
+  await ks.setPin(PIN);
+  assert.strictEqual(ks.reload(), true);
+  assert.strictEqual(ks.isUnlocked(), false);
+  assert.strictEqual(ks.hasPin(), true);
+});
+
+test('a failure while protection IS available still counts as corruption', (t) => {
+  const { dir, file, make } = fixture(t);
+  fs.writeFileSync(file, 'not sealed by anything we know');
+  const ks = make({
+    isProtectionAvailable: () => true,
+    unprotect: () => { throw new Error('bad data'); }
+  });
+  assert.strictEqual(ks.isAvailable(), true);
+  assert.strictEqual(ks.hasPin(), false);
+  assert.strictEqual(fs.readdirSync(dir).filter((f) => f.includes('.unreadable.')).length, 1);
+  assert.ok(!fs.existsSync(file));
+});
+
+test('a throwing availability check counts as unavailable', (t) => {
+  const { dir, file, make } = fixture(t);
+  fs.writeFileSync(file, 'whatever');
+  const ks = make({ isProtectionAvailable: () => { throw new Error('boom'); } });
+  assert.strictEqual(ks.isAvailable(), false);
+  assert.deepStrictEqual(fs.readdirSync(dir), ['remote.keys']);
+  assert.strictEqual(fs.readFileSync(file, 'utf8'), 'whatever');
+});
