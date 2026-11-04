@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const lib = (f) => require(path.join(__dirname, '..', 'lib', f));
-const { isWithinRoots, applyExactPatch } = lib('fs-rules.js');
+const { isWithinRoots, isInProfile, applyExactPatch, walkFiles } = lib('fs-rules.js');
 const { isPrivateAddress, checkUrl, safeFetchText } = lib('url-rules.js');
 const { grepInWorker } = lib('grep-runner.js');
 const { detectRepetitionLoop, splitOutputLines, quoteWindowsArg, encodePowerShell } = lib('text-rules.js');
@@ -45,6 +45,58 @@ test('a symlink pointing out of the root is outside', (t) => {
   catch { t.skip('this machine cannot create links'); return; }
   assert.ok(!isWithinRoots(path.join(link, 'secret.txt'), [root]));
   assert.ok(isWithinRoots(path.join(root, 'new-file.txt'), [root]), 'a file that does not exist yet is checked by its parent');
+});
+
+test("Sanctum's own data folder and everything in it counts as the profile", () => {
+  const profile = 'C:\\Users\\A\\AppData\\Roaming\\sanctum';
+  assert.ok(isInProfile(profile, profile, win));
+  assert.ok(isInProfile(`${profile}\\`, profile, win));
+  assert.ok(isInProfile(`${profile}\\Local Storage\\leveldb\\000003.log`, profile, win));
+  assert.ok(isInProfile('c:\\users\\a\\APPDATA\\roaming\\SANCTUM\\mcp_config.json', profile, win), 'case does not matter on Windows');
+  assert.ok(isInProfile('C:/Users/A/AppData/Roaming/sanctum/mcp_config.json', profile, win));
+  assert.ok(isInProfile('C:\\proj\\..\\Users\\A\\AppData\\Roaming\\sanctum\\a', profile, win), 'dots are walked');
+  assert.ok(!isInProfile('C:\\Users\\A\\AppData\\Roaming\\sanctum-old\\a', profile, win), 'a name that only starts the same');
+  assert.ok(!isInProfile('C:\\Users\\A\\AppData\\Roaming', profile, win), 'a parent is not the profile');
+  assert.ok(!isInProfile('C:\\Users\\A\\AppData\\Roaming\\sanctum\\..\\other\\a', profile, win));
+  assert.ok(isInProfile('/home/a/.config/sanctum/x', '/home/a/.config/sanctum', posix));
+  assert.ok(!isInProfile('/home/a/.config/Sanctum/x', '/home/a/.config/sanctum', posix), 'case matters here');
+  assert.ok(!isInProfile('C:\\anything', '', win));
+  assert.ok(!isInProfile('C:\\anything', undefined, win));
+});
+
+test('a link into the profile counts as the profile', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sanctum-profile-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const profile = path.join(dir, 'profile');
+  const project = path.join(dir, 'project');
+  fs.mkdirSync(profile); fs.mkdirSync(project);
+  fs.writeFileSync(path.join(profile, 'secret.txt'), 'x');
+  const link = path.join(project, 'link');
+  try { fs.symlinkSync(profile, link, 'junction'); }
+  catch { t.skip('this machine cannot create links'); return; }
+  assert.ok(isInProfile(path.join(link, 'secret.txt'), profile));
+  assert.ok(isInProfile(link, profile));
+  assert.ok(!isInProfile(path.join(project, 'mine.txt'), profile));
+});
+
+test('a walk or a search from a parent folder goes around the profile', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sanctum-walk-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const profile = path.join(dir, 'AppData', 'sanctum');
+  fs.mkdirSync(path.join(profile, 'Local Storage'), { recursive: true });
+  fs.mkdirSync(path.join(dir, 'work'));
+  fs.writeFileSync(path.join(profile, 'Local Storage', 'keys.log'), 'CANARY in the profile');
+  fs.writeFileSync(path.join(profile, 'mcp_config.json'), 'CANARY in the profile');
+  fs.writeFileSync(path.join(dir, 'AppData', 'beside.txt'), 'CANARY beside the profile');
+  fs.writeFileSync(path.join(dir, 'work', 'mine.txt'), 'CANARY in the work folder');
+  const skipDir = (d) => isInProfile(d, profile);
+
+  const walked = walkFiles(dir, { skipDir }).map((f) => path.relative(dir, f).replace(/\\/g, '/')).sort();
+  assert.deepEqual(walked, ['AppData/beside.txt', 'work/mine.txt']);
+  assert.equal(walkFiles(dir).length, 4, 'without being told to, a walk still finds everything');
+
+  const found = await grepInWorker({ pattern: 'CANARY', root: dir, skipDir });
+  assert.deepEqual(found.matches.map((m) => m.file).sort(), ['AppData/beside.txt', 'work/mine.txt']);
 });
 
 test('apply_patch keeps $ patterns literally', () => {

@@ -4774,8 +4774,9 @@ function wireComposer() {
 }
 
 // Stop also clears queued messages — if the user stops, they probably mean "stop
-// everything", not "stop just this one and keep going". Another device's queued words
-// weren't theirs to throw away, so those go back to whoever typed them.
+// everything", not "stop just this one and keep going". Someone else's queued words
+// weren't theirs to throw away, so those go back to whoever typed them, on another
+// device or at this one.
 function stopChatAndQueue(c, stoppedBy = null) {
   stopChat(c.id);
   if (c.remote) return; // the home PC does the rest
@@ -4783,6 +4784,7 @@ function stopChatAndQueue(c, stoppedBy = null) {
   if (!queued.length) return;
   c.messages = c.messages.filter(m => !m.queued);
   sendQueuedBack(c, queued, stoppedBy);
+  if (stoppedBy) returnOwnQueued(c, queued);
   saveToStorage();
   renderIfOpen(c);
   renderChatList();
@@ -4837,18 +4839,21 @@ function restoreQueuedMessages(c) {
   c.messages = c.messages.filter(m => !m.queued);
   // What a laptop typed goes back to that laptop. This box is the home PC's own.
   sendQueuedBack(c, queued);
-  const ours = queued.filter(m => !m._fromDevice);
-  if (ours.length) {
-    const input = $('#composer-input');
-    if (currentChat()?.id === c.id && input && !input.value.trim()) {
-      input.value = ours.map(m => m.content).join('\n\n');
-      showToast('The reply stopped, so your queued message was not sent. It is back in the message box.');
-    } else {
-      showToast('The reply stopped, so a queued message was not sent.');
-    }
-  }
+  returnOwnQueued(c, queued);
   saveToStorage();
   renderIfOpen(c);
+}
+
+function returnOwnQueued(c, queued) {
+  const ours = queued.filter(m => !m._fromDevice);
+  if (!ours.length) return;
+  const input = $('#composer-input');
+  if (currentChat()?.id === c.id && input && !input.value.trim()) {
+    input.value = ours.map(m => m.content).join('\n\n');
+    showToast('The reply stopped, so your queued message was not sent. It is back in the message box.');
+  } else {
+    showToast('The reply stopped, so a queued message was not sent.');
+  }
 }
 
 async function processNextQueued(c) {
@@ -6459,7 +6464,11 @@ const REMOTE_ACTION_TIMEOUT_MS = 15000;
 const REMOTE_ACTION_REFUSED = "That isn't something this device can do.";
 const REMOTE_ACTION_FAILED = "The home PC couldn't do that.";
 const REMOTE_NOT_SHARED = 'This chat is no longer shared.';
+const REMOTE_PROFILE_REFUSED = "That is Sanctum's own data folder. A project can't use it.";
 const REMOTE_ERROR_MAX = 300;
+// How long an action that timed out still counts, if its answer turns up after all.
+const REMOTE_LATE_ANSWER_MS = 10 * 60 * 1000;
+const REMOTE_RETURNED_SEEN_MAX = 1000;
 
 // ---- At home ----
 
@@ -6469,12 +6478,40 @@ function sharedChatById(chatId) {
   return c && c.remoteControl === true && !c.remote ? c : null;
 }
 
+// A note on the machine at risk of what a laptop did. Names of settings and folders, never what
+// anyone said: message text, attachments and titles stay out. A refused frame's args aren't
+// looked at at all, because they could be anything.
+function auditRemoteAction(deviceId, frame, allowed, answer) {
+  const args = frame.args || {};
+  let details;
+  if (allowed) {
+    if (frame.kind === 'send') details = { attachments: args.attachments?.length || 0 };
+    else if (frame.kind === 'set-model') details = { model: args.model };
+    else if (frame.kind === 'set-mode') details = { mode: args.mode };
+    else if (frame.kind === 'set-toggle') details = { name: args.name, value: args.value };
+    else if (frame.kind === 'new-chat') details = { modality: args.modality, model: args.model };
+    else if (frame.kind === 'list-dir' || frame.kind === 'set-folder') details = { path: args.path };
+  }
+  const short = (value, max) => (typeof value === 'string' ? value.slice(0, max) : undefined);
+  window.api.audit.log({
+    ts: new Date().toISOString(),
+    source: 'remote-action',
+    device: deviceId,
+    chat: answer?.chatId || short(frame.chatId, 256),
+    kind: short(frame.kind, 64),
+    ok: answer?.ok === true,
+    args: details
+  }).catch(() => {});
+}
+
 function handleRemoteAction(deviceId, frame) {
   if (!RemoteRules.isActionId(frame.id)) return;
+  const allowed = RemoteRules.isAllowedAction(frame);
   const reply = (answer) => {
+    auditRemoteAction(deviceId, frame, allowed, answer);
     window.api.remote.send(deviceId, { type: 'action-result', id: frame.id, ...answer }).catch(() => {});
   };
-  if (!RemoteRules.isAllowedAction(frame)) {
+  if (!allowed) {
     reply({ ok: false, error: RemoteRules.attachmentProblem(frame.args?.attachments) || REMOTE_ACTION_REFUSED });
     return;
   }
@@ -6599,6 +6636,7 @@ async function remoteListDir(c, path) {
   if (c.modality !== 'agent') return { ok: false, error: 'Only a project has a folder.' };
   const target = path || '~';
   const listed = await window.api.fs.listDir(target, [target]);
+  if (listed?.inProfile) return { ok: false, error: REMOTE_PROFILE_REFUSED };
   if (!listed || listed.error) return { ok: false, error: "That folder isn't available on the home PC." };
   if (!sharedChatById(c.id)) return { ok: false, error: REMOTE_NOT_SHARED };
   return { ok: true, path: listed.path, entries: listed.entries.filter(e => e.kind === 'dir').map(e => e.name).sort() };
@@ -6609,6 +6647,7 @@ async function remoteSetFolder(c, path) {
   const turn = (mirror.folderTurns.get(c.id) || 0) + 1;
   mirror.folderTurns.set(c.id, turn);
   const listed = await window.api.fs.listDir(path, [path]);
+  if (listed?.inProfile) return { ok: false, error: REMOTE_PROFILE_REFUSED };
   if (!listed || listed.error) return { ok: false, error: "That folder isn't available on the home PC." };
   if (!sharedChatById(c.id)) return { ok: false, error: REMOTE_NOT_SHARED };
   if (mirror.folderTurns.get(c.id) !== turn) return { ok: false, error: 'Another folder was chosen after this one.' };
@@ -6624,10 +6663,33 @@ async function remoteSetFolder(c, path) {
 function sendQueuedBack(c, messages, exceptDevice = null) {
   for (const m of messages) {
     if (!m._fromDevice || m._fromDevice === exceptDevice) continue;
-    window.api.remote.send(m._fromDevice, {
+    deliverReturnedWords(m._fromDevice, {
       type: 'queued-returned', chatId: c.id, text: m.content || '', hadAttachments: !!m._attachmentData?.length
-    }).catch(() => {});
+    });
   }
+}
+
+// By now the words have left the thread, so this is the only copy. Being sent doesn't mean they
+// got there: send says true for a laptop that has gone quiet, and the link's copy is lost if the
+// session is replaced when it comes back. So they stay here until the laptop says it has them,
+// and go again after its next snapshot. Memory only: a restart loses them.
+function deliverReturnedWords(deviceId, words) {
+  const frame = { ...words, id: 'w_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 10) };
+  if (!mirror.undelivered.has(deviceId)) mirror.undelivered.set(deviceId, new Map());
+  mirror.undelivered.get(deviceId).set(frame.id, frame);
+  window.api.remote.send(deviceId, frame).catch(() => {});
+}
+
+function flushReturnedWords(deviceId) {
+  for (const frame of mirror.undelivered.get(deviceId)?.values() || []) {
+    window.api.remote.send(deviceId, frame).catch(() => {});
+  }
+}
+
+function applyQueuedReturnedAck(deviceId, frame) {
+  const held = mirror.undelivered.get(deviceId);
+  if (!held?.delete(frame.id)) return;
+  if (!held.size) mirror.undelivered.delete(deviceId);
 }
 
 // ---- On the laptop ----
@@ -6639,8 +6701,14 @@ function homeBlockedReason(deviceId) {
   return null;
 }
 
-// Always answers, with { ok, error? } and whatever the action gives back.
-function actionToHome(deviceId, chatId, kind, args, extraWaitMs = 0) {
+function homeName(deviceId) {
+  return mirror.homes.get(deviceId)?.info?.name || 'your home PC';
+}
+
+// Always answers, with { ok, error? } and whatever the action gives back. timedOut means no
+// answer yet, not that it didn't happen: the link keeps a frame through a brief outage, so it can
+// still land. onLateOk is for hearing about that.
+function actionToHome(deviceId, chatId, kind, args, { extraWaitMs = 0, onLateOk = null } = {}) {
   const blocked = homeBlockedReason(deviceId);
   if (blocked) return Promise.resolve({ ok: false, error: blocked });
   const id = 'a_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
@@ -6648,7 +6716,13 @@ function actionToHome(deviceId, chatId, kind, args, extraWaitMs = 0) {
   if (chatId !== undefined) frame.chatId = chatId;
   if (args !== undefined) frame.args = args;
   return new Promise((resolve) => {
-    const timer = setTimeout(() => settleAction(id, { ok: false, error: 'The home PC did not answer.' }), REMOTE_ACTION_TIMEOUT_MS + extraWaitMs);
+    const timer = setTimeout(() => {
+      if (onLateOk) {
+        const expiry = setTimeout(() => mirror.lateActions.delete(id), REMOTE_LATE_ANSWER_MS);
+        mirror.lateActions.set(id, { deviceId, onLateOk, timer: expiry });
+      }
+      settleAction(id, { ok: false, timedOut: true, error: `No answer from ${homeName(deviceId)} yet.` });
+    }, REMOTE_ACTION_TIMEOUT_MS + extraWaitMs);
     mirror.actions.set(id, { deviceId, resolve, timer });
     const unsent = { ok: false, error: 'It could not be sent to the home PC.' };
     window.api.remote.send(deviceId, frame).then((sent) => {
@@ -6667,6 +6741,13 @@ function settleAction(id, answer) {
 
 // A home can send anything here too, and an answer only counts from the device that was asked.
 function finishAction(deviceId, frame) {
+  const late = mirror.lateActions.get(frame.id);
+  if (late && late.deviceId === deviceId) {
+    mirror.lateActions.delete(frame.id);
+    clearTimeout(late.timer);
+    if (frame.ok === true) late.onLateOk();
+    return;
+  }
   const pending = mirror.actions.get(frame.id);
   if (!pending || pending.deviceId !== deviceId) return;
   if (frame.ok !== true) {
@@ -6717,10 +6798,32 @@ async function sendComposerToHome(c) {
   // Attachments take time to cross a slow connection before anything can answer. A second per
   // MiB, so a message that's on its way isn't given back and sent twice.
   const mib = attachments.reduce((sum, a) => sum + (a.base64?.length || a.text?.length || 0), 0) / (1024 * 1024);
-  const answer = await actionToHome(c.remote.deviceId, c.remote.chatId, 'send', args, Math.ceil(mib) * 1000);
+  const answer = await actionToHome(c.remote.deviceId, c.remote.chatId, 'send', args, {
+    extraWaitMs: Math.ceil(mib) * 1000,
+    onLateOk: () => takeBackReturned(key, text, attachments)
+  });
   if (answer.ok) return;
   returnToBox(key, text, attachments);
-  showToast(`Your message wasn't sent. ${answer.error}`);
+  // It may yet land, and pressing Send again would start a second run, so this can't say it didn't.
+  showToast(answer.timedOut ? `${answer.error} Your message may still arrive.` : `Your message wasn't sent. ${answer.error}`);
+}
+
+// The answer came after all, and the text had already been given back. It's removed only while
+// it's exactly as it came back, because anything else is something the person has since typed.
+function takeBackReturned(key, text, attachments) {
+  showToast('Your message did go through');
+  const c = state.chats[key];
+  if (c?._returned?.text === text) {
+    delete c._returned;
+    return;
+  }
+  const input = $('#composer-input');
+  if (input.value !== text) return;
+  input.value = '';
+  input.dispatchEvent(new Event('input'));
+  state.pendingAttachments = state.pendingAttachments.filter(a => !attachments.includes(a));
+  renderAttachments();
+  updateSendButton();
 }
 
 // What didn't get sent goes back where it was typed. If that chat isn't on screen it waits there
@@ -6759,10 +6862,14 @@ function takeReturnedDraft(c) {
 }
 
 function applyQueuedReturned(deviceId, frame) {
+  if (!RemoteRules.isActionId(frame.id)) return;
   if (typeof frame.chatId !== 'string' || typeof frame.text !== 'string' || frame.text.length > RemoteRules.MAX_MESSAGE_BYTES) return;
-  const key = remoteChatKey(deviceId, frame.chatId);
-  if (!state.chats[key]) return;
-  returnToBox(key, frame.text);
+  window.api.remote.send(deviceId, { type: 'queued-returned-ack', id: frame.id }).catch(() => {});
+  // The home PC sends these again until it hears back, so one can arrive twice.
+  if (mirror.returnedSeen.has(frame.id)) return;
+  mirror.returnedSeen.add(frame.id);
+  if (mirror.returnedSeen.size > REMOTE_RETURNED_SEEN_MAX) mirror.returnedSeen.delete(mirror.returnedSeen.values().next().value);
+  returnToBox(remoteChatKey(deviceId, frame.chatId), frame.text);
   showToast(frame.hadAttachments === true
     ? "A queued message wasn't sent. Its words are back in the message box, but its files need attaching again."
     : "A queued message wasn't sent. It's back in the message box.");
@@ -6845,6 +6952,13 @@ const MIRROR_SNAPSHOT_GRACE_MS = 1500;
 const MIRROR_SPLIT_BYTES = 32 * 1024 * 1024;
 const MIRROR_FRAME_LIMIT_BYTES = 47 * 1024 * 1024;
 const MIRROR_MAX_PARTS = 100000;
+// However large the snapshot, the laptop's acks pace it, so the link's 64 MiB buffer can't fill.
+// A part larger than the byte window goes by itself.
+const MIRROR_PART_WINDOW = 4;
+const MIRROR_PART_WINDOW_BYTES = 40 * 1024 * 1024;
+// Frames held for a laptop while its snapshot arrives. Past this, it gets a new snapshot instead.
+const MIRROR_HELD_MAX = 20000;
+const MIRROR_RESYNC_MIN_MS = 1000;
 const MIRROR_RETRY_MS = 1000;
 const MIRROR_RETRY_MAX_MS = 30000;
 
@@ -6856,6 +6970,8 @@ const mirror = {
   sentRunning: new Set(),    // chatIds
   sentHome: null,            // JSON of the home details last sent
   tooLarge: new Set(),       // chatIds of chats no frame can hold
+  chatBytes: new Map(),      // chatId -> size of its snapshot, as last measured
+  undelivered: new Map(),    // deviceId -> Map of id -> queued-returned frames not yet acknowledged
   dirtyAll: false,
   dirty: new Set(),
   timer: null,
@@ -6866,6 +6982,8 @@ const mirror = {
   resumeId: null,            // the remote chat that was open when that happened
   // Acting.
   actions: new Map(),        // id -> { deviceId, resolve, timer }, waiting for an answer
+  lateActions: new Map(),    // id -> { deviceId, onLateOk, timer }, timed out but may still be answered
+  returnedSeen: new Set(),   // ids of queued-returned frames already put back in the box
   openOnArrival: null,       // a chat made here, to open when it gets here
   folderTurns: new Map()     // chatId -> the latest set-folder to arrive, so a slow check can't undo a later one
 };
@@ -6900,6 +7018,10 @@ function mirrorOnStatus(status) {
   for (const id of mirror.laptops.keys()) {
     if (!devices.some(d => d.id === id && d.role === 'laptop' && d.connected)) dropLaptop(id);
   }
+  // A device that has been removed isn't coming back for them.
+  for (const id of mirror.undelivered.keys()) {
+    if (!devices.some(d => d.id === id)) mirror.undelivered.delete(id);
+  }
   reflectRemoteLock();
   paintRemoteChatButton();
   paintRemoteComposer();
@@ -6909,7 +7031,15 @@ function mirrorOnFrame(deviceId, frame) {
   if (!frame || typeof frame.type !== 'string') return;
   const role = state.remoteStatus?.devices?.find(d => d.id === deviceId)?.role;
   if (frame.type === 'mirror-resync-request') {
-    if (role === 'laptop') addLaptop(deviceId);
+    if (role === 'laptop') resyncRequested(deviceId);
+    return;
+  }
+  if (frame.type === 'mirror-part-ack') {
+    if (role === 'laptop') applyMirrorPartAck(deviceId, frame);
+    return;
+  }
+  if (frame.type === 'queued-returned-ack') {
+    if (role === 'laptop') applyQueuedReturnedAck(deviceId, frame);
     return;
   }
   // An action only comes from a laptop this one serves.
@@ -6959,13 +7089,42 @@ function scheduleMirrorTick(ms) {
 }
 
 function addLaptop(deviceId) {
-  if (!mirror.laptops.has(deviceId)) mirror.laptops.set(deviceId, { seq: 0, split: false, failures: 0, retryTimer: null });
+  if (!mirror.laptops.has(deviceId)) {
+    mirror.laptops.set(deviceId, {
+      seq: 0, split: false, failures: 0, retryTimer: null,
+      paced: null, transfers: 0, lastResyncAt: 0, resyncTimer: null
+    });
+  }
   mirror.needsSnapshot.add(deviceId);
   scheduleMirrorTick(0);
 }
 
+// A snapshot means measuring every shared chat, so a laptop can't ask for them as fast as it can
+// send. One request in the gap is kept for the end of it, because that one may be the one that
+// matters.
+function resyncRequested(deviceId) {
+  const laptop = mirror.laptops.get(deviceId);
+  if (!laptop) {
+    addLaptop(deviceId);
+    return;
+  }
+  const wait = laptop.lastResyncAt + MIRROR_RESYNC_MIN_MS - Date.now();
+  if (wait <= 0) {
+    laptop.lastResyncAt = Date.now();
+    addLaptop(deviceId);
+  } else if (laptop.resyncTimer === null) {
+    laptop.resyncTimer = setTimeout(() => {
+      laptop.resyncTimer = null;
+      if (mirror.laptops.get(deviceId) !== laptop) return;
+      laptop.lastResyncAt = Date.now();
+      addLaptop(deviceId);
+    }, wait);
+  }
+}
+
 function dropLaptop(deviceId) {
   clearTimeout(mirror.laptops.get(deviceId)?.retryTimer);
+  clearTimeout(mirror.laptops.get(deviceId)?.resyncTimer);
   mirror.laptops.delete(deviceId);
   mirror.needsSnapshot.delete(deviceId);
   if (!mirror.laptops.size) {
@@ -7022,8 +7181,11 @@ function mirrorFrameFailed(deviceId) {
 }
 
 function sendToLaptops(frame) {
-  for (const id of mirror.laptops.keys()) {
-    if (!mirror.needsSnapshot.has(id)) sendToLaptop(id, frame);
+  for (const [id, laptop] of mirror.laptops) {
+    if (mirror.needsSnapshot.has(id)) continue;
+    if (!laptop.paced) sendToLaptop(id, frame);
+    else if (laptop.paced.held.length < MIRROR_HELD_MAX) laptop.paced.held.push(frame);
+    else laptop.paced.overflowed = true;
   }
 }
 
@@ -7069,6 +7231,10 @@ function mirrorTick() {
       for (const id of mirror.laptops.keys()) mirror.needsSnapshot.add(id);
     }
   }
+  // A chat crossing the limit changes what every laptop is sent, so they all need to know.
+  if (mirror.needsSnapshot.size && measureSharedChats()) {
+    for (const id of mirror.laptops.keys()) mirror.needsSnapshot.add(id);
+  }
   for (const id of mirror.needsSnapshot) sendMirrorSnapshot(id);
   mirror.needsSnapshot.clear();
 
@@ -7099,34 +7265,96 @@ function sendMirrorChanges(shared, everything, dirty) {
   }
 }
 
+// Sizes every chat in mirror.sent. True if one has crossed the limit that a frame can hold, either
+// way, which changes what's sent to every laptop.
+function measureSharedChats() {
+  let changed = false;
+  mirror.chatBytes.clear();
+  for (const [id, chat] of mirror.sent) {
+    const bytes = new Blob([JSON.stringify(chat)]).size;
+    mirror.chatBytes.set(id, bytes);
+    const tooLarge = bytes > MIRROR_FRAME_LIMIT_BYTES;
+    if (tooLarge !== mirror.tooLarge.has(id)) {
+      changed = true;
+      if (tooLarge) mirror.tooLarge.add(id);
+      else mirror.tooLarge.delete(id);
+    }
+  }
+  return changed;
+}
+
 // Only after sendMirrorChanges, so this is the point every other laptop has reached too.
 // `now` lets the laptop show running times against this machine's clock.
 function sendMirrorSnapshot(deviceId) {
   const laptop = mirror.laptops.get(deviceId);
   if (!laptop) return;
-  const chats = [];
+  // A new snapshot says everything the frames held for an old one would have said.
+  laptop.paced = null;
+  const parts = [];
   let total = 0;
   for (const [id, chat] of mirror.sent) {
-    const bytes = new Blob([JSON.stringify(chat)]).size;
-    if (bytes > MIRROR_FRAME_LIMIT_BYTES) {
-      mirror.tooLarge.add(id);
-    } else {
-      mirror.tooLarge.delete(id);
-      chats.push(chat);
-      total += bytes;
-    }
+    if (mirror.tooLarge.has(id)) continue;
+    const bytes = mirror.chatBytes.get(id) || 0;
+    parts.push({ chat, bytes });
+    total += bytes;
   }
   const frame = { type: 'mirror-snapshot', home: mirrorHomeDetails(), now: Date.now() };
-  if (chats.length > 1 && (laptop.split || total > MIRROR_SPLIT_BYTES)) {
-    chats.forEach((chat, i) => sendToLaptop(deviceId, { ...frame, part: i + 1, of: chats.length, chats: [chat] }));
-  } else {
-    sendToLaptop(deviceId, { ...frame, chats });
+  if (parts.length > 1 && (laptop.split || total > MIRROR_SPLIT_BYTES)) {
+    laptop.transfers += 1;
+    laptop.paced = { transfer: laptop.transfers, frame, parts, next: 0, acked: 0, inFlightBytes: 0, held: [], overflowed: false };
+    sendNextParts(deviceId, laptop);
+    return;
   }
+  sendToLaptop(deviceId, { ...frame, chats: parts.map(p => p.chat) });
+  finishMirrorSnapshot(deviceId);
+}
+
+// As many parts as the window allows. The laptop's acks bring the rest, so a snapshot of any size
+// arrives whole, however long it takes. Frames for this laptop wait in the meantime.
+function sendNextParts(deviceId, laptop) {
+  const paced = laptop.paced;
+  while (paced.next < paced.parts.length) {
+    const { chat, bytes } = paced.parts[paced.next];
+    const inFlight = paced.next - paced.acked;
+    if (inFlight >= MIRROR_PART_WINDOW) return;
+    if (inFlight > 0 && paced.inFlightBytes + bytes > MIRROR_PART_WINDOW_BYTES) return;
+    paced.next += 1;
+    paced.inFlightBytes += bytes;
+    sendToLaptop(deviceId, { ...paced.frame, transfer: paced.transfer, part: paced.next, of: paced.parts.length, chats: [chat] });
+  }
+}
+
+// Only the next part of the current transfer counts, so a laptop can't rush the window open.
+function applyMirrorPartAck(deviceId, frame) {
+  const laptop = mirror.laptops.get(deviceId);
+  const paced = laptop?.paced;
+  if (!paced || frame.transfer !== paced.transfer) return;
+  if (frame.part !== paced.acked + 1 || paced.acked >= paced.next) return;
+  paced.inFlightBytes -= paced.parts[paced.acked].bytes;
+  paced.acked += 1;
+  if (paced.acked < paced.parts.length) {
+    sendNextParts(deviceId, laptop);
+    return;
+  }
+  laptop.paced = null;
+  if (paced.overflowed) {
+    mirror.needsSnapshot.add(deviceId);
+    scheduleMirrorTick(0);
+    return;
+  }
+  for (const held of paced.held) sendToLaptop(deviceId, held);
+  finishMirrorSnapshot(deviceId);
+}
+
+// What follows a snapshot, once all of it has been sent.
+function finishMirrorSnapshot(deviceId) {
   // A chat left out of a snapshot leaves the laptop. It shouldn't just seem to have gone.
   if (mirror.tooLarge.size) window.api.remote.send(deviceId, { type: 'mirror-too-large' }).catch(() => {});
   for (const id of mirror.sent.keys()) {
     if (!mirror.tooLarge.has(id)) sendToLaptop(deviceId, { type: 'mirror-run', chatId: id, running: mirror.sentRunning.has(id) });
   }
+  // After the snapshot, so a chat the words belong to is there for them to go back to.
+  flushReturnedWords(deviceId);
 }
 
 // ---- Watching ----
@@ -7160,10 +7388,12 @@ function homeDeviceStatus(device) {
   if (device.connected === home.connected) return;
   home.connected = device.connected;
   home.awaitingSnapshot = true;
+  home.nextPart = null;
   home.offlineAt = device.connected ? null : Date.now();
   if (device.connected) {
     setTimeout(() => {
-      if (home.connected && home.awaitingSnapshot) requestMirrorSnapshot(device.id, home);
+      // Parts arriving are a snapshot on its way, and asking again would start it over.
+      if (home.connected && home.awaitingSnapshot && !home.nextPart) requestMirrorSnapshot(device.id, home);
     }, MIRROR_SNAPSHOT_GRACE_MS);
   } else {
     // Nothing can say a reply has ended now, and Stop can't reach it. What's on screen stays
@@ -7252,6 +7482,9 @@ function applyMirrorSnapshot(deviceId, home, frame) {
     } catch (e) {
       console.warn('a remote chat could not be applied', e);
     }
+  }
+  if (parted && Number.isSafeInteger(frame.transfer)) {
+    window.api.remote.send(deviceId, { type: 'mirror-part-ack', part: frame.part, transfer: frame.transfer }).catch(() => {});
   }
   if (more) return;
   home.incoming = null;

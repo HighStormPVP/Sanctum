@@ -596,6 +596,287 @@ test('acting from a laptop', async (t) => {
     await waitFor('the chat to stop', async () => !(await isRunning(home, id)), 5000);
   });
 
+  await t.test('the home PC sending at the same moment as two laptops: one order, three matching threads', async () => {
+    const id = await shared();
+    await openChat(home, id);
+    await openOn(laptop, id);
+    await openOn(laptop2, id);
+    const words = ['Typed at home at once', 'Typed on laptop one at once', 'Typed on laptop two at once'];
+    await Promise.all([submit(home, words[0]), submit(laptop, words[1]), submit(laptop2, words[2])]);
+    await threeMatch('all three in the thread', ...words);
+    const history = [];
+    for (let i = 0; i < 3; i++) {
+      const reply = await ollama.next();
+      const sent = reply.body.messages.filter((m) => m.role !== 'system').map((m) => [m.role, m.content]);
+      assert.deepEqual(sent.slice(0, -1), history, 'each turn sees all that came before it');
+      assert.equal(sent.at(-1)[0], 'user');
+      history.push(sent.at(-1));
+      reply.say(`Answer ${i}.`);
+      reply.finish();
+      history.push(['assistant', `Answer ${i}.`]);
+    }
+    assert.deepEqual(history.filter(([role]) => role === 'user').map(([, text]) => text).sort(), [...words].sort());
+    await threeMatch('all three answered', 'Answer 2.');
+    await stopButtonsAre(onLaptop, false, 'all answered');
+    await stopButtonsAre(onLaptop2, false, 'all answered');
+    await chatDataMatches(onLaptop, id);
+    await chatDataMatches(onLaptop2, id);
+  });
+
+  await t.test("a laptop's Stop doesn't destroy what the person at home queued", async () => {
+    const id = await shared();
+    await openChat(home, id);
+    await openOn(laptop, id);
+    await submit(laptop, 'Running');
+    const reply = await ollama.next();
+    reply.say('Partly');
+    await lastMessageIs(laptop, rid(id), 'Partly');
+    await submit(home, 'Queued by the person at home');
+    await threadsMatch(onLaptop, 'the home queue', 'Queued by the person at home', 'msg user queued');
+    assert.equal(await box(home), '');
+
+    await clickStopWhenShowing(laptop);
+    await waitFor('the words back in the home box', async () => (await box(home)) === 'Queued by the person at home', 5000);
+    await toastSays(home, 'back in the message box');
+    await waitFor('the chat to stop', async () => !(await isRunning(home, id)), 5000);
+    assert.equal(await box(laptop), '');
+    await setBox(home, '');
+  });
+
+  await t.test("deleting a chat during a run gives a laptop's queued words back", async () => {
+    const id = await shared();
+    await openChat(home, id);
+    await openOn(laptop, id);
+    await submit(laptop, 'Running');
+    const reply = await ollama.next();
+    reply.say('Partly');
+    await lastMessageIs(laptop, rid(id), 'Partly');
+    await submit(laptop, 'Queued before the delete');
+    await waitFor('it to queue', () => home.page.evaluate((c) => state.chats[c].messages.some((m) => m.queued), id), 5000);
+
+    // The chat leaving the laptop usually beats the end of the aborted run. Here it always does.
+    await home.page.evaluate(() => {
+      window.__realRestore = window.restoreQueuedMessages;
+      window.restoreQueuedMessages = (c) => setTimeout(() => window.__realRestore(c), 800);
+    });
+    await home.page.evaluate((c) => deleteChat(c), id);
+    await waitFor('the chat to leave', async () => !(await hasChat(laptop, rid(id))), 3000);
+    assert.equal(await box(laptop), '', 'not yet');
+    await waitFor('the words to come back', async () => (await box(laptop)) === 'Queued before the delete', 5000);
+    assert.equal(await laptop.page.evaluate(() => document.querySelector('#remote-gone').hidden), false);
+    await home.page.evaluate(() => { window.restoreQueuedMessages = window.__realRestore; });
+    await setBox(laptop, '');
+    await click(laptop, '#remote-gone button');
+  });
+
+  await t.test("a laptop's queued words wait at home while it's offline", async () => {
+    const id = await shared();
+    await openChat(home, id);
+    await openOn(laptop, id);
+    await submit(laptop, 'Running');
+    const reply = await ollama.next();
+    reply.say('Partly');
+    await lastMessageIs(laptop, rid(id), 'Partly');
+    await submit(laptop, 'Queued before going offline');
+    await waitFor('it to queue', () => home.page.evaluate((c) => state.chats[c].messages.some((m) => m.queued), id), 5000);
+
+    const laptopId = (await home.entry()).id;
+    assert.deepEqual(await laptop.remote('setAddress', 'ws://127.0.0.1:9/nowhere-at-all'), { ok: true });
+    await waitFor('home to see it go', async () => (await home.entry(laptopId)).connected === false, 60000);
+
+    await clickStopWhenShowing(home);
+    await waitFor('the chat to stop', async () => !(await isRunning(home, id)), 5000);
+    assert.equal(await home.page.evaluate((c) => state.chats[c].messages.some((m) => m.queued), id), false);
+    assert.equal(await box(home), '', "the home PC's box isn't where they go");
+    assert.equal(await box(laptop), '');
+
+    assert.deepEqual(await laptop.remote('setAddress', trio.relay.address), { ok: true });
+    await waitFor('the laptop to be back', async () => (await laptop.entry()).connected === true, 30000);
+    await waitFor('the words to come back', async () => (await box(laptop)) === 'Queued before going offline', 10000);
+    await toastSays(laptop, 'back in the message box');
+    await setBox(laptop, '');
+    // Once.
+    await sleep(2200);
+    assert.equal(await box(laptop), '');
+    assert.equal(await home.page.evaluate(() => mirror.undelivered.size), 0);
+  });
+
+  await t.test('a send answered after the chat was unshared: refused, and the words come back', async () => {
+    const id = await shared({ title: 'Unshared in flight' });
+    await openChat(home, id);
+    await openOn(laptop, id);
+    await home.page.evaluate(() => {
+      window.__realHandle = window.handleRemoteAction;
+      window.handleRemoteAction = (d, frame) => setTimeout(() => window.__realHandle(d, frame), 500);
+    });
+    await submit(laptop, 'Already on its way');
+    assert.equal(await box(laptop), '');
+    await home.page.evaluate((c) => { state.chats[c].remoteControl = false; markMirrorDirty(); }, id);
+    await waitFor('the chat to leave', async () => !(await hasChat(laptop, rid(id))), 3000);
+    await waitFor('the words to come back', async () => (await box(laptop)) === 'Already on its way', 5000);
+    await toastSays(laptop, 'no longer shared');
+    assert.equal(await laptop.page.evaluate(() => document.querySelector('#remote-gone').hidden), false);
+    assert.ok(!(await readChat(home, id)).includes('Already on its way'));
+    await home.page.evaluate(() => { window.handleRemoteAction = window.__realHandle; });
+    await setBox(laptop, '');
+    await click(laptop, '#remote-gone button');
+  });
+
+  await t.test('a late answer to a send that timed out says it did go through', async () => {
+    const id = await shared({ title: 'Late' });
+    await openChat(home, id);
+    await openOn(laptop, id);
+    const holdFrames = () => home.page.evaluate(() => {
+      window.__realHandle = window.handleRemoteAction;
+      window.handleRemoteAction = (d, frame) => setTimeout(() => window.__realHandle(d, frame), 16500);
+    });
+    const release = () => home.page.evaluate(() => { window.handleRemoteAction = window.__realHandle; });
+
+    // Nothing else has been typed, so what came back goes again.
+    await holdFrames();
+    await submit(laptop, 'Slow but sure');
+    await waitFor('the text back in the box', async () => (await box(laptop)) === 'Slow but sure', 16000);
+    await toastSays(laptop, 'Your message may still arrive.');
+    const first = await ollama.next();
+    assert.equal(first.body.messages.at(-1).content, 'Slow but sure');
+    await waitFor('the box to empty', async () => (await box(laptop)) === '', 3000);
+    await toastSays(laptop, 'Your message did go through');
+    first.finish();
+    await waitFor('the run to end', async () => !(await isRunning(home, id)), 5000);
+
+    // More typed since: it stays, because what's there isn't just what came back.
+    await submit(laptop, 'Slow again');
+    await waitFor('the text back in the box', async () => (await box(laptop)) === 'Slow again', 16000);
+    await setBox(laptop, 'Slow again, and more I typed');
+    const second = await ollama.next();
+    assert.equal(second.body.messages.at(-1).content, 'Slow again');
+    await toastSays(laptop, 'Your message did go through');
+    assert.equal(await box(laptop), 'Slow again, and more I typed');
+    second.finish();
+    await waitFor('the run to end', async () => !(await isRunning(home, id)), 5000);
+    await setBox(laptop, '');
+
+    // A late refusal changes nothing: the words are already back.
+    await home.page.evaluate(() => {
+      window.handleRemoteAction = (d, frame) => setTimeout(() => window.api.remote.send(d, { type: 'action-result', id: frame.id, ok: false, error: 'Too late anyway' }), 16500);
+    });
+    await submit(laptop, 'Refused late');
+    await waitFor('the text back in the box', async () => (await box(laptop)) === 'Refused late', 16000);
+    await sleep(2000);
+    assert.equal(await box(laptop), 'Refused late');
+    await release();
+    await setBox(laptop, '');
+    assert.equal(await laptop.page.evaluate(() => mirror.lateActions.size), 0, 'answered ones are not kept');
+    // And a late answer from some other device counts for nothing.
+    const kept = await laptop.page.evaluate(([from]) => {
+      mirror.lateActions.set('kept-id', { deviceId: from, onLateOk: () => { window.__lateRan = true; }, timer: null });
+      mirrorOnFrame('someone-else', { type: 'action-result', id: 'kept-id', ok: true });
+      const ran = window.__lateRan === true;
+      mirror.lateActions.delete('kept-id');
+      return ran;
+    }, [homeId]);
+    assert.equal(kept, false);
+  });
+
+  await t.test('the home PC keeps a record of what a laptop did, and never what it said', async () => {
+    const auditFile = await home.page.evaluate(() => window.api.audit.path());
+    const entries = () => fs.readFileSync(auditFile, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line));
+    const laptopId = (await home.entry()).id;
+    const id = await agent({ title: 'Audited' });
+    const SECRET_WORDS = 'AUDIT-MUST-NOT-SEE-THESE-WORDS';
+    const SECRET_FILE = 'AUDIT-MUST-NOT-SEE-THIS-FILE';
+    const SECRET_TITLE = 'AUDIT-MUST-NOT-SEE-THIS-TITLE';
+    const before = entries().length;
+
+    assert.equal((await ask(laptop, 'set-mode', id, { mode: 'noApproval' })).ok, true);
+    assert.equal((await ask(laptop, 'set-toggle', id, { name: 'readOnly', value: true })).ok, true);
+    assert.equal((await ask(laptop, 'set-model', id, { model: SECOND_MODEL })).ok, true);
+    assert.equal((await ask(laptop, 'set-folder', id, { path: folder })).ok, true);
+    assert.equal((await ask(laptop, 'rename', id, { title: SECRET_TITLE })).ok, true);
+    assert.equal((await ask(laptop, 'set-model', id, { model: MODEL })).ok, true);
+    assert.equal((await ask(laptop, 'send', id, { text: SECRET_WORDS, attachments: [{ kind: 'text', name: 'a.txt', text: SECRET_FILE, ext: 'txt', size: 28 }] })).ok, true);
+    const reply = await ollama.next();
+    assert.ok(reply.body.messages.at(-1).content.includes(SECRET_WORDS), 'the words did reach the model');
+    reply.finish();
+    assert.equal((await ask(laptop, 'set-mode', privateId, { mode: 'noApproval' })).ok, false);
+    assert.equal((await ask(laptop, 'read-api-keys', id)).ok, false);
+    assert.equal((await ask(laptop, 'delete', id)).ok, true);
+
+    const seen = await waitFor('the record', async () => {
+      const found = entries().slice(before);
+      return found.length >= 10 ? found : null;
+    }, 5000);
+    const of = (kind, ok) => seen.find((e) => e.kind === kind && e.ok === ok);
+    for (const e of seen) {
+      assert.equal(e.device, laptopId);
+      assert.equal(e.source, 'remote-action');
+      assert.ok(e.ts);
+    }
+    assert.equal(of('set-mode', true).chat, id);
+    assert.deepEqual(of('set-mode', true).args, { mode: 'noApproval' });
+    assert.deepEqual(of('set-toggle', true).args, { name: 'readOnly', value: true });
+    assert.deepEqual(of('set-model', true).args, { model: SECOND_MODEL });
+    assert.deepEqual(of('set-folder', true).args, { path: folder });
+    assert.equal(of('delete', true).chat, id);
+    assert.equal(of('set-mode', false).chat, privateId);
+    assert.equal(of('read-api-keys', false).ok, false);
+    assert.deepEqual(of('send', true).args, { attachments: 1 });
+    const text = fs.readFileSync(auditFile, 'utf8');
+    assert.ok(!text.includes(SECRET_WORDS), 'message text');
+    assert.ok(!text.includes(SECRET_FILE), 'attachment contents');
+    assert.ok(!text.includes(SECRET_TITLE), 'a chat title');
+  });
+
+  await t.test("no agent tool reads Sanctum's own data folder, and a laptop can't choose it", async () => {
+    const profile = home.profile;
+    const parent = path.dirname(profile);
+    fs.writeFileSync(path.join(profile, 'profile-canary.txt'), 'PROFILE-CANARY-WORDS');
+
+    const id = await agent({ title: 'Reaching for the profile', projectFolder: undefined, pathAllowlist: [] });
+    for (const kind of ['set-folder', 'list-dir']) {
+      for (const target of [profile, path.join(profile, 'Local Storage'), ...(process.platform === 'win32' ? [profile.toUpperCase()] : [])]) {
+        const answer = await ask(laptop, kind, id, { path: target });
+        assert.equal(answer.ok, false, `${kind} ${target}`);
+        assert.match(answer.error, /Sanctum's own data/, `${kind} ${target}`);
+      }
+    }
+    assert.equal(await field(home, id, 'projectFolder'), undefined);
+
+    // A folder above it is allowed, and a project starts in Plan Mode. Reads there go ahead with
+    // no pop-up, so it's the tools themselves that have to refuse.
+    assert.equal((await ask(laptop, 'set-folder', id, { path: parent })).ok, true);
+    assert.equal(await field(home, id, 'planMode'), true);
+    assert.equal((await ask(laptop, 'send', id, { text: 'Read the profile' })).ok, true);
+    const first = await ollama.next();
+    first.call(['read_file', { path: path.join(profile, 'profile-canary.txt') }], ['list_dir', { path: profile }]);
+    first.finish();
+    const second = await ollama.next();
+    const results = second.body.messages.filter((m) => m.role === 'tool').map((m) => String(m.content));
+    assert.equal(results.length, 2);
+    for (const result of results) assert.match(result, /Sanctum's own data/);
+    assert.ok(!JSON.stringify(second.body).includes('PROFILE-CANARY-WORDS'));
+    assert.ok(!JSON.stringify(second.body).includes('Local Storage'), 'not even the names inside');
+    assert.equal(await home.page.evaluate(() => document.querySelector('#path-expand-overlay').hidden), true, 'and nobody is asked');
+    second.finish();
+    await waitFor('the run to end', async () => !(await isRunning(home, id)), 5000);
+    await home.page.evaluate((c) => deleteChat(c), id);
+  });
+
+  await t.test('a burst of snapshot requests costs about one snapshot a second, and the last still gets answered', async () => {
+    const count = () => laptop.page.evaluate(() => window.__mirrorFrames.filter((f) => f.type === 'mirror-snapshot').length);
+    await sleep(1200);
+    const before = await count();
+    await laptop.page.evaluate((to) => {
+      for (let i = 0; i < 40; i++) window.api.remote.send(to, { type: 'mirror-resync-request' });
+    }, homeId);
+    await sleep(600);
+    assert.ok((await count()) - before <= 1, `${(await count()) - before} snapshots in 600 ms`);
+    await waitFor('the deferred one', async () => (await count()) - before >= 2, 3000);
+    await sleep(1500);
+    assert.ok((await count()) - before <= 2, `${(await count()) - before} snapshots from 40 requests`);
+    assert.equal(await laptop.page.evaluate((h) => mirror.homes.get(h).awaitingSnapshot, homeId), false);
+  });
+
   await t.test('review focus 4: unsharing while the laptop has text in the box', async () => {
     const id = await shared({ title: 'Going away' });
     const stay = await shared({ title: 'Staying' });
@@ -661,10 +942,12 @@ test('acting from a laptop', async (t) => {
     await sleep(14000 - (Date.now() - asked));
     assert.equal(await box(laptop), '', 'not before 15 seconds');
     await waitFor('the text back in the box', async () => (await box(laptop)) === typed, 3000);
-    await toastSays(laptop, "wasn't sent");
+    await toastSays(laptop, 'yet. Your message may still arrive.');
+    assert.ok(!(await toastsOn(laptop)).some((text) => text.includes("wasn't sent")), "it can't say that for sure");
     await home.page.evaluate(() => {
       window.handleRemoteAction = window.__realHandle;
     });
+    await setBox(laptop, '');
 
     // Typed more in the meantime: neither is lost.
     await home.page.evaluate(() => { window.handleRemoteAction = (d, frame) => setTimeout(() => window.api.remote.send(d, { type: 'action-result', id: frame.id, ok: false, error: 'No thanks' }), 400); });
@@ -915,7 +1198,175 @@ test('acting from a laptop', async (t) => {
       deleteChat(b);
     }, [one, two]);
     await waitFor('the snapshot traffic to settle', async () => hasChat(laptop, rid(small)), 5000);
+    await home.page.evaluate((c) => deleteChat(c), small);
+    await waitFor('it to go', async () => !(await hasChat(laptop, rid(small))), 5000);
   });
+
+  await t.test('a chat that grows too large is said out loud to every laptop, and comes back to all of them', async () => {
+    await home.page.evaluate(() => { window.saveToStorage = () => {}; });
+    const laptopIds = await home.remote('status').then((s) => s.devices.map((d) => d.id));
+    assert.equal(laptopIds.length, 2);
+    const grower = await shared({ title: 'Grower' });
+    await openOn(laptop, grower);
+    const lengthOn = (device) => device.page.evaluate((key) => state.chats[key]?.messages.length ?? -1, rid(grower));
+    // Small enough each time that every step goes through as ordinary ops, to both laptops.
+    for (let i = 1; i <= 5; i++) {
+      await home.page.evaluate(([c, text]) => {
+        state.chats[c].messages.push({ role: 'user', content: text, attachments: [] });
+        markMirrorDirty(c);
+      }, [grower, 'g'.repeat(10 * MIB)]);
+      await waitFor(`step ${i} on both`, async () => (await lengthOn(laptop)) === i && (await lengthOn(laptop2)) === i, 30000);
+    }
+    await home.page.evaluate((c) => {
+      state.runningChats.set(c, { channelId: null, abortRequested: false });
+      markMirrorDirty(c);
+    }, grower);
+    await waitFor('Stop on the first laptop', () => stopShowingOn(laptop), 5000);
+
+    // The other laptop asks for a snapshot, and only that shows the chat has outgrown a frame.
+    await laptop.page.evaluate(() => { document.querySelector('#toast-host')?.replaceChildren(); });
+    assert.equal(await laptop2.remote('send', homeId, { type: 'mirror-resync-request' }), true);
+    await toastSays(laptop, 'too large to show', 20000);
+    await toastSays(laptop2, 'too large to show', 20000);
+    await waitFor('it to leave the first laptop', async () => (await lengthOn(laptop)) === -1, 20000);
+    await waitFor('it to leave the second', async () => (await lengthOn(laptop2)) === -1, 20000);
+    assert.equal(await stopShowingOn(laptop), false, "a Stop button can't stick on a chat that's gone");
+
+    // It shrinks, the next snapshot sees it, and everyone gets it back with no hole in it.
+    await home.page.evaluate((c) => {
+      state.runningChats.delete(c);
+      state.chats[c].messages.length = 1;
+      state.chats[c].messages.push({ role: 'user', content: 'After it shrank', attachments: [] });
+      markMirrorDirty(c);
+    }, grower);
+    await sleep(1200);
+    assert.equal(await laptop2.remote('send', homeId, { type: 'mirror-resync-request' }), true);
+    await waitFor('it back on the first laptop', async () => (await lengthOn(laptop)) === 2, 30000);
+    await waitFor('it back on the second', async () => (await lengthOn(laptop2)) === 2, 30000);
+    await home.page.evaluate((c) => {
+      state.chats[c].messages.push({ role: 'user', content: 'Ops flow again', attachments: [] });
+      markMirrorDirty(c);
+    }, grower);
+    await lastMessageIs(laptop, rid(grower), 'Ops flow again');
+    await lastMessageIs(laptop2, rid(grower), 'Ops flow again');
+    await home.page.evaluate((c) => deleteChat(c), grower);
+    await waitFor('it to go', async () => (await lengthOn(laptop)) === -1 && (await lengthOn(laptop2)) === -1, 5000);
+  });
+
+  await t.test('a snapshot over 64 MiB arrives whole, at the pace of the laptop, with the session up throughout', async () => {
+    await home.page.evaluate(() => { window.saveToStorage = () => {}; });
+    const forget = (device) => device.page.evaluate(() => { window.__mirrorFrames.length = 0; });
+    const chats = [];
+    for (let i = 0; i < 3; i++) {
+      const id = await shared({ title: `Huge ${i}` });
+      chats.push(id);
+      await home.page.evaluate(([c, text]) => {
+        state.chats[c].messages.push({ role: 'user', content: text, attachments: [] });
+        markMirrorDirty(c);
+      }, [id, `H${i}` + 'h'.repeat(24 * MIB)]);
+      await waitFor(`huge chat ${i}`, async () => laptop.page.evaluate(([key, want]) => state.chats[key]?.messages[0]?.content?.length === want, [rid(id), 2 + 24 * MIB]), 60000);
+      await waitFor(`huge chat ${i} on the other`, async () => laptop2.page.evaluate(([key, want]) => state.chats[key]?.messages[0]?.content?.length === want, [rid(id), 2 + 24 * MIB]), 60000);
+    }
+
+    const whole = (device) => device.page.evaluate(([ids, want]) => ids.every((key) => state.chats[key]?.messages[0]?.content?.length === want), [chats.map(rid), 2 + 24 * MIB]);
+    const partsOf = (device) => device.page.evaluate(() => window.__mirrorFrames.filter((f) => f.type === 'mirror-snapshot' && f.part).map((f) => ({ part: f.part, of: f.of, seq: f.seq })));
+    const quietFor = async (device, ms) => {
+      await device.page.evaluate(() => { window.__statuses.length = 0; });
+      await sleep(ms);
+    };
+
+    await forget(laptop);
+    await quietFor(laptop, 1200);
+    assert.equal(await laptop.remote('send', homeId, { type: 'mirror-resync-request' }), true);
+    // Something happens to a chat during the transfer. It has to wait, and arrive after.
+    await waitFor('the first part', async () => (await partsOf(laptop)).length >= 1, 60000);
+    await home.page.evaluate((c) => {
+      state.chats[c].messages.push({ role: 'user', content: 'Said during the snapshot', attachments: [] });
+      markMirrorDirty(c);
+    }, chats[0]);
+    await waitFor('every part', async () => {
+      const parts = await partsOf(laptop);
+      return parts.length >= 3 && parts.length === parts[0].of;
+    }, 120000);
+    const parts = await partsOf(laptop);
+    assert.deepEqual(parts.map((p) => p.part), parts.map((_, i) => i + 1));
+    assert.ok(parts.every((p, i) => i === 0 || p.seq === parts[i - 1].seq + 1), 'no gap between the parts');
+    await lastMessageIs(laptop, rid(chats[0]), 'Said during the snapshot');
+    assert.equal(await whole(laptop), true);
+    await home.page.evaluate(([c]) => {
+      state.chats[c].messages.length = 1;
+      markMirrorDirty(c);
+    }, [chats[0]]);
+    const gone = await laptop.page.evaluate(() => window.__statuses.filter((s) => s.devices?.some((d) => d.connected === false)).length);
+    assert.equal(gone, 0, 'the session stayed up');
+    assert.equal(await laptop.page.evaluate((h) => mirror.homes.get(h).awaitingSnapshot, homeId), false);
+    const acked = await home.page.evaluate(() => window.__mirrorFrames.filter((f) => f.type === 'mirror-part-ack').length);
+    assert.ok(acked >= parts.length, 'the laptop acknowledged each part');
+    await waitFor('home to finish', () => home.page.evaluate(() => [...mirror.laptops.values()].every((l) => !l.paced)), 5000);
+
+    // The laptop going away mid-transfer stops it, and coming back gets all of it.
+    await forget(laptop);
+    await sleep(1200);
+    assert.equal(await laptop.remote('send', homeId, { type: 'mirror-resync-request' }), true);
+    await waitFor('the first part again', async () => (await partsOf(laptop)).length >= 1, 60000);
+    assert.deepEqual(await laptop.remote('setAddress', 'ws://127.0.0.1:9/nowhere-at-all'), { ok: true });
+    await waitFor('the laptop to be offline', async () => (await laptop.entry()).connected === false, 15000);
+    assert.deepEqual(await laptop.remote('setAddress', trio.relay.address), { ok: true });
+    await waitFor('the laptop to be back', async () => (await laptop.entry()).connected === true, 30000);
+    await waitFor('whole again', async () => (await whole(laptop)) && !(await laptop.page.evaluate((h) => mirror.homes.get(h).awaitingSnapshot, homeId)), 120000);
+
+    await home.page.evaluate((ids) => { for (const c of ids) deleteChat(c); }, chats);
+    await waitFor('them to go', async () => !(await hasChat(laptop, rid(chats[0]))), 15000);
+  });
+});
+
+test("Sanctum's own data folder is closed to the agent's file tools, wherever they start from", async (t) => {
+  const ollama = await startScriptedOllama();
+  const tree = fs.mkdtempSync(path.join(os.tmpdir(), 'sanctum-e2e-tree-'));
+  const profile = path.join(tree, 'nested', 'profile');
+  fs.mkdirSync(profile, { recursive: true });
+  const device = await launchDevice('profile', { ollamaUrl: ollama.url, profile });
+  t.after(async () => {
+    await device.stop();
+    await ollama.stop();
+    fs.rmSync(tree, { recursive: true, force: true });
+  });
+  await started(device);
+  const canary = 'TOOLS-CANARY-WORDS';
+  fs.writeFileSync(path.join(profile, 'in-the-profile.txt'), canary);
+  fs.writeFileSync(path.join(tree, 'nested', 'beside.txt'), canary);
+  const inside = path.join(profile, 'in-the-profile.txt');
+  const allow = [tree];
+
+  const results = await device.page.evaluate(async ([file, dir, root, allowed]) => ({
+    read: await window.api.fs.readFile(file, allowed),
+    list: await window.api.fs.listDir(dir, allowed),
+    upper: await window.api.fs.readFile(file.toUpperCase(), allowed),
+    dots: await window.api.fs.readFile(`${dir}\\..\\profile\\in-the-profile.txt`, allowed),
+    glob: await window.api.fs.glob('**/*.txt', root, allowed),
+    globInside: await window.api.fs.glob('*', dir, allowed),
+    grep: await window.api.fs.grep('TOOLS-CANARY', root, { allowlist: allowed }),
+    grepInside: await window.api.fs.grep('TOOLS-CANARY', dir, { allowlist: allowed }),
+    patch: await window.api.fs.applyPatch(file, 'TOOLS', 'x', allowed),
+    // Outside the allowlist is refused the same way, and doesn't offer a pop-up to widen it.
+    unlisted: await window.api.fs.readFile(file, [])
+  }), [inside, profile, tree, allow]);
+
+  for (const key of ['read', 'list', 'globInside', 'grepInside', 'patch', 'unlisted']) {
+    assert.match(results[key].error ?? '', /Sanctum's own data/, key);
+    assert.doesNotMatch(results[key].error, /outside (the )?allowed roots/, key);
+  }
+  if (process.platform === 'win32') {
+    assert.match(results.upper.error ?? '', /Sanctum's own data/);
+    assert.match(results.dots.error ?? '', /Sanctum's own data/);
+  }
+  assert.equal(fs.readFileSync(inside, 'utf8'), canary, 'and nothing changed');
+  // From above it, a search finds what's beside it and nothing in it.
+  assert.deepEqual(results.glob.matches.sort(), ['nested/beside.txt']);
+  assert.deepEqual(results.grep.matches.map((m) => m.file), ['nested/beside.txt']);
+  // The list of a parent names the folder, as any listing would, and nothing in it.
+  const parent = await device.page.evaluate(async ([dir, allowed]) => window.api.fs.listDir(dir, allowed), [path.join(tree, 'nested'), allow]);
+  assert.deepEqual(parent.entries.map((e) => e.name).sort(), ['beside.txt', 'profile']);
 });
 
 test('parts of a snapshot from a hostile home change nothing they should not', async (t) => {
@@ -953,9 +1404,13 @@ test('parts of a snapshot from a hostile home change nothing they should not', a
     // A hostile answer to nothing.
     mirrorOnFrame(HOME, { type: 'action-result', id: 'nobody-asked', ok: true });
     mirrorOnFrame(HOME, { type: 'action-result', id: { evil: 1 }, ok: true });
-    mirrorOnFrame(HOME, { type: 'queued-returned', chatId: 'not-a-chat', text: 'pushed' });
-    mirrorOnFrame(HOME, { type: 'queued-returned', chatId: 'a', text: 7 });
-    mirrorOnFrame('someone-else', { type: 'queued-returned', chatId: 'a', text: 'from a stranger' });
+    mirrorOnFrame(HOME, { type: 'queued-returned', id: 'w1', chatId: 'a', text: 7 });
+    mirrorOnFrame(HOME, { type: 'queued-returned', id: 'w2', chatId: 7, text: 'no chat id' });
+    mirrorOnFrame(HOME, { type: 'queued-returned', chatId: 'a', text: 'no id' });
+    mirrorOnFrame(HOME, { type: 'queued-returned', id: { evil: 1 }, chatId: 'a', text: 'bad id' });
+    mirrorOnFrame(HOME, { type: 'queued-returned-ack', id: 'w1' });
+    mirrorOnFrame(HOME, { type: 'mirror-part-ack', part: 1, transfer: 1 });
+    mirrorOnFrame('someone-else', { type: 'queued-returned', id: 'w3', chatId: 'a', text: 'from a stranger' });
     mirrorOnFrame('someone-else', { type: 'mirror-too-large' });
     out.box = document.querySelector('#composer-input').value;
     // An action from a device that isn't a laptop of this one.
@@ -963,7 +1418,14 @@ test('parts of a snapshot from a hostile home change nothing they should not', a
     mirrorOnFrame(HOME, { type: 'action', id: 'x', chatId: `remote:${HOME}:a`, kind: 'rename', args: { title: 'Taken' } });
     mirrorOnFrame('someone-else', { type: 'action', id: 'x', chatId: `remote:${HOME}:a`, kind: 'rename', args: { title: 'Taken' } });
     out.title = state.chats[`remote:${HOME}:a`].title === before;
+    // Words for a chat that has gone end up in the box, with the notice. There's nowhere else.
+    mirrorOnFrame(HOME, { type: 'queued-returned', id: 'w4', chatId: 'gone-now', text: 'words for a gone chat' });
+    out.orphan = document.querySelector('#composer-input').value;
+    out.notice = !document.querySelector('#remote-gone').hidden;
+    // Sent again until acknowledged, so a second copy changes nothing.
+    mirrorOnFrame(HOME, { type: 'queued-returned', id: 'w4', chatId: 'gone-now', text: 'words for a gone chat' });
+    out.once = document.querySelector('#composer-input').value;
     return out;
   });
-  assert.deepEqual(result, { whole: true, partOneKeepsB: true, lastPartDropsB: true, outOfOrder: true, nonsense: true, box: '', title: true });
+  assert.deepEqual(result, { whole: true, partOneKeepsB: true, lastPartDropsB: true, outOfOrder: true, nonsense: true, box: '', title: true, orphan: 'words for a gone chat', notice: true, once: 'words for a gone chat' });
 });

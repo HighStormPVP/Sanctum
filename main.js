@@ -5,7 +5,7 @@ const crypto = require('crypto');
 const os = require('os');
 const { exec, spawn } = require('child_process');
 const { McpManager } = require('./lib/mcp-manager');
-const { isWithinRoots, applyExactPatch, globToRegex, walkFiles } = require('./lib/fs-rules');
+const { isWithinRoots, isInProfile, applyExactPatch, globToRegex, walkFiles } = require('./lib/fs-rules');
 const { safeFetchText, isAppPage } = require('./lib/url-rules');
 const { grepInWorker } = require('./lib/grep-runner');
 const { detectRepetitionLoop, splitOutputLines, quoteWindowsArg, encodePowerShell } = require('./lib/text-rules');
@@ -2619,10 +2619,17 @@ function withinAllowlist(filePath, allowlist) {
   return isWithinRoots(filePath, (allowlist || []).map(resolveSafe).filter(Boolean));
 }
 
+// The agent's reads stop here, before the allowlist, so being refused can't offer a pop-up to
+// widen it. A folder above the profile is fine: a walk goes around it. Sanctum's own code reads
+// this folder with fs directly, not through these handlers. run_command isn't limited by this.
+const inProfile = (fp) => isInProfile(fp, app.getPath('userData'));
+const PROFILE_REFUSAL = { error: "That is inside Sanctum's own data folder, which the agent's file tools can't open.", inProfile: true };
+
 ipcMain.handle('fs:read_file', async (_e, requestedPath, allowlist) => {
   try {
     const fp = resolveSafe(requestedPath);
     if (!fp) return { error: 'path required' };
+    if (inProfile(fp)) return PROFILE_REFUSAL;
     if (!withinAllowlist(fp, allowlist)) return { error: `path "${requestedPath}" is outside the allowed roots: ${(allowlist || []).join(', ')}` };
     if (!fs.existsSync(fp)) return { error: 'file not found' };
     const stat = fs.statSync(fp);
@@ -2637,6 +2644,7 @@ ipcMain.handle('fs:list_dir', async (_e, requestedPath, allowlist) => {
   try {
     const fp = resolveSafe(requestedPath);
     if (!fp) return { error: 'path required' };
+    if (inProfile(fp)) return PROFILE_REFUSAL;
     if (!withinAllowlist(fp, allowlist)) return { error: `path "${requestedPath}" is outside the allowed roots: ${(allowlist || []).join(', ')}` };
     if (!fs.existsSync(fp)) return { error: 'directory not found' };
     const stat = fs.statSync(fp);
@@ -2667,6 +2675,7 @@ ipcMain.handle('fs:apply_patch', async (_e, { path: p, find, replace, allowlist 
   try {
     const fp = resolveSafe(p);
     if (!fp) return { error: 'path required' };
+    if (inProfile(fp)) return PROFILE_REFUSAL;
     if (!withinAllowlist(fp, allowlist)) return { error: `path "${p}" is outside the allowed roots: ${(allowlist || []).join(', ')}` };
     if (typeof find !== 'string' || !find.length) return { error: 'find string required' };
     if (!fs.existsSync(fp)) return { error: 'file not found' };
@@ -2707,10 +2716,11 @@ ipcMain.handle('fs:glob', async (_e, { pattern, root, allowlist }) => {
   try {
     const r = resolveSafe(root || os.homedir());
     if (!r) return { error: 'root required' };
+    if (inProfile(r)) return PROFILE_REFUSAL;
     if (!withinAllowlist(r, allowlist)) return { error: 'root outside allowed roots' };
     if (!pattern || typeof pattern !== 'string') return { error: 'pattern required' };
     const re = globToRegex(pattern);
-    const all = walkFiles(r);
+    const all = walkFiles(r, { skipDir: inProfile });
     const matches = [];
     for (const f of all) {
       const rel = path.relative(r, f).replace(/\\/g, '/');
@@ -2724,9 +2734,10 @@ ipcMain.handle('fs:grep', async (_e, { pattern, root, glob: globFilter, caseInse
   try {
     const r = resolveSafe(root || os.homedir());
     if (!r) return { error: 'root required' };
+    if (inProfile(r)) return PROFILE_REFUSAL;
     if (!withinAllowlist(r, allowlist)) return { error: 'root outside allowed roots' };
     if (!pattern || typeof pattern !== 'string') return { error: 'pattern required' };
-    return await grepInWorker({ pattern, root: r, globFilter, caseInsensitive });
+    return await grepInWorker({ pattern, root: r, globFilter, caseInsensitive, skipDir: inProfile });
   } catch (e) { return { error: e.message }; }
 });
 

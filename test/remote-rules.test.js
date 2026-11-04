@@ -205,9 +205,7 @@ test('an attachment field of the wrong type refuses the frame', () => {
     { kind: 'image', name: 'a', base64: 'AAAA', size: -1 },
     { kind: 'image', name: 'a', base64: 'AAAA', size: 'big' },
     { kind: 'image', name: 'a', base64: 'AAAA', size: Infinity },
-    { kind: 'file', name: 'a', ext: '<b>' },
-    { kind: 'file', name: 'a', ext: 7 },
-    { kind: 'file', name: 'a', ext: 'e'.repeat(33) }
+    { kind: 'file', name: 'a', ext: 7 }
   ];
   for (const attachment of cases) {
     assert.equal(isAllowedAction(action('send', { text: 'x', attachments: [attachment] })), false, JSON.stringify(attachment));
@@ -261,6 +259,33 @@ test('a message is limited to 25 MiB, counting every attachment and the text', (
   assert.equal(isAllowedAction(action('send', { text: 'x', attachments: [image(24 * MIB)] })), true);
   assert.equal(isAllowedAction(action('send', { text: 'x', attachments: [image(30 * MIB)] })), false);
   assert.equal(isAllowedAction(action('send', { text: 'x'.repeat(26 * MIB) })), false);
+});
+
+test('an empty base64 is no way past the limit: both fields count', () => {
+  const big = 'x'.repeat(40 * MIB);
+  for (const attachment of [
+    { kind: 'text', name: 'a', text: big, base64: '' },
+    { kind: 'pdf', name: 'a', text: big, base64: '', pages: 1 },
+    { kind: 'text', name: 'a', text: '', base64: 'A'.repeat(40 * MIB) }
+  ]) {
+    assert.equal(attachmentProblem([attachment]), TOO_LARGE, attachment.kind);
+    assert.equal(isAllowedAction(action('send', { text: 'x', attachments: [attachment] })), false, attachment.kind);
+  }
+  // Each alone is under the limit, and together they aren't.
+  const half = { kind: 'text', name: 'a', text: 'x'.repeat(13 * MIB), base64: 'A'.repeat(18 * MIB) };
+  assert.equal(attachmentProblem([half]), TOO_LARGE);
+});
+
+test("an extension that doesn't fit is dropped, and the file still goes", () => {
+  for (const ext of ['c++', '日本語', 'has space', '<b>', 'e'.repeat(33)]) {
+    const att = { kind: 'file', name: `a.${ext}`, ext, size: 3 };
+    assert.equal(isAllowedAction(action('send', { text: 'x', attachments: [att] })), true, ext);
+    assert.deepEqual(cleanAttachment(att), { kind: 'file', name: `a.${ext}`, size: 3 }, ext);
+    const asText = { kind: 'text', name: `a.${ext}`, text: 'body', ext };
+    assert.deepEqual(cleanAttachment(asText), { kind: 'text', name: `a.${ext}`, text: 'body' }, ext);
+  }
+  assert.deepEqual(cleanAttachment({ kind: 'file', name: 'a.zip', ext: 'zip' }), { kind: 'file', name: 'a.zip', ext: 'zip' });
+  assert.deepEqual(cleanAttachment({ kind: 'file', name: 'a', ext: '' }), { kind: 'file', name: 'a', ext: '' });
 });
 
 test('a video is refused, in the exact words', () => {
