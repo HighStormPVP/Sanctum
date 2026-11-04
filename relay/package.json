@@ -1,0 +1,13 @@
+{
+  "name": "sanctum-relay",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Sanctum Remote Control relay: a Cloudflare Worker that passes encrypted frames between the owner's devices.",
+  "type": "module",
+  "scripts": {
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}

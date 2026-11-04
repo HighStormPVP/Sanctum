@@ -7,6 +7,7 @@
   "scripts": {
     "start": "node launch.js",
     "test": "node --test test/",
+    "test:relay": "node --test relay/test/",
     "dev": "node launch.js --enable-logging",
     "dist": "electron-builder",
     "dist:mac": "electron-builder --mac",
@@ -17,7 +18,8 @@
   "license": "MIT",
   "devDependencies": {
     "electron": "^33.0.0",
-    "electron-builder": "^25.1.8"
+    "electron-builder": "^25.1.8",
+    "miniflare": "^4.20260730.0"
   },
   "dependencies": {
     "@noble/ciphers": "1.3.0",

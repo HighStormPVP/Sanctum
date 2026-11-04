@@ -1,0 +1,22 @@
+# Remote Control relay. One owner, one Worker. Deploying is a separate, approved
+# step: this file names no account, route, or secret. ACCESS_SECRET is set with
+# `wrangler secret put ACCESS_SECRET` at deploy time and never lives in the repo.
+name = "sanctum-relay"
+main = "src/index.js"
+
+# Ed25519 in WebCrypto and the Durable Object RPC used by Mailbox both need a
+# recent date. Anything this old or newer works; the tests read this value, so
+# they run against the same date the Worker deploys with.
+compatibility_date = "2026-07-01"
+
+[[durable_objects.bindings]]
+name = "MAILBOX"
+class_name = "Mailbox"
+
+[[durable_objects.bindings]]
+name = "PAIRING_SLOT"
+class_name = "PairingSlot"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Mailbox", "PairingSlot"]
