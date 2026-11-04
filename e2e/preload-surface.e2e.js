@@ -1,6 +1,7 @@
 // What the renderer gets from Remote Control, checked in the real app, and that nothing else
 // can use it: the methods on window.api.remote, what status() gives away, that a peer's
-// frame can't reach the control switch, and that isLocalUi turns away the hidden window.
+// frame can't reach the control switch. And that the hidden window, the one renderer handling
+// what peers and the network send, gets nothing: no IPC, no shared storage, no broadcasts.
 //
 //   node e2e/preload-surface.e2e.js
 const test = require('node:test');
@@ -9,6 +10,9 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { startPair, waitFor, sleep, SECRET, PIN, TRANSPORT_PAGE } = require('./harness.js');
+
+const PARTITION = 'remote-transport';
+const REFUSED = /can only be used from this app's own window/;
 
 const REMOTE_METHODS = [
   'cancelCode', 'createCode', 'lock', 'onFrame', 'onStatus', 'pair', 'removeDevice',
@@ -71,62 +75,213 @@ test('the preload surface', async (t) => {
     assert.deepEqual(await home.frames(), [{ type: 'after' }]);
   });
 
-  await t.test("isLocalUi refuses IPC from the hidden window, and every remote: channel goes through it", async () => {
-    await home.transport();
-    // A real ipcRenderer in the real hidden window, which its page can't otherwise get to,
-    // through a preload only this test adds. It goes in before the page reloads.
+  await t.test('the hidden window is cut off from everything else', async (s) => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sanctum-e2e-preload-'));
     t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    await home.transport();
+
+    // A real ipcRenderer in each real window, which their pages can't otherwise get to, through
+    // a preload only this test adds. Each window's session gets it, and each page loads again.
     const probe = path.join(dir, 'probe.js');
     fs.writeFileSync(probe, `
       const { contextBridge, ipcRenderer } = require('electron');
-      if (location.href.includes(${JSON.stringify(TRANSPORT_PAGE)})) {
-        contextBridge.exposeInMainWorld('__probe', {
-          invoke: (channel, args) => ipcRenderer.invoke(channel, args).then(
-            (value) => ({ ok: true, value }),
-            (err) => ({ ok: false, message: String(err && err.message) })
-          )
-        });
+      const received = [];
+      for (const channel of ['mcp:updated', 'system:freeze-abort']) {
+        ipcRenderer.on(channel, (_e, payload) => received.push({ channel, payload }));
       }
+      contextBridge.exposeInMainWorld('__probe', {
+        invoke: (channel, args) => ipcRenderer.invoke(channel, args).then(
+          (value) => ({ ok: true, value }),
+          (err) => ({ ok: false, message: String(err && err.message) })
+        ),
+        send: (channel) => ipcRenderer.send(channel),
+        received: () => JSON.parse(JSON.stringify(received))
+      });
     `);
-    await home.app.evaluate(({ BrowserWindow, session }, [file, page]) => {
+    await home.app.evaluate(({ BrowserWindow, session }, [file, partition]) => {
       session.defaultSession.setPreloads([file]);
-      BrowserWindow.getAllWindows().find((w) => w.webContents.getURL().includes(page)).webContents.reload();
-    }, [probe, TRANSPORT_PAGE]);
-    const hidden = await waitFor('the probe', async () => {
-      const page = home.app.windows().find((w) => w.url().includes(TRANSPORT_PAGE));
-      try {
-        return page && (await page.evaluate(() => Boolean(window.__probe))) ? page : null;
-      } catch {
-        return null; // mid-reload
+      session.fromPartition(partition).setPreloads([file]);
+      for (const win of BrowserWindow.getAllWindows()) win.webContents.reload();
+    }, [probe, PARTITION]);
+
+    const probed = (find) =>
+      waitFor('the probe', async () => {
+        const page = find();
+        try {
+          return page && (await page.evaluate(() => Boolean(window.__probe && window.api !== null))) ? page : null;
+        } catch {
+          return null; // mid-reload
+        }
+      });
+    const hidden = await probed(() => home.app.windows().find((w) => w.url().includes(TRANSPORT_PAGE)));
+    await probed(() => home.page);
+    await waitFor('window.api after the reload', () => home.page.evaluate(() => Boolean(window.api?.remote)));
+    await home.record();
+    const fromHidden = (channel, args) => hidden.evaluate(([c, a]) => window.__probe.invoke(c, a), [channel, args]);
+    const fromMain = (channel, args) => home.page.evaluate(([c, a]) => window.__probe.invoke(c, a), [channel, args]);
+    const fromHiddenReceived = () => hidden.evaluate(() => window.__probe.received());
+
+    await s.test('isLocalUi refuses it on every remote: channel', async () => {
+      const calls = [
+        ['remote:status', {}],
+        ['remote:setAddress', { url: '' }],
+        ['remote:setPin', { pin: '654321' }],
+        ['remote:unlock', { pin: PIN }],
+        ['remote:lock', {}],
+        ['remote:createCode', {}],
+        ['remote:cancelCode', {}],
+        ['remote:pair', { code: 'ABC', name: 'x', pin: PIN }],
+        ['remote:removeDevice', { id: laptopId }],
+        ['remote:setControlAllowed', { allowed: true }],
+        ['remote:send', { deviceId: laptopId, frame: { type: 'from-hidden' } }]
+      ];
+      for (const [channel, args] of calls) {
+        const answer = await fromHidden(channel, args);
+        assert.equal(answer.ok, false, `${channel} answered the hidden window`);
+        assert.match(answer.message, REFUSED, channel);
       }
+      const status = await home.remote('status');
+      assert.equal(status.controlAllowed, false);
+      assert.equal(status.devices.length, 1);
+      await sleep(500);
+      assert.ok(!(await laptop.frames()).some((f) => f.type === 'from-hidden'));
     });
 
-    const calls = [
-      ['remote:status', {}],
-      ['remote:setAddress', { url: '' }],
-      ['remote:setPin', { pin: '654321' }],
-      ['remote:unlock', { pin: PIN }],
-      ['remote:lock', {}],
-      ['remote:createCode', {}],
-      ['remote:cancelCode', {}],
-      ['remote:pair', { code: 'ABC', name: 'x', pin: PIN }],
-      ['remote:removeDevice', { id: laptopId }],
-      ['remote:setControlAllowed', { allowed: true }],
-      ['remote:send', { deviceId: laptopId, frame: { type: 'from-hidden' } }]
-    ];
-    for (const [channel, args] of calls) {
-      const answer = await hidden.evaluate(([c, a]) => window.__probe.invoke(c, a), [channel, args]);
-      assert.equal(answer.ok, false, `${channel} answered the hidden window`);
-      assert.match(answer.message, /can only be used from this app's own window/, channel);
-    }
+    await s.test('a raw shell:run from it is refused and runs nothing, and the main window can still run one', async () => {
+      const marker = path.join(dir, 'ran.txt');
+      const command = 'echo ran > ran.txt';
+      const refused = await fromHidden('shell:run', { command, cwd: dir });
+      assert.equal(refused.ok, false, JSON.stringify(refused));
+      assert.match(refused.message, REFUSED);
+      await sleep(1000);
+      assert.equal(fs.existsSync(marker), false, 'the command ran');
 
-    // None of that did anything, and the same call from the real window is fine.
-    const status = await home.remote('status');
-    assert.equal(status.controlAllowed, false);
-    assert.equal(status.devices.length, 1);
-    await sleep(500);
-    assert.ok(!(await laptop.frames()).some((f) => f.type === 'from-hidden'));
-    await home.app.evaluate(({ session }) => session.defaultSession.setPreloads([]));
+      const ran = await home.page.evaluate(([c, d]) => window.api.shell.run(c, d), [command, dir]);
+      assert.equal(ran.exitCode, 0, JSON.stringify(ran));
+      assert.equal(fs.existsSync(marker), true);
+    });
+
+    await s.test('every registered channel refuses it, and nothing registered can be missed', async () => {
+      const { handlers, listeners } = await home.app.evaluate(({ ipcMain }) => ({
+        handlers: [...ipcMain._invokeHandlers.keys()],
+        listeners: ipcMain.eventNames().filter((name) => typeof name === 'string')
+      }));
+      assert.ok(handlers.length >= 50, `only ${handlers.length} handlers found: did the registry move?`);
+
+      // What the source registers has to be in that registry, so reading it can't miss any.
+      const source = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
+      const named = [...source.matchAll(/\b(?:ipcMain\.handle|handleRemote)\(\s*'([^']+)'/g)].map((m) => m[1]);
+      assert.ok(named.length >= 50);
+      for (const channel of named) assert.ok(handlers.includes(channel), `${channel} isn't registered`);
+      const registrations = [...source.matchAll(/\bipcMain\.(handle|handleOnce|on|once|addListener|prependListener|prependOnceListener)\(/g)];
+      assert.equal(registrations.length, named.filter((c) => !c.startsWith('remote:')).length + 1, 'a registration this test cannot read the name of');
+
+      for (const channel of handlers) {
+        const answer = await fromHidden(channel, undefined);
+        assert.equal(answer.ok, false, `${channel} answered the hidden window: ${JSON.stringify(answer)}`);
+        assert.match(answer.message, REFUSED, channel);
+      }
+      // Electron's own no-op on 'error' is always there. Anything else is new, and this test
+      // should send it something too. The next test shows every way of adding one is guarded.
+      const added = listeners.filter((name) => name !== 'error');
+      assert.deepEqual(added, [], `a listener on ipcMain, check this test covers it: ${added}`);
+    });
+
+    await s.test('anything registered later is guarded too, however it registers', async () => {
+      await home.app.evaluate(({ ipcMain }) => {
+        globalThis.__hits = [];
+        const hit = (name) => () => {
+          globalThis.__hits.push(name);
+          return name;
+        };
+        for (const method of ['on', 'once', 'addListener', 'prependListener', 'prependOnceListener']) ipcMain[method](`e2e:${method}`, hit(method));
+        for (const method of ['handle', 'handleOnce']) ipcMain[method](`e2e:${method}`, hit(method));
+      });
+      const hits = () => home.app.evaluate(() => globalThis.__hits);
+      const listeners = ['on', 'once', 'addListener', 'prependListener', 'prependOnceListener'];
+
+      for (const method of listeners) await hidden.evaluate((c) => window.__probe.send(c), `e2e:${method}`);
+      for (const method of ['handle', 'handleOnce']) {
+        const answer = await fromHidden(`e2e:${method}`);
+        assert.equal(answer.ok, false, method);
+        assert.match(answer.message, REFUSED);
+      }
+      await sleep(300);
+      assert.deepEqual(await hits(), []);
+
+      // And they do work, so what stopped them above was the sender.
+      for (const method of listeners) await home.page.evaluate((c) => window.__probe.send(c), `e2e:${method}`);
+      for (const method of ['handle', 'handleOnce']) assert.deepEqual(await fromMain(`e2e:${method}`), { ok: true, value: method });
+      await waitFor('the listeners', async () => (await hits()).length === listeners.length + 2);
+    });
+
+    await s.test("it can't read the main window's storage, and is in a session of its own", async () => {
+      await home.page.evaluate(() => localStorage.setItem('e2e-only-in-main', 'visible'));
+      const main = await home.page.evaluate(() => Object.keys(localStorage));
+      assert.ok(main.includes('e2e-only-in-main'));
+      assert.ok(main.includes('localai.settings.v1') || main.includes('localai.state.v1'), `main window's keys: ${main}`);
+
+      const seen = await hidden.evaluate(() => ({
+        keys: Object.keys(localStorage),
+        value: localStorage.getItem('e2e-only-in-main'),
+        state: localStorage.getItem('localai.state.v1'),
+        settings: localStorage.getItem('localai.settings.v1')
+      }));
+      assert.deepEqual(seen, { keys: [], value: null, state: null, settings: null });
+
+      // Going the other way, too.
+      await hidden.evaluate(() => localStorage.setItem('e2e-only-in-hidden', 'visible'));
+      assert.equal(await home.page.evaluate(() => localStorage.getItem('e2e-only-in-hidden')), null);
+      assert.deepEqual(await home.hiddenWindowFacts(), {
+        visible: false, contextIsolation: true, sandbox: true, nodeIntegration: false, ownSession: true, sessionPersists: false
+      });
+    });
+
+    await s.test('it gets no MCP update, which holds tokens, and the main window does', async () => {
+      await home.page.evaluate(() => {
+        window.__mcp = [];
+        window.api.mcp.onUpdate((servers) => window.__mcp.push(servers));
+      });
+      const token = 'e2e-mcp-token-that-stays-in-the-main-window';
+      // A command that doesn't exist, so nothing runs. It still announces the change.
+      await home.page.evaluate(
+        ([value]) => window.api.mcp.add('e2e-probe', { command: 'sanctum-e2e-no-such-command', args: [], env: { TOKEN: value } }).catch(() => {}),
+        [token]
+      );
+      await waitFor('the update', () => home.page.evaluate((value) => window.__mcp.some((servers) => JSON.stringify(servers).includes(value)), token));
+      await sleep(300);
+      assert.deepEqual(await fromHiddenReceived(), []);
+      await home.page.evaluate(() => window.api.mcp.remove('e2e-probe').catch(() => {}));
+    });
+
+    await s.test('it gets no freeze-abort notice, and the main window does', async () => {
+      await home.page.evaluate(async () => {
+        window.__freeze = [];
+        window.api.watchdog.onFreezeAbort((payload) => window.__freeze.push(payload));
+        await window.api.watchdog.config({ enabled: true, tripMs: 5000 });
+        // Local as far as the watchdog knows. The fake Ollama never answers it.
+        window.api.ollama.chat({ model: 'e2e-fake-model', messages: [] }, () => {}).catch(() => {});
+      });
+      await waitFor('the chat to be under way', () => pair.ollama.chats() > 0);
+      // The freeze itself: this process doing nothing else for longer than the limit.
+      await home.app.evaluate(() => {
+        const until = Date.now() + 6500;
+        while (Date.now() < until);
+      });
+      await waitFor('the notice', () => home.page.evaluate(() => window.__freeze.length > 0), 20000);
+      await sleep(300);
+      assert.deepEqual(await fromHiddenReceived(), []);
+    });
+
+    await s.test('nothing in main.js broadcasts to every window any more', () => {
+      const source = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
+      assert.ok(!source.includes('getAllWindows'));
+      assert.ok(!source.includes('getAllWebContents'));
+    });
+
+    await home.app.evaluate(({ session }, partition) => {
+      session.defaultSession.setPreloads([]);
+      session.fromPartition(partition).setPreloads([]);
+    }, PARTITION);
   });
 });

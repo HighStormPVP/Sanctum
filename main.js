@@ -15,6 +15,25 @@ const { createManager: createRemoteManager } = require('./lib/remote/manager');
 const remoteRelayClient = require('./lib/remote/relay-client');
 const { createDirectPath } = require('./lib/remote/direct-path');
 
+// Only this app's own page may use anything registered on ipcMain. The hidden transport window
+// parses what peers and the network send, so a renderer exploit there must not reach the
+// shell, the files, or the keys. Wrapped here, before anything registers, so a new handler
+// can't forget. The transport's own channel is on its webContents, not here. A listener added
+// this way can't be taken off by reference, and nothing here does that.
+for (const method of ['handle', 'handleOnce']) {
+  const register = ipcMain[method].bind(ipcMain);
+  ipcMain[method] = (channel, handler) => register(channel, (e, ...args) => {
+    if (!isLocalUi(e)) throw new Error("This can only be used from this app's own window.");
+    return handler(e, ...args);
+  });
+}
+for (const method of ['on', 'once', 'addListener', 'prependListener', 'prependOnceListener']) {
+  const register = ipcMain[method].bind(ipcMain);
+  ipcMain[method] = (channel, listener) => register(channel, (e, ...args) => {
+    if (isLocalUi(e)) listener(e, ...args);
+  });
+}
+
 // Chunks sent before an invoke returns are lost, because the preload can't listen
 // for a channel until it knows the name. This holds them until the reply is out.
 function deferredSender(sender, channelId) {
@@ -45,10 +64,8 @@ fixPackagedPath();
 
 let mcpManager = null;
 function broadcastMcpUpdate() {
-  const payload = mcpManager ? mcpManager.listServers() : [];
-  for (const w of BrowserWindow.getAllWindows()) {
-    try { w.webContents.send('mcp:updated', payload); } catch {}
-  }
+  // Each server's env is in this, and often tokens with it, so it goes to the main window only.
+  sendToLocalUi('mcp:updated', mcpManager ? mcpManager.listServers() : []);
 }
 
 const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434';
@@ -325,13 +342,9 @@ async function wdTrip(stalledMs) {
   for (const m of models) if (await unloadOllamaModel(m)) unloaded.push(m);
   dlog(`WATCHDOG · unloaded: ${unloaded.join(', ') || '(none)'}`);
 
-  for (const w of BrowserWindow.getAllWindows()) {
-    try {
-      w.webContents.send('system:freeze-abort', {
-        stalledMs: Math.round(stalledMs), freeGB, models, unloaded
-      });
-    } catch {}
-  }
+  sendToLocalUi('system:freeze-abort', {
+    stalledMs: Math.round(stalledMs), freeGB, models, unloaded
+  });
   wdStallAccum = 0;
   setTimeout(() => { wdTripping = false; }, 5000); // debounce re-trips
 }
@@ -531,7 +544,7 @@ app.on('before-quit', (e) => {
 });
 
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
-app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
+app.on('activate', () => { if (!mainWindow || mainWindow.isDestroyed()) createWindow(); });
 
 ipcMain.handle('config:get', () => ({ ollamaUrl: OLLAMA_URL }));
 
@@ -560,7 +573,10 @@ function openRemoteTransport({ onEvent, onGone }) {
       contextIsolation: true,
       sandbox: true,
       nodeIntegration: false,
-      backgroundThrottling: false
+      backgroundThrottling: false,
+      // Its own session, in memory only. The main window's file:// storage holds the chats and
+      // API keys, and in the same session this page would share the origin and read them.
+      partition: 'remote-transport'
     }
   });
   remoteTransportWindow = win;

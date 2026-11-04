@@ -53,15 +53,28 @@ async function startRelay() {
   return { address: `ws://${url.host}/${SECRET}`, stop: () => mf.dispose() };
 }
 
-// So nothing ever reaches a real model, including the unload the app does on its way out.
+// So nothing ever reaches a real model, including the unload the app does on its way out. A
+// chat never answers, which is a local model still generating, for as long as a test needs.
 async function startFakeOllama() {
+  let chats = 0;
   const server = http.createServer((req, res) => {
     req.resume();
+    if (req.url === '/api/chat') {
+      chats += 1;
+      return;
+    }
     res.setHeader('content-type', 'application/json');
     res.end(JSON.stringify({ models: [] }));
   });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
-  return { url: `http://127.0.0.1:${server.address().port}`, stop: () => new Promise((resolve) => server.close(resolve)) };
+  return {
+    url: `http://127.0.0.1:${server.address().port}`,
+    chats: () => chats,
+    stop() {
+      server.closeAllConnections();
+      return new Promise((resolve) => server.close(resolve));
+    }
+  };
 }
 
 // `flags` become SANCTUM_REMOTE_TEST, which main.js reads only in an unpackaged app. The
@@ -87,14 +100,17 @@ async function launchDevice(name, { flags = 'log,no-stun', ollamaUrl }) {
   await page.waitForLoadState('domcontentloaded');
   await waitFor(`${name}'s window.api.remote`, () => page.evaluate(() => Boolean(window.api?.remote)));
   // Keep everything the renderer is handed, to look at later.
-  await page.evaluate(() => {
-    window.__frames = [];
-    window.__statuses = [];
-    window.api.remote.onFrame((deviceId, frame) => window.__frames.push(frame));
-    window.api.remote.onStatus((status) => window.__statuses.push(status));
-  });
+  const record = () =>
+    page.evaluate(() => {
+      window.__frames = [];
+      window.__statuses = [];
+      window.api.remote.onFrame((deviceId, frame) => window.__frames.push(frame));
+      window.api.remote.onStatus((status) => window.__statuses.push(status));
+    });
+  await record();
 
   const device = {
+    record,
     name,
     app,
     page,
@@ -112,7 +128,7 @@ async function launchDevice(name, { flags = 'log,no-stun', ollamaUrl }) {
     frameCount: () => page.evaluate(() => window.__frames.length),
     windowCount: () => app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows().length),
     hiddenWindowFacts: () =>
-      app.evaluate(({ BrowserWindow }, pageName) => {
+      app.evaluate(({ BrowserWindow, session }, pageName) => {
         const win = BrowserWindow.getAllWindows().find((w) => w.webContents.getURL().includes(pageName));
         if (!win) return null;
         const prefs = win.webContents.getLastWebPreferences();
@@ -120,7 +136,9 @@ async function launchDevice(name, { flags = 'log,no-stun', ollamaUrl }) {
           visible: win.isVisible(),
           contextIsolation: prefs.contextIsolation,
           sandbox: prefs.sandbox,
-          nodeIntegration: prefs.nodeIntegration
+          nodeIntegration: prefs.nodeIntegration,
+          ownSession: win.webContents.session !== session.defaultSession,
+          sessionPersists: win.webContents.session.isPersistent()
         };
       }, TRANSPORT_PAGE),
     async stop() {
@@ -164,6 +182,7 @@ async function startPair({ flags } = {}) {
   const laptopId = (await home.entry()).id;
   return {
     relay,
+    ollama,
     home,
     laptop,
     homeId,

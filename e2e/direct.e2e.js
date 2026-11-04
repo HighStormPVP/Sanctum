@@ -66,7 +66,9 @@ test('direct connections', async (t) => {
 
   await t.test('the hidden window is locked down and stays hidden', async () => {
     for (const device of [home, laptop]) {
-      assert.deepEqual(await device.hiddenWindowFacts(), { visible: false, contextIsolation: true, sandbox: true, nodeIntegration: false });
+      assert.deepEqual(await device.hiddenWindowFacts(), {
+        visible: false, contextIsolation: true, sandbox: true, nodeIntegration: false, ownSession: true, sessionPersists: false
+      });
       const page = await device.transport();
       assert.deepEqual(
         await page.evaluate(() => [typeof require, typeof process, typeof window.api, Object.keys(window.sanctumTransport).sort()]),
