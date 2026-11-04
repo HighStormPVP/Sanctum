@@ -286,6 +286,14 @@ The manager takes its clients by injection, so tests can use fakes. In `main.js`
   - Pairing, laptop side: `pair` gives up after 30 seconds with a clear error, since a host failure sends nothing back.
   - Pairing can finish on one side only: if the home side has a verified `peer` but the last message was lost, the laptop reports failure. The home side's new device shows as offline, and removing it or pairing again must work.
   - A peer's `name` is untrusted: empty becomes "Unnamed device", and it's trimmed to 64 characters before it's stored.
+  - Pairing, laptop side: a code that has already failed on this device is refused without contacting anyone, with "That code didn't work. Get a new one." This limits guesses by a fake home PC, which the home side's five-attempt limit can't see. Keep the failed codes only in memory, as salted hashes, and clear them after 10 minutes.
+  - A home-side pairing entry stays provisional until the first session with that device completes. A provisional entry that never connects is dropped after 10 minutes, and pairing again with the same key doesn't create a duplicate.
+  - Heartbeat: an encrypted heartbeat frame every 15 seconds. No frame decrypted for 45 seconds ends the connection and reconnects with a new session. Forged link headers can otherwise stall a connection silently.
+  - Any `decrypt` throw ends the connection and reconnects with a new session.
+  - A send refused by the link because it's full ends the connection and starts a new session, so the session's counter and the link can't drift apart.
+  - A receive-side `onResyncNeeded` is advisory: it never triggers a snapshot, and doesn't reset anything.
+  - `handleHello` only ever receives messages whose type is `session-hello` or `session-auth`. A connection whose handshake hasn't finished after 20 seconds starts again with a new session.
+  - Each device's `status()` entry includes `fingerprint`: the first 8 characters of its `deviceId`, grouped as `abcd-efgh`.
 - [ ] **Step 2: Run.** Expected: FAIL.
 - [ ] **Step 3: Implement.** `relay-client.js` uses `ws` and does the challenge from Task 3. Add IPC handlers and preload methods. Keep `preload.js` free of Node requires beyond `electron`.
 - [ ] **Step 4: Run** `npm test`. Expected: all pass.
@@ -404,7 +412,7 @@ Exact UI, from the spec and reviewed mockups:
 - **Message box menu:** a **Remote Control** item with a switch, beside Web search and Thinking. Hidden until the address is set and, on a chat with `c.remote`, always hidden.
 - **Shared chat marker:** a small marker in the chat header and a dot in the chat list, using `--accent-1`.
 - **First share with no paired device:** dialog titled "Connect a device" showing the code large, with "Enter this code on your laptop. It works once and expires in 10 minutes."
-- **Settings > Devices:** service address field, paired devices with **Direct**, **Through relay**, or **Offline**, Remove, **Add a device** (shows a code), **Connect to a home PC** (takes a code), and on any device with a `home` peer, the switch **Let my home PC control this laptop**, off by default.
+- **Settings > Devices:** service address field, paired devices with **Direct**, **Through relay**, or **Offline**, each with its fingerprint and "This device's fingerprint: abcd-efgh" shown for comparison, Remove, **Add a device** (shows a code), **Connect to a home PC** (takes a code), and on any device with a `home` peer, the switch **Let my home PC control this laptop**, off by default.
 - **Laptop sidebar:** shared chats grouped under each home PC's name, above local chats.
 - **Offline state:** the chat stays visible, with "Home PC is offline. Reconnecting…" and the message box disabled.
 - **PIN screen:** set at first pairing, asked at start and after 15 minutes idle. Idle hides remote chats and blocks sending, and leaves the connection up.
