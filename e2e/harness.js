@@ -207,6 +207,61 @@ async function startPair({ flags, homeOllama } = {}) {
   };
 }
 
+// Stands between a device and the relay, and gives that device a slow downstream, so what the
+// home PC sends stays unacknowledged in its real link for as long as a real slow connection
+// would. Point a device's address at `address`, with block-ice so it can't go around this.
+async function startThrottledProxy(relayAddress, bytesPerSecond) {
+  const WebSocket = require('ws');
+  const target = new URL(relayAddress);
+  const server = new WebSocket.WebSocketServer({ host: '127.0.0.1', port: 0, maxPayload: 16 * 1024 * 1024 });
+  await new Promise((resolve) => server.once('listening', resolve));
+  const pairs = new Set();
+  server.on('connection', (down, req) => {
+    const up = new WebSocket(`${target.protocol}//${target.host}${req.url}`, { perMessageDeflate: false });
+    const toRelay = [];
+    const toDevice = [];
+    let allowance = 0;
+    const entry = { up, down };
+    pairs.add(entry);
+    const close = () => {
+      clearInterval(pump);
+      pairs.delete(entry);
+      if (up.readyState === WebSocket.OPEN || up.readyState === WebSocket.CONNECTING) up.terminate();
+      if (down.readyState === WebSocket.OPEN) down.terminate();
+    };
+    const pump = setInterval(() => {
+      allowance = Math.min(allowance + bytesPerSecond / 50, Math.max(bytesPerSecond / 5, 2 * 1024 * 1024));
+      while (toDevice.length && toDevice[0].data.length <= allowance && down.readyState === WebSocket.OPEN) {
+        const { data, isBinary } = toDevice.shift();
+        allowance -= data.length;
+        down.send(data, { binary: isBinary });
+      }
+    }, 20);
+    up.on('open', () => {
+      for (const { data, isBinary } of toRelay.splice(0)) up.send(data, { binary: isBinary });
+    });
+    up.on('message', (data, isBinary) => toDevice.push({ data, isBinary }));
+    down.on('message', (data, isBinary) => {
+      if (up.readyState === WebSocket.OPEN) up.send(data, { binary: isBinary });
+      else toRelay.push({ data, isBinary });
+    });
+    up.on('close', close);
+    up.on('error', close);
+    down.on('close', close);
+    down.on('error', close);
+  });
+  return {
+    address: `ws://127.0.0.1:${server.address().port}${target.pathname}`,
+    stop() {
+      for (const { up, down } of pairs) {
+        up.terminate();
+        down.terminate();
+      }
+      return new Promise((resolve) => server.close(resolve));
+    }
+  };
+}
+
 const MODEL = 'fake:latest';
 const TITLE = 'Mirrored Title Here';
 
@@ -394,6 +449,6 @@ const offlineMark = (device) => device.page.evaluate(() => document.querySelecto
 const snapshotsSeen = async (device) => (await device.mirrorFrames()).filter((f) => f.type === 'mirror-snapshot').length;
 
 module.exports = {
-  startPair, startRelay, startFakeOllama, startScriptedOllama, launchDevice, pair, waitFor, sleep, PIN, SECRET, TRANSPORT_PAGE, MODEL, TITLE,
+  startPair, startRelay, startFakeOllama, startScriptedOllama, startThrottledProxy, launchDevice, pair, waitFor, sleep, PIN, SECRET, TRANSPORT_PAGE, MODEL, TITLE,
   normalize, threadOf, threadsMatch, stopShowing, stopButtonsAre, secondsOn, timersAgree, newChat, openChat, submit, clickStop, remoteId, hasChat, watch, sorted, chatDataMatches, offlineMark, snapshotsSeen
 };

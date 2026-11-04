@@ -9,7 +9,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const {
-  startPair, startScriptedOllama, launchDevice, pair, waitFor, sleep, PIN, MODEL, TITLE,
+  startPair, startScriptedOllama, startThrottledProxy, launchDevice, pair, waitFor, sleep, PIN, MODEL, TITLE,
   threadOf, threadsMatch, stopButtonsAre, chatDataMatches, newChat, openChat, submit, clickStop, hasChat, offlineMark
 } = require('./harness.js');
 const { VIDEO_REFUSED, TOO_LARGE } = require('../lib/remote-rules.js');
@@ -643,6 +643,48 @@ test('acting from a laptop', async (t) => {
     await setBox(home, '');
   });
 
+  await t.test("a laptop's Stop with another chat on the home screen keeps the home's words and files for later", async () => {
+    const id = await shared();
+    await openChat(home, id);
+    await openOn(laptop, id);
+    await submit(laptop, 'Running');
+    const reply = await ollama.next();
+    reply.say('Partly');
+    await lastMessageIs(laptop, rid(id), 'Partly');
+    await home.page.evaluate(() => {
+      state.pendingAttachments = [{ kind: 'text', name: 'held-file.txt', text: 'HELD-FILE-BODY', ext: 'txt', size: 14 }];
+      renderAttachments();
+    });
+    await submit(home, 'HELD-HOME-WORDS');
+    await threadsMatch(onLaptop, 'the home queue', 'HELD-HOME-WORDS', 'msg user queued');
+    await openChat(home, privateId);
+
+    await clickStopWhenShowing(laptop);
+    await toastSays(home, 'back in the message box');
+    await waitFor('the chat to stop', async () => !(await isRunning(home, id)), 5000);
+    assert.equal(await box(home), '', 'not into a box showing another chat');
+    assert.equal(await home.page.evaluate(() => state.pendingAttachments.length), 0);
+    await home.page.evaluate(() => saveToStorage());
+    assert.ok(!(await home.page.evaluate(() => localStorage.getItem('localai.state.v1'))).includes('HELD-HOME-WORDS'), 'held in memory only');
+
+    // Opened with something else in the box: they keep waiting.
+    await setBox(home, 'Something else I was typing');
+    await openChat(home, id);
+    assert.equal(await box(home), 'Something else I was typing');
+    assert.equal(await home.page.evaluate(() => state.pendingAttachments.length), 0);
+
+    // The box empties: now they come back, files too.
+    await setBox(home, '');
+    assert.equal(await box(home), 'HELD-HOME-WORDS');
+    assert.deepEqual(await home.page.evaluate(() => state.pendingAttachments.map((a) => a.name)), ['held-file.txt']);
+    assert.equal(await field(home, id, '_returned'), undefined);
+    await home.page.evaluate(() => {
+      state.pendingAttachments = [];
+      renderAttachments();
+    });
+    await setBox(home, '');
+  });
+
   await t.test("deleting a chat during a run gives a laptop's queued words back", async () => {
     const id = await shared();
     await openChat(home, id);
@@ -699,6 +741,27 @@ test('acting from a laptop', async (t) => {
     await sleep(2200);
     assert.equal(await box(laptop), '');
     assert.equal(await home.page.evaluate(() => mirror.undelivered.size), 0);
+  });
+
+  await t.test('words held for a laptop are capped at 2 MiB, oldest first, and the record never has them', async () => {
+    const auditFile = await home.page.evaluate(() => window.api.audit.path());
+    const laptopId = (await home.entry()).id;
+    const before = fs.existsSync(auditFile) ? fs.readFileSync(auditFile, 'utf8').length : 0;
+    const MARK = 'HELD-WORDS-NOT-IN-THE-RECORD';
+    // Held until acknowledged, and this device isn't going to, because these are for nobody.
+    const held = await home.page.evaluate(([mark, size]) => {
+      const nobody = 'not-a-paired-device';
+      for (let i = 0; i < 3; i++) {
+        deliverReturnedWords(nobody, { type: 'queued-returned', chatId: 'c', text: mark + i + 'x'.repeat(size), hadAttachments: false });
+      }
+      const texts = [...mirror.undelivered.get(nobody).values()].map((f) => f.text.slice(0, mark.length + 1));
+      mirror.undelivered.delete(nobody);
+      return texts;
+    }, [MARK, 900 * 1024]);
+    assert.deepEqual(held, [`${MARK}1`, `${MARK}2`], 'the oldest went, and two fit');
+    await waitFor('the record of it', () => fs.readFileSync(auditFile, 'utf8').slice(before).includes('queued-words-dropped'), 3000);
+    assert.ok(!fs.readFileSync(auditFile, 'utf8').includes(MARK));
+    assert.ok(laptopId);
   });
 
   await t.test('a send answered after the chat was unshared: refused, and the words come back', async () => {
@@ -866,14 +929,19 @@ test('acting from a laptop', async (t) => {
     const count = () => laptop.page.evaluate(() => window.__mirrorFrames.filter((f) => f.type === 'mirror-snapshot').length);
     await sleep(1200);
     const before = await count();
-    await laptop.page.evaluate((to) => {
-      for (let i = 0; i < 40; i++) window.api.remote.send(to, { type: 'mirror-resync-request' });
-    }, homeId);
-    await sleep(600);
-    assert.ok((await count()) - before <= 1, `${(await count()) - before} snapshots in 600 ms`);
-    await waitFor('the deferred one', async () => (await count()) - before >= 2, 3000);
+    const burst = (n) => laptop.page.evaluate(([to, times]) => {
+      for (let i = 0; i < times; i++) window.api.remote.send(to, { type: 'mirror-resync-request' });
+    }, [homeId, n]);
+    const laptopId = (await home.entry()).id;
+    await burst(40);
+    await waitFor('the first', async () => (await count()) - before >= 1, 3000);
+    await waitFor('it to finish', () => home.page.evaluate((id) => !mirror.laptops.get(id).paced, laptopId), 3000);
+    // Those that came during it needed no answer of their own. These come just after it, inside
+    // the second, and one of them is kept for the end of it.
+    await burst(20);
+    await waitFor('the one kept for later', async () => (await count()) - before >= 2, 3000);
     await sleep(1500);
-    assert.ok((await count()) - before <= 2, `${(await count()) - before} snapshots from 40 requests`);
+    assert.ok((await count()) - before <= 3, `${(await count()) - before} snapshots from 60 requests`);
     assert.equal(await laptop.page.evaluate((h) => mirror.homes.get(h).awaitingSnapshot, homeId), false);
   });
 
@@ -1177,7 +1245,7 @@ test('acting from a laptop', async (t) => {
     }, 30000);
     const parts = (await framesOf(laptop)).filter((p) => p.part);
     assert.deepEqual(parts.map((p) => p.part), parts.map((_, i) => i + 1));
-    assert.ok(parts.every((p) => p.of === parts.length && p.chats === 1));
+    assert.ok(parts.every((p) => p.of === parts.length && p.chats >= 1));
     await sleep(500);
     assert.equal(await has(laptop, one, 'CCC', 14), true, 'nothing went missing between the parts');
     assert.equal(await has(laptop, two, 'DDD', 14), true);
@@ -1239,8 +1307,6 @@ test('acting from a laptop', async (t) => {
       state.chats[c].messages.push({ role: 'user', content: 'After it shrank', attachments: [] });
       markMirrorDirty(c);
     }, grower);
-    await sleep(1200);
-    assert.equal(await laptop2.remote('send', homeId, { type: 'mirror-resync-request' }), true);
     await waitFor('it back on the first laptop', async () => (await lengthOn(laptop)) === 2, 30000);
     await waitFor('it back on the second', async () => (await lengthOn(laptop2)) === 2, 30000);
     await home.page.evaluate((c) => {
@@ -1348,11 +1414,13 @@ test("Sanctum's own data folder is closed to the agent's file tools, wherever th
     grep: await window.api.fs.grep('TOOLS-CANARY', root, { allowlist: allowed }),
     grepInside: await window.api.fs.grep('TOOLS-CANARY', dir, { allowlist: allowed }),
     patch: await window.api.fs.applyPatch(file, 'TOOLS', 'x', allowed),
+    write: await window.api.fs.writeFile(file, 'overwritten', allowed),
+    writeNew: await window.api.fs.writeFile(`${dir}\\new-file.txt`, 'created', allowed),
     // Outside the allowlist is refused the same way, and doesn't offer a pop-up to widen it.
     unlisted: await window.api.fs.readFile(file, [])
   }), [inside, profile, tree, allow]);
 
-  for (const key of ['read', 'list', 'globInside', 'grepInside', 'patch', 'unlisted']) {
+  for (const key of ['read', 'list', 'globInside', 'grepInside', 'patch', 'write', 'writeNew', 'unlisted']) {
     assert.match(results[key].error ?? '', /Sanctum's own data/, key);
     assert.doesNotMatch(results[key].error, /outside (the )?allowed roots/, key);
   }
@@ -1361,12 +1429,327 @@ test("Sanctum's own data folder is closed to the agent's file tools, wherever th
     assert.match(results.dots.error ?? '', /Sanctum's own data/);
   }
   assert.equal(fs.readFileSync(inside, 'utf8'), canary, 'and nothing changed');
+  assert.equal(fs.existsSync(path.join(profile, 'new-file.txt')), false, 'and nothing was added');
   // From above it, a search finds what's beside it and nothing in it.
   assert.deepEqual(results.glob.matches.sort(), ['nested/beside.txt']);
   assert.deepEqual(results.grep.matches.map((m) => m.file), ['nested/beside.txt']);
   // The list of a parent names the folder, as any listing would, and nothing in it.
   const parent = await device.page.evaluate(async ([dir, allowed]) => window.api.fs.listDir(dir, allowed), [path.join(tree, 'nested'), allow]);
   assert.deepEqual(parent.entries.map((e) => e.name).sort(), ['beside.txt', 'profile']);
+});
+
+test('over a slow link, a snapshot past the link limit arrives whole, in one transfer, and the session stays up', async (t) => {
+  const MIB_BYTES = 1024 * 1024;
+  const ollama = await startScriptedOllama();
+  const trio = await startPair({ homeOllama: ollama, flags: 'log,no-stun,block-ice' });
+  const proxy = await startThrottledProxy(trio.relay.address, (50 * 1000 * 1000) / 8);
+  t.after(async () => {
+    await trio.stop();
+    await proxy.stop();
+    await ollama.stop();
+  });
+  const { home, laptop, homeId } = trio;
+  await started(home);
+  await started(laptop);
+  await waitFor('the model', () => home.page.evaluate((m) => state.installed.has(m), MODEL));
+  const laptopId = (await home.entry()).id;
+  const rid = (id) => `remote:${homeId}:${id}`;
+  // Far too much to be saving, and none of it is what this is about.
+  await home.page.evaluate(() => { window.saveToStorage = () => {}; });
+
+  const goOffline = async () => {
+    assert.deepEqual(await laptop.remote('setAddress', 'ws://127.0.0.1:9/nowhere-at-all'), { ok: true });
+    await waitFor('home to see the laptop go', async () => (await home.entry(laptopId)).connected === false, 60000);
+    await waitFor('the laptop to see it', async () => (await laptop.entry()).connected === false, 15000);
+  };
+  const forgetFrames = () => laptop.page.evaluate(() => {
+    window.__mirrorFrames.length = 0;
+    window.__statuses.length = 0;
+  });
+  const comeBack = async () => {
+    await forgetFrames();
+    assert.deepEqual(await laptop.remote('setAddress', proxy.address), { ok: true });
+  };
+  const addChats = (count, mib, tag) => home.page.evaluate(([n, size, name, model]) => {
+    const ids = [];
+    for (let i = 0; i < n; i++) {
+      const c = addChat(model, 'chat', { title: `${name} ${i}`, remoteControl: true, webEnabled: false });
+      c.messages.push({ role: 'user', content: `${name}${i}:` + 'z'.repeat(size * 1024 * 1024), attachments: [] });
+      ids.push(c.id);
+    }
+    return ids;
+  }, [count, mib, tag, MODEL]);
+  const removeChats = (ids) => home.page.evaluate((list) => { for (const c of list) deleteChat(c); markMirrorDirty(); }, ids);
+  const sessionDropped = () => laptop.page.evaluate(() => {
+    let up = false;
+    for (const s of window.__statuses) {
+      const entry = s.devices?.[0];
+      if (entry?.connected) up = true;
+      else if (up) return true;
+    }
+    return false;
+  });
+  const transferOnHome = () => home.page.evaluate((id) => {
+    const p = mirror.laptops.get(id)?.paced;
+    return p ? { transfer: p.transfer, next: p.next, acked: p.acked, inFlight: p.inFlightBytes, restart: !!p.restart, held: p.held.length, overflowed: !!p.overflowed } : null;
+  }, laptopId);
+  const partFrames = () => laptop.page.evaluate(() => window.__mirrorFrames.filter((f) => f.type === 'mirror-snapshot').map((f) => ({ part: f.part, of: f.of, transfer: f.transfer, now: f.now, ids: f.chats.map((c) => c.id) })));
+  const holds = (id, mib) => laptop.page.evaluate(([key, want]) => {
+    const text = state.chats[key]?.messages[0]?.content;
+    return !!text && text.length >= want;
+  }, [rid(id), mib * MIB_BYTES]);
+
+  // Fails as soon as the session ends, because that's the failure, and watches what's in flight.
+  async function untilWhole(what, done, ms = 240000) {
+    let most = 0;
+    const deadline = Date.now() + ms;
+    for (;;) {
+      if (await sessionDropped()) assert.fail(`${what}: the session ended, so the link's buffer overflowed`);
+      const now = await transferOnHome();
+      if (now) most = Math.max(most, now.inFlight);
+      if (await done()) return most;
+      if (Date.now() > deadline) assert.fail(`${what}: never arrived whole`);
+      await sleep(100);
+    }
+  }
+
+  // Sending this much takes time, so each step goes on from the chats the last one left there.
+  let kept = [];
+
+  await t.test('78 MiB in 13 MiB chats: one transfer, a re-ask ignored, and an unshared chat never sent', async () => {
+    await goOffline();
+    const ids = await addChats(6, 13, 'Slow');
+    await comeBack();
+    await waitFor('the first part', async () => (await partFrames()).length >= 1, 60000);
+
+    // A resync request while it's going doesn't start another.
+    assert.equal(await laptop.remote('send', homeId, { type: 'mirror-resync-request' }), true);
+
+    // The chat in the last part is unshared before that part has gone.
+    await sleep(500);
+    assert.equal(await sessionDropped(), false, 'the session is still up');
+    const last = await home.page.evaluate(() => [...mirror.sent.keys()].at(-1));
+    assert.ok(ids.includes(last));
+    assert.ok(!(await partFrames()).some((f) => f.ids.includes(last)));
+    await home.page.evaluate((c) => { state.chats[c].remoteControl = false; markMirrorDirty(); }, last);
+    const seenAtUnshare = (await partFrames()).length;
+
+    const rest = ids.filter((c) => c !== last);
+    const most = await untilWhole('78 MiB', async () => {
+      for (const c of rest) if (!(await holds(c, 13))) return false;
+      return (await transferOnHome()) === null;
+    });
+    assert.ok(most > 0 && most <= 32 * MIB_BYTES, `in flight reached ${most / MIB_BYTES} MiB`);
+
+    const frames = await partFrames();
+    assert.equal(frames.filter((f) => f.part === 1).length, 1, 'one transfer');
+    assert.deepEqual(frames.map((f) => f.part), frames.map((_, i) => i + 1));
+    assert.ok(!frames.slice(seenAtUnshare).some((f) => f.ids.includes(last)), "the unshared chat wasn't sent");
+    assert.equal(await hasChat(laptop, rid(last)), false);
+    assert.ok(frames.at(-1).now > frames[0].now + 2000, 'each part has its own clock reading');
+    assert.equal(await sessionDropped(), false);
+    kept = rest;
+  });
+
+  await t.test('a restart during a transfer waits for what is outstanding, and held frames have a byte cap', async () => {
+    const ids = kept;
+    assert.equal(ids.length, 5);
+    await sleep(1200);
+    await forgetFrames();
+    // Transfer numbers start again with each connection, so earlier acks would be counted here.
+    await home.page.evaluate(() => { window.__mirrorFrames.length = 0; });
+    assert.equal(await laptop.remote('send', homeId, { type: 'mirror-resync-request' }), true);
+    await waitFor('the first part', async () => (await partFrames()).length >= 1, 60000);
+    const firstTransfer = (await partFrames())[0].transfer;
+
+    // More to hold than the cap allows: it's dropped, because a snapshot carries the same state.
+    await home.page.evaluate(([c, text]) => {
+      state.chats[c].messages.push({ role: 'user', content: text, attachments: [] });
+      markMirrorDirty(c);
+    }, [ids[0], 'Too much to hold ' + 'y'.repeat(17 * MIB_BYTES)]);
+    const capped = await waitFor('the held frames to be dropped', async () => {
+      const now = await transferOnHome();
+      return now && now.overflowed ? now : null;
+    }, 5000);
+    assert.equal(capped.held, 0);
+
+    // The home details change, which needs a restart. It waits for what's already out there.
+    ollama.models.push('restart-trigger:latest');
+    await home.page.evaluate(() => refreshOllama());
+    const marked = await waitFor('the restart to be marked', async () => {
+      const now = await transferOnHome();
+      return now && now.restart && now.transfer === firstTransfer ? now : null;
+    }, 10000);
+    let last = marked;
+    await waitFor('the new transfer', async () => {
+      const now = await transferOnHome();
+      if (now && now.transfer !== firstTransfer) return true;
+      if (now) {
+        assert.equal(now.next, marked.next, 'no new part goes while a restart waits');
+        last = now;
+      }
+      return false;
+    }, 120000);
+    assert.ok(last);
+    assert.equal(await sessionDropped(), false);
+    const acks = await home.page.evaluate((transfer) => window.__mirrorFrames.filter((f) => f.type === 'mirror-part-ack' && f.transfer === transfer).length, firstTransfer);
+    assert.equal(acks, marked.next, 'every part that had gone was acknowledged first');
+
+    const most = await untilWhole('after the restart', async () => {
+      for (const c of ids) if (!(await holds(c, 13))) return false;
+      const done = (await transferOnHome()) === null;
+      const has = await laptop.page.evaluate(([key]) => state.chats[key]?.messages.at(-1)?.content.startsWith('Too much to hold'), [rid(ids[0])]);
+      return done && has;
+    });
+    assert.ok(most <= 32 * MIB_BYTES, `in flight reached ${most / MIB_BYTES} MiB`);
+    await home.page.evaluate(() => {
+      for (const c of Object.values(state.chats)) c.messages = c.messages.filter((m) => !m.content.startsWith('Too much to hold'));
+      markMirrorDirty();
+    });
+    await waitFor('the extra message to go', () => laptop.page.evaluate(([key]) => state.chats[key].messages.length === 1, [rid(ids[0])]), 15000);
+  });
+
+  await t.test('a chat unshared during a transfer leaves the laptop before it ends, behind only what was in flight', async () => {
+    const ids = kept;
+    await sleep(1200);
+    await forgetFrames();
+    assert.equal(await laptop.remote('send', homeId, { type: 'mirror-resync-request' }), true);
+    await waitFor('the first part', async () => (await partFrames()).length >= 1, 60000);
+    const seen = (await partFrames())[0].ids.find((c) => ids.includes(c));
+    assert.ok(seen);
+    await home.page.evaluate((c) => { state.chats[c].remoteControl = false; markMirrorDirty(); }, seen);
+    // A link is ordered, so this can't overtake parts already in it. It doesn't wait for the rest.
+    await waitFor('it to leave', async () => !(await hasChat(laptop, rid(seen))), 45000);
+    assert.ok((await transferOnHome()) !== null, 'and the transfer is still going');
+    const rest = ids.filter((c) => c !== seen);
+    await untilWhole('after the unshare', async () => {
+      for (const c of rest) if (!(await holds(c, 13))) return false;
+      return (await transferOnHome()) === null;
+    });
+    assert.equal(await hasChat(laptop, rid(seen)), false, 'and stays gone');
+    await removeChats(rest);
+    await waitFor('them to go', async () => !(await hasChat(laptop, rid(rest[0]))), 5000);
+  });
+
+  await t.test('a single 40 MiB chat: one transfer, and an ack before anything follows it', async () => {
+    await goOffline();
+    const [id] = await addChats(1, 40, 'Single');
+    await comeBack();
+    await untilWhole('40 MiB', async () => (await holds(id, 40)) && (await transferOnHome()) === null);
+    const frames = await partFrames();
+    assert.equal(frames.length, 1, `${frames.length} snapshots`);
+    assert.equal(frames[0].part, 1);
+    assert.equal(frames[0].of, 1);
+    await removeChats([id]);
+  });
+
+  await t.test('a laptop that reloads during a transfer lets it finish, then gets a new one', async () => {
+    await goOffline();
+    const ids = await addChats(2, 20, 'Reload');
+    await comeBack();
+    await waitFor('the first part', async () => (await partFrames()).length >= 1, 60000);
+    await laptop.page.reload();
+    await laptop.page.waitForLoadState('domcontentloaded');
+    await waitFor('the page back', () => laptop.page.evaluate(() => typeof mirror !== 'undefined' && state.order.length > 0 && Boolean(state.catalog)), 30000);
+    await laptop.record();
+    await waitFor('the chats whole', async () => {
+      for (const c of ids) if (!(await holds(c, 20))) return false;
+      return laptop.page.evaluate((h) => mirror.homes.get(h)?.awaitingSnapshot === false, homeId);
+    }, 180000);
+    await removeChats(ids);
+  });
+
+  await t.test('a laptop that stays connected and never acks only stalls itself, and is told', async () => {
+    const ids = await addChats(2, 6, 'Stall');
+    await waitFor('them to arrive', async () => (await holds(ids[0], 6)) && (await holds(ids[1], 6)), 60000);
+    await sleep(1200);
+    await forgetFrames();
+    await home.page.evaluate(() => {
+      window.__realAck = window.applyMirrorPartAck;
+      window.applyMirrorPartAck = () => {};
+    });
+    assert.equal(await laptop.remote('send', homeId, { type: 'mirror-resync-request' }), true);
+    await waitFor('a part out', async () => (await partFrames()).length >= 1, 30000);
+    assert.ok(await transferOnHome());
+    await sleep(500);
+    await home.page.evaluate((id) => {
+      window.applyMirrorPartAck = window.__realAck;
+      mirror.laptops.get(id).paced.progressAt -= 11 * 60 * 1000;
+    }, laptopId);
+    await toastSays(laptop, 'Asking again', 8000);
+    assert.equal((await laptop.entry()).connected, true, 'the session stays up');
+    assert.equal(await sessionDropped(), false);
+    // It asks again, and this time it's fine.
+    await waitFor('a whole snapshot', () => laptop.page.evaluate((h) => mirror.homes.get(h).awaitingSnapshot === false, homeId), 60000);
+    await waitFor('home to finish', async () => (await transferOnHome()) === null, 60000);
+    await removeChats(ids);
+  });
+});
+
+test('a laptop asks again only when nothing has arrived, and less and less often', async (t) => {
+  const ollama = await startScriptedOllama();
+  const device = await launchDevice('reask', { ollamaUrl: ollama.url });
+  t.after(async () => {
+    await device.stop();
+    await ollama.stop();
+  });
+  await started(device);
+  const result = await device.page.evaluate(async () => {
+    const HOME = 'fuzz-home';
+    const long = [];
+    const realSetTimeout = window.setTimeout;
+    window.setTimeout = (fn, ms, ...rest) => {
+      if (ms >= 10000) {
+        long.push({ fn, ms });
+        return long.length + 100000000;
+      }
+      return realSetTimeout(fn, ms, ...rest);
+    };
+    window.__status = { devices: [{ id: HOME, role: 'home', connected: true }], locked: false, idleLocked: false };
+    mirrorOnStatus(window.__status);
+    const home = mirrorHome(HOME);
+    const out = { waits: [] };
+    const wait = (ms) => new Promise((resolve) => realSetTimeout(resolve, ms));
+    // The first-snapshot re-ask, for a lost first frame, and then the slow ones.
+    await wait(1800);
+    for (let i = 0; i < 3; i++) {
+      const next = long.at(-1);
+      out.waits.push(next?.ms);
+      next?.fn();
+    }
+    // A part arriving is progress: the wait goes back to the start, and nothing's been asked for.
+    const before = long.length;
+    let seq = 100;
+    mirrorOnFrame(HOME, { type: 'mirror-snapshot', seq, now: Date.now(), home: {}, part: 1, of: 3, transfer: 1, chats: [] });
+    out.afterPart = long.at(-1)?.ms;
+    out.armed = long.length > before;
+    // That timer firing with parts still to come does ask, since nothing has arrived for that long.
+    seq += 1;
+    mirrorOnFrame(HOME, { type: 'mirror-snapshot', seq, now: Date.now(), home: {}, part: 2, of: 3, transfer: 1, chats: [] });
+    out.nextPart = home.nextPart;
+    seq += 1;
+    mirrorOnFrame(HOME, { type: 'mirror-snapshot', seq, now: Date.now(), home: {}, part: 3, of: 3, transfer: 1, chats: [] });
+    out.awaiting = home.awaitingSnapshot;
+    // Once it's whole, an old timer does nothing.
+    long.at(-1)?.fn();
+    out.awaitingAfter = home.awaitingSnapshot;
+    // A clock reading that comes after a slow part puts running times right.
+    const realNow = Date.now();
+    mirrorOnFrame(HOME, { type: 'mirror-snapshot', seq: seq + 1, now: realNow - 300000, home: {}, part: 1, of: 1, transfer: 2, chats: [{ id: 'clock', title: 'Clock', messages: [] }] });
+    out.slowOffset = Math.round(home.clockOffset / 1000);
+    mirrorOnFrame(HOME, { type: 'mirror-run', seq: seq + 2, chatId: 'clock', running: false, now: Date.now() });
+    out.settledOffset = Math.round(home.clockOffset / 1000);
+    window.setTimeout = realSetTimeout;
+    return out;
+  });
+  assert.deepEqual(result.waits, [60000, 120000, 240000]);
+  assert.equal(result.afterPart, 60000);
+  assert.equal(result.armed, true);
+  assert.equal(result.nextPart, 3);
+  assert.equal(result.awaiting, false);
+  assert.equal(result.awaitingAfter, false);
+  assert.equal(result.slowOffset, -300, 'as read from a part that took five minutes');
+  assert.equal(result.settledOffset, 0);
 });
 
 test('parts of a snapshot from a hostile home change nothing they should not', async (t) => {

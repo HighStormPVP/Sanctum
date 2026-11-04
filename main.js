@@ -2664,6 +2664,7 @@ ipcMain.handle('fs:write_file', async (_e, { path: p, content, allowlist }) => {
   try {
     const fp = resolveSafe(p);
     if (!fp) return { error: 'path required' };
+    if (inProfile(fp)) return PROFILE_REFUSAL;
     if (!withinAllowlist(fp, allowlist)) return { error: `path "${p}" is outside the allowed roots: ${(allowlist || []).join(', ')}` };
     fs.mkdirSync(path.dirname(fp), { recursive: true });
     fs.writeFileSync(fp, content ?? '', 'utf-8');
