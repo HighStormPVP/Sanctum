@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-+iZQNrFHecBfHIojpfHL52RQJ4FinkPhbiYTzHMHEuA='; base-uri 'none'; form-action 'none'">
+<title>Sanctum transport</title>
+</head>
+<body>
+<script>
+'use strict';
+// Runs the WebRTC half of lib/remote/direct-path.js, which holds the rules and says what the
+// messages mean. Everything crossing this page is bytes it can't read, and signaling it only
+// passes to WebRTC. Changing this script means changing the hash in the CSP above: a test in
+// test/remote-direct.test.js prints the right one.
+const HIGH_WATER_BYTES = 1024 * 1024;
+const LOW_WATER_BYTES = 256 * 1024;
+
+const peers = new Map(); // id -> { pc, channel, queue, head, described, early }
+// A test build's record of what this page was handed, for proving what it can see. main.js
+// only asks for it in an unpackaged app, and no frame can.
+const frameLog = new URLSearchParams(location.search).has('log') ? [] : null;
+
+function emit(event) {
+  if (frameLog) frameLog.push(event.bytes ? { dir: 'in', bytes: event.bytes } : { dir: 'event', event });
+  window.sanctumTransport.emit(event);
+}
+
+function finish(id, { quiet = false } = {}) {
+  const peer = peers.get(id);
+  if (!peer) return;
+  peers.delete(id);
+  peer.queue = [];
+  try {
+    if (peer.channel) peer.channel.close();
+    peer.pc.close();
+  } catch { /* closing is all that was wanted */ }
+  if (!quiet) emit({ ev: 'closed', id });
+}
+
+function pump(id, peer) {
+  const { channel } = peer;
+  if (!channel || channel.readyState !== 'open') return;
+  try {
+    while (peer.head < peer.queue.length && channel.bufferedAmount < HIGH_WATER_BYTES) {
+      channel.send(peer.queue[peer.head]);
+      peer.queue[peer.head] = null;
+      peer.head += 1;
+    }
+  } catch {
+    finish(id);
+    return;
+  }
+  if (peer.head === peer.queue.length) {
+    peer.queue = [];
+    peer.head = 0;
+  }
+}
+
+function bindChannel(id, peer, channel) {
+  peer.channel = channel;
+  channel.binaryType = 'arraybuffer';
+  channel.bufferedAmountLowThreshold = LOW_WATER_BYTES;
+  channel.onopen = () => {
+    if (peers.get(id) !== peer) return;
+    emit({ ev: 'open', id });
+    pump(id, peer);
+  };
+  channel.onbufferedamountlow = () => pump(id, peer);
+  channel.onmessage = (e) => {
+    if (peers.get(id) === peer && e.data instanceof ArrayBuffer) emit({ ev: 'data', id, bytes: new Uint8Array(e.data) });
+  };
+  channel.onclose = () => finish(id);
+  channel.onerror = () => finish(id);
+}
+
+// A candidate can turn up before the description it belongs after has gone out.
+function describedLocally(id, peer, description) {
+  emit({ ev: 'signal', id, data: { kind: description.type, sdp: description.sdp } });
+  peer.described = true;
+  for (const data of peer.early) emit({ ev: 'signal', id, data });
+  peer.early = [];
+}
+
+function open({ id, initiator, iceServers }) {
+  const pc = new RTCPeerConnection({ iceServers });
+  const peer = { pc, channel: null, queue: [], head: 0, described: false, early: [] };
+  peers.set(id, peer);
+  pc.onicecandidate = (e) => {
+    if (!e.candidate || !e.candidate.candidate) return;
+    const { candidate, sdpMid, sdpMLineIndex } = e.candidate;
+    const data = { kind: 'candidate', candidate, sdpMid, sdpMLineIndex };
+    if (peer.described) emit({ ev: 'signal', id, data });
+    else peer.early.push(data);
+  };
+  pc.onconnectionstatechange = () => {
+    if (['disconnected', 'failed', 'closed'].includes(pc.connectionState)) finish(id);
+  };
+  if (initiator) {
+    bindChannel(id, peer, pc.createDataChannel('sanctum', { ordered: true }));
+    pc.createOffer()
+      .then((offer) => pc.setLocalDescription(offer).then(() => describedLocally(id, peer, offer)))
+      .catch(() => finish(id));
+  } else {
+    pc.ondatachannel = (e) => {
+      if (peer.channel) e.channel.close();
+      else bindChannel(id, peer, e.channel);
+    };
+  }
+}
+
+function signal({ id, data }) {
+  const peer = peers.get(id);
+  if (!peer) return;
+  const { pc } = peer;
+  if (data.kind === 'candidate') {
+    const { candidate, sdpMid, sdpMLineIndex } = data;
+    // One bad candidate doesn't stop the others from working.
+    pc.addIceCandidate({ candidate, sdpMid, sdpMLineIndex }).catch(() => {});
+  } else if (data.kind === 'offer') {
+    pc.setRemoteDescription({ type: 'offer', sdp: data.sdp })
+      .then(() => pc.createAnswer())
+      .then((answer) => pc.setLocalDescription(answer).then(() => describedLocally(id, peer, answer)))
+      .catch(() => finish(id));
+  } else if (data.kind === 'answer') {
+    pc.setRemoteDescription({ type: 'answer', sdp: data.sdp }).catch(() => finish(id));
+  }
+}
+
+function send({ id, bytes }) {
+  const peer = peers.get(id);
+  if (!peer) return;
+  if (frameLog) frameLog.push({ dir: 'out', bytes });
+  peer.queue.push(bytes);
+  pump(id, peer);
+}
+
+window.sanctumTransport.onCommand((command) => {
+  if (frameLog && command.op !== 'send') frameLog.push({ dir: 'command', command });
+  if (command.op === 'open') open(command);
+  else if (command.op === 'signal') signal(command);
+  else if (command.op === 'send') send(command);
+  else if (command.op === 'close') finish(command.id, { quiet: true });
+});
+emit({ ev: 'ready' });
+</script>
+</body>
+</html>

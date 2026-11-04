@@ -13,6 +13,7 @@ const { killTree } = require('./lib/kill-tree');
 const { createKeystore, retryTransient } = require('./lib/remote/keystore');
 const { createManager: createRemoteManager } = require('./lib/remote/manager');
 const remoteRelayClient = require('./lib/remote/relay-client');
+const { createDirectPath } = require('./lib/remote/direct-path');
 
 // Chunks sent before an invoke returns are lost, because the preload can't listen
 // for a channel until it knows the name. This holds them until the reply is out.
@@ -389,6 +390,8 @@ function createWindow() {
     }
   });
   mainWindow.setMenuBarVisibility(false);
+  // Otherwise the hidden window would keep the app running with nothing to show for it.
+  mainWindow.on('closed', closeRemoteTransport);
 
   // Web links open in the user's browser, never in a window of this app. The app
   // itself only ever shows its own page.
@@ -535,6 +538,58 @@ ipcMain.handle('config:get', () => ({ ollamaUrl: OLLAMA_URL }));
 // =================== REMOTE CONTROL ===================
 // All of the logic is in lib/remote/. This is only the Electron wiring.
 let remoteManager = null;
+let remoteTransportWindow = null;
+
+// For the tests in e2e/ only, so never in a packaged app, and nothing a peer says reaches them.
+//   log        the hidden window keeps a record of what it was handed
+//   no-stun    no STUN server, so a test only touches this machine's own networking
+//   block-ice  no candidates cross, so a data channel can never form
+const remoteTestFlags = new Set(app.isPackaged ? [] : String(process.env.SANCTUM_REMOTE_TEST || '').split(','));
+
+// Direct connections need WebRTC, which Electron only has in a renderer, so they live in this
+// window. It's hidden and sandboxed, and only ever sees ciphertext. None if the main window is
+// gone, as on a Mac after closing it, when the relay does the work until there's one again.
+function openRemoteTransport({ onEvent, onGone }) {
+  if (!mainWindow || mainWindow.isDestroyed()) return null;
+  const win = new BrowserWindow({
+    show: false,
+    skipTaskbar: true,
+    title: 'Sanctum transport',
+    webPreferences: {
+      preload: path.join(__dirname, 'remote-transport-preload.js'),
+      contextIsolation: true,
+      sandbox: true,
+      nodeIntegration: false,
+      backgroundThrottling: false
+    }
+  });
+  remoteTransportWindow = win;
+  const contents = win.webContents;
+  contents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  contents.on('will-navigate', (e) => e.preventDefault());
+  contents.ipc.on('remote-transport:event', (e, event) => {
+    if (e.senderFrame === contents.mainFrame) onEvent(event);
+  });
+  // Either way the window is no use now, and the next attempt opens another.
+  contents.on('render-process-gone', () => win.destroy());
+  contents.on('did-fail-load', (_e, _code, _text, _url, isMainFrame) => {
+    if (isMainFrame) win.destroy();
+  });
+  win.once('closed', () => {
+    if (remoteTransportWindow === win) remoteTransportWindow = null;
+    onGone();
+  });
+  win.loadFile(path.join(__dirname, 'remote-transport.html'), remoteTestFlags.has('log') ? { query: { log: '1' } } : {}).catch(() => {});
+  return {
+    send(command) {
+      if (!win.isDestroyed()) contents.send('remote-transport:command', command);
+    }
+  };
+}
+
+function closeRemoteTransport() {
+  if (remoteTransportWindow && !remoteTransportWindow.isDestroyed()) remoteTransportWindow.close();
+}
 
 // The address holds the relay's secret. It's only ever read from here and passed on, and
 // never logged.
@@ -597,7 +652,13 @@ function startRemoteControl() {
     relay: remoteRelayClient,
     addressStore: remoteAddressStore(path.join(userData, 'remote-service.json')),
     autoUnlock: { ...remoteAutoUnlockFile(path.join(userData, 'remote-autounlock.bin')), protect, unprotect },
-    deviceName: os.hostname()
+    deviceName: os.hostname(),
+    createDirect: (callbacks) => createDirectPath({
+      ...callbacks,
+      openTransport: openRemoteTransport,
+      iceServers: remoteTestFlags.has('no-stun') ? [] : undefined,
+      blockCandidates: remoteTestFlags.has('block-ice')
+    })
   });
   remoteManager.onFrame((deviceId, frame) => sendToLocalUi('remote:frame', { deviceId, frame }));
   remoteManager.onStatus((status) => sendToLocalUi('remote:status', status));

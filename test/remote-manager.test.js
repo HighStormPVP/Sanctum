@@ -277,7 +277,8 @@ function newWorld(t) {
         },
         autoUnlock: device.autoUnlock,
         clock: world.clock,
-        deviceName: name
+        deviceName: name,
+        createDirect: device.createDirect
       });
       device.manager.onFrame((id, frame) => device.frames.push({ id, frame }));
       device.manager.onStatus((status) => device.statuses.push(status));
@@ -1233,12 +1234,15 @@ test('the manager has no route from a frame to anything but onFrame listeners', 
     'send', 'setAddress', 'setControlAllowed', 'setPin', 'shutdown', 'status', 'unlock'
   ]);
 
-  // The code that handles what arrives never mentions the switch, and doesn't branch on what a frame says.
+  // The code that handles what arrives never mentions the switch, and doesn't branch on what
+  // a frame says, but for the one test that hands signaling to the direct path.
   const source = fs.readFileSync(path.join(__dirname, '..', 'lib', 'remote', 'manager.js'), 'utf8');
   const receiving = source.slice(source.indexOf('// ---- Receiving ----'), source.indexOf('// ---- Pairing, home side ----'));
   assert.ok(receiving.includes('notify(frameListeners'));
   assert.ok(!/control/i.test(receiving));
-  assert.ok(!/frame.(t|type|method|kind)/.test(receiving));
+  const signaling = 'if (frame.type === FRAME_RTC) return receiveSignal(conn, frame.data);';
+  assert.equal(receiving.split(signaling).length, 2);
+  assert.ok(!/frame\.(t|type|method|kind)\b/.test(receiving.replace(signaling, '')));
 });
 
 test('setControlAllowed is refused unless the caller says it is the local UI', async (t) => {
@@ -3657,4 +3661,323 @@ test('relay client: the pairing channel opens on the right path and wraps its me
 
   socket._receiver.emit('conclude', 1000, Buffer.from('no pairing in progress'));
   assert.equal(events.closed, 1);
+});
+
+// ---- Direct connections, with a fake direct path ----
+
+// Stands in for lib/remote/direct-path.js on one device, and records what the manager asks.
+function fakeDirect() {
+  const fake = {
+    calls: [],
+    sent: [],
+    throwOnSend: false,
+    throwOnSignal: false,
+    create(callbacks) {
+      fake.callbacks = callbacks;
+      return {
+        connect: (id, initiator) => fake.calls.push(['connect', id, initiator]),
+        signal: (id, data) => {
+          if (fake.throwOnSignal) throw new Error('boom');
+          fake.calls.push(['signal', id, data]);
+        },
+        send: (id, bytes) => {
+          if (fake.throwOnSend) throw new Error('channel closed');
+          fake.sent.push({ id, bytes: Uint8Array.from(bytes) });
+        },
+        close: (id) => fake.calls.push(['close', id])
+      };
+    },
+    of: (op) => fake.calls.filter((call) => call[0] === op)
+  };
+  return fake;
+}
+
+async function connectedWithDirect(t, { laptopHasDirect = true } = {}) {
+  const world = newWorld(t);
+  const home = await world.device('Home');
+  const laptop = await world.device('Laptop');
+  home.direct = fakeDirect();
+  home.createDirect = home.direct.create;
+  if (laptopHasDirect) {
+    laptop.direct = fakeDirect();
+    laptop.createDirect = laptop.direct.create;
+  }
+  seedPair(home, laptop);
+  home.start();
+  laptop.start();
+  world.relay.pump();
+  assert.equal(home.entry(laptop.id).connected, true);
+  assert.equal(laptop.entry(home.id).connected, true);
+  return { world, home, laptop };
+}
+
+// Hands over what each end's direct path has been given to send, as the channel would.
+function pumpDirect({ home, laptop }) {
+  for (let moved = true; moved;) {
+    moved = false;
+    for (const [from, to] of [[home, laptop], [laptop, home]]) {
+      for (const { bytes } of from.direct.sent.splice(0)) {
+        moved = true;
+        to.direct.callbacks.onData(from.id, bytes);
+      }
+    }
+  }
+}
+
+function goDirect(ends) {
+  ends.home.direct.callbacks.onOpen(ends.laptop.id);
+  ends.laptop.direct.callbacks.onOpen(ends.home.id);
+  pumpDirect(ends);
+}
+
+// Ends the home side's connection with a frame that won't decrypt, and lets a new session
+// form. It goes over the relay, so the laptop's direct path has to be down for this.
+function breakSession({ world, home, laptop }) {
+  laptop.direct.callbacks.onClose(home.id);
+  const { connectionId, nextSeq } = liveLinkState(world, laptop, home);
+  world.relay.inject(laptop.id, home.id, forgeLink(DATA, connectionId, nextSeq, new Uint8Array(64)));
+  world.relay.pump();
+}
+
+test('the home-role side initiates, and each side connects when the session goes live', async (t) => {
+  const { home, laptop } = await connectedWithDirect(t);
+  assert.deepEqual(home.direct.of('connect'), [['connect', laptop.id, true]]);
+  assert.deepEqual(laptop.direct.of('connect'), [['connect', home.id, false]]);
+  assert.deepEqual(home.direct.of('close'), []);
+});
+
+test('a device of both roles decides who initiates per connection, by the peer', async (t) => {
+  const world = newWorld(t);
+  const middle = await world.device('Middle');
+  const above = await world.device('Above');
+  const below = await world.device('Below');
+  middle.direct = fakeDirect();
+  middle.createDirect = middle.direct.create;
+  seedPair(above, middle);
+  seedPair(middle, below);
+  above.start();
+  middle.start();
+  below.start();
+  world.relay.pump();
+  const connects = new Map(middle.direct.of('connect').map(([, id, initiator]) => [id, initiator]));
+  assert.equal(connects.get(above.id), false);
+  assert.equal(connects.get(below.id), true);
+});
+
+test('signaling crosses inside the encrypted session and never reaches the renderer', async (t) => {
+  const { world, home, laptop } = await connectedWithDirect(t);
+  const data = { attempt: 1, kind: 'offer', sdp: 'a-very-recognizable-session-description' };
+  const start = world.relay.log.length;
+  home.direct.callbacks.onSignal(laptop.id, data);
+  world.relay.pump();
+
+  assert.deepEqual(laptop.direct.of('signal'), [['signal', home.id, data]]);
+  assert.deepEqual(laptop.frames, []);
+  const sent = world.relay.log.slice(start).filter((m) => m.from === home.id);
+  assert.ok(sent.length > 0);
+  for (const message of sent) {
+    assert.equal(message.data.t, 'link');
+    const raw = Buffer.from(message.data.b, 'base64').toString('latin1');
+    assert.ok(!raw.includes('recognizable'));
+    assert.ok(!raw.includes('rtc'));
+  }
+});
+
+test('a device with no direct path still keeps signaling away from the renderer', async (t) => {
+  const { world, home, laptop } = await connectedWithDirect(t, { laptopHasDirect: false });
+  home.direct.callbacks.onSignal(laptop.id, { attempt: 1, kind: 'offer', sdp: 's' });
+  world.relay.pump();
+  assert.deepEqual(laptop.frames, []);
+  assert.equal(home.manager.send(laptop.id, { type: 'chat' }), true);
+  world.relay.pump();
+  assert.deepEqual(laptop.frames.map((f) => f.frame), [{ type: 'chat' }]);
+  assert.equal(laptop.entry(home.id).path, 'relay');
+});
+
+test('the renderer cannot send a frame the other end would take as signaling', async (t) => {
+  const { world, home, laptop } = await connectedWithDirect(t);
+  assert.equal(home.manager.send(laptop.id, { type: 'rtc', data: { attempt: 1, kind: 'offer', sdp: 's' } }), false);
+  world.relay.pump();
+  assert.deepEqual(laptop.direct.of('signal'), []);
+  // Other frames are as they were, including ones merely called something like it.
+  assert.equal(home.manager.send(laptop.id, { type: 'RTC' }), true);
+  assert.equal(home.manager.send(laptop.id, { t: 'rtc' }), true);
+  world.relay.pump();
+  assert.deepEqual(laptop.frames.map((f) => f.frame), [{ type: 'RTC' }, { t: 'rtc' }]);
+});
+
+test('signaling with bad data is left for the path to check, and a path that throws costs nothing', async (t) => {
+  const { world, home, laptop } = await connectedWithDirect(t);
+  home.direct.callbacks.onSignal(laptop.id, 'nonsense');
+  world.relay.pump();
+  assert.deepEqual(laptop.direct.of('signal').map((call) => call[2]), ['nonsense']);
+  assert.deepEqual(laptop.frames, []);
+
+  laptop.direct.throwOnSignal = true;
+  home.direct.callbacks.onSignal(laptop.id, { boom: true });
+  world.relay.pump();
+  assert.equal(laptop.entry(home.id).connected, true);
+  assert.equal(home.manager.send(laptop.id, { still: 'working' }), true);
+  world.relay.pump();
+  assert.deepEqual(laptop.frames.map((f) => f.frame), [{ still: 'working' }]);
+});
+
+test('status follows the path: direct when open, relay when closed, and it stays connected throughout', async (t) => {
+  const { home, laptop } = await connectedWithDirect(t);
+  assert.equal(home.entry(laptop.id).path, 'relay');
+  home.statuses.length = 0;
+
+  home.direct.callbacks.onOpen(laptop.id);
+  assert.equal(home.entry(laptop.id).path, 'direct');
+  assert.equal(home.entry(laptop.id).connected, true);
+  assert.equal(home.statuses.at(-1).devices[0].path, 'direct');
+
+  home.direct.callbacks.onClose(laptop.id);
+  assert.equal(home.entry(laptop.id).path, 'relay');
+  assert.equal(home.entry(laptop.id).connected, true);
+  assert.equal(home.statuses.at(-1).devices[0].path, 'relay');
+  assert.ok(home.statuses.every((status) => status.devices[0].connected));
+});
+
+test('while direct, frames go over it and not the relay, and arrive once and in order across switches', async (t) => {
+  const ends = await connectedWithDirect(t);
+  const { world, home, laptop } = ends;
+  goDirect(ends);
+  const relayed = world.relay.log.length;
+
+  for (let n = 0; n < 5; n++) assert.equal(home.manager.send(laptop.id, { n }), true);
+  assert.equal(home.direct.sent.length, 5);
+  pumpDirect(ends);
+  assert.equal(world.relay.log.length, relayed);
+
+  // Frames lost with the channel: the link still has them, so the relay carries them.
+  for (let n = 5; n < 10; n++) home.manager.send(laptop.id, { n });
+  home.direct.sent.length = 0;
+  home.direct.callbacks.onClose(laptop.id);
+  laptop.direct.callbacks.onClose(home.id);
+  for (let n = 10; n < 15; n++) home.manager.send(laptop.id, { n });
+  world.relay.pump();
+
+  // And back again, with some of the same frames on their way down both paths.
+  for (let n = 15; n < 20; n++) home.manager.send(laptop.id, { n });
+  goDirect(ends);
+  for (let n = 20; n < 25; n++) home.manager.send(laptop.id, { n });
+  pumpDirect(ends);
+  world.relay.pump();
+
+  assert.deepEqual(laptop.frames.map((f) => f.frame.n), Array.from({ length: 25 }, (_, n) => n));
+});
+
+test('a frame split into parts arrives whole over the direct path', async (t) => {
+  const ends = await connectedWithDirect(t);
+  const { home, laptop } = ends;
+  goDirect(ends);
+  const text = 'x'.repeat(2 * MIB);
+  assert.equal(home.manager.send(laptop.id, { text }), true);
+  pumpDirect(ends);
+  assert.equal(laptop.frames.length, 1);
+  assert.equal(laptop.frames[0].frame.text, text);
+});
+
+test('what a direct path carries is the same sealed bytes the relay would carry', async (t) => {
+  const ends = await connectedWithDirect(t);
+  const { home, laptop } = ends;
+  goDirect(ends);
+  home.manager.send(laptop.id, { secret: 'something-that-must-stay-sealed' });
+  assert.equal(home.direct.sent.length, 1);
+  assert.ok(!Buffer.from(home.direct.sent[0].bytes).toString('latin1').includes('must-stay-sealed'));
+  pumpDirect(ends);
+  assert.equal(laptop.frames[0].frame.secret, 'something-that-must-stay-sealed');
+});
+
+test('a connection that ends closes its direct path, and the new one starts another', async (t) => {
+  const ends = await connectedWithDirect(t);
+  const { home, laptop } = ends;
+  goDirect(ends);
+  breakSession(ends);
+
+  for (const [device, peer, initiator] of [[home, laptop, true], [laptop, home, false]]) {
+    assert.deepEqual(device.direct.of('close'), [['close', peer.id]]);
+    assert.deepEqual(device.direct.of('connect'), [['connect', peer.id, initiator], ['connect', peer.id, initiator]]);
+    assert.equal(device.entry(peer.id).connected, true);
+    assert.equal(device.entry(peer.id).path, 'relay', 'a new link starts on the relay');
+    // Closed before the next one connects, so the two can't overlap.
+    const ops = device.direct.calls.map((call) => call[0]);
+    assert.deepEqual(ops, ['connect', 'close', 'connect']);
+  }
+});
+
+test('what a replaced connection left behind can do nothing to the new one', async (t) => {
+  const ends = await connectedWithDirect(t);
+  const { world, home, laptop } = ends;
+  goDirect(ends);
+  // Sealed under the old connection, and not delivered yet.
+  home.manager.send(laptop.id, { n: 'old' });
+  const stale = home.direct.sent.splice(0).map((entry) => entry.bytes);
+  breakSession(ends);
+  assert.equal(laptop.entry(home.id).connected, true);
+
+  laptop.frames.length = 0;
+  for (const bytes of stale) laptop.direct.callbacks.onData(home.id, bytes);
+  assert.deepEqual(laptop.frames, []);
+  assert.equal(laptop.entry(home.id).connected, true);
+  assert.equal(home.manager.send(laptop.id, { n: 'new' }), true);
+  world.relay.pump();
+  assert.deepEqual(laptop.frames.map((f) => f.frame.n), ['new']);
+});
+
+test('events for a device with nothing live are harmless', async (t) => {
+  const { home, laptop } = await connectedWithDirect(t);
+  assert.equal(home.manager.removeDevice(laptop.id).ok, true);
+  assert.deepEqual(home.direct.of('close'), [['close', laptop.id]]);
+  const { callbacks } = home.direct;
+  callbacks.onOpen(laptop.id);
+  callbacks.onClose(laptop.id);
+  callbacks.onData(laptop.id, Uint8Array.of(1, 2, 3));
+  callbacks.onSignal(laptop.id, { attempt: 1, kind: 'offer', sdp: 's' });
+  callbacks.onOpen('someone-else');
+  callbacks.onSignal('someone-else', {});
+  assert.deepEqual(home.manager.status().devices, []);
+});
+
+test('junk bytes from the direct path are dropped by the link, and the connection stays', async (t) => {
+  const ends = await connectedWithDirect(t);
+  const { home, laptop } = ends;
+  goDirect(ends);
+  home.direct.callbacks.onData(laptop.id, new Uint8Array(0));
+  home.direct.callbacks.onData(laptop.id, Uint8Array.of(9, 9, 9));
+  home.direct.callbacks.onData(laptop.id, new Uint8Array(100));
+  assert.equal(home.entry(laptop.id).connected, true);
+  assert.equal(home.entry(laptop.id).path, 'direct');
+});
+
+test('with the relay gone the direct path carries on, and the session with it', async (t) => {
+  const ends = await connectedWithDirect(t);
+  const { world, home, laptop } = ends;
+  goDirect(ends);
+  world.relay.kill(home.id);
+  assert.equal(home.entry(laptop.id).path, 'direct');
+  assert.equal(home.entry(laptop.id).connected, true);
+  assert.deepEqual(home.direct.of('close'), []);
+  assert.equal(home.manager.send(laptop.id, { n: 1 }), true);
+  pumpDirect(ends);
+  assert.deepEqual(laptop.frames.map((f) => f.frame.n), [1]);
+});
+
+test('a channel that throws on send loses nothing, once the close arrives', async (t) => {
+  const ends = await connectedWithDirect(t);
+  const { world, home, laptop } = ends;
+  goDirect(ends);
+  home.direct.throwOnSend = true;
+  assert.equal(home.manager.send(laptop.id, { n: 1 }), true);
+  assert.equal(home.entry(laptop.id).path, 'direct');
+  home.direct.callbacks.onClose(laptop.id);
+  world.relay.pump();
+  assert.deepEqual(laptop.frames.map((f) => f.frame.n), [1]);
+});
+
+test('shutting down closes the direct path', async (t) => {
+  const { home, laptop } = await connectedWithDirect(t);
+  home.manager.shutdown();
+  assert.deepEqual(home.direct.of('close'), [['close', laptop.id]]);
 });
