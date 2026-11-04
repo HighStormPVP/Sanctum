@@ -20,8 +20,12 @@
     "electron-builder": "^25.1.8"
   },
   "dependencies": {
+    "@noble/ciphers": "1.3.0",
+    "@noble/curves": "1.9.7",
+    "@noble/hashes": "1.8.0",
     "electron-store": "^8.2.0",
-    "pdf-parse": "^1.1.1"
+    "pdf-parse": "^1.1.1",
+    "ws": "8.22.1"
   },
   "build": {
     "appId": "com.aiden.sanctum",
