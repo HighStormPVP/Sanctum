@@ -282,6 +282,10 @@ The manager takes its clients by injection, so tests can use fakes. In `main.js`
   - A 2 MiB frame arrives whole through splitting.
   - Reconnect uses backoff, capped at 30 seconds.
   - Frames from a `laptop`-role device are only ever delivered to the renderer, and `setControlAllowed` has no frame route (assert there's no such handler).
+  - Pairing, home side: the manager discards a pending code itself after 10 minutes, even if the relay never says so, because the relay is untrusted. `attemptsLeft === 0` followed by 15 seconds with no completed pairing counts as cancelled, since a guest with a wrong code goes silent and no `failed` arrives. A new `createCode` replaces the old one.
+  - Pairing, laptop side: `pair` gives up after 30 seconds with a clear error, since a host failure sends nothing back.
+  - Pairing can finish on one side only: if the home side has a verified `peer` but the last message was lost, the laptop reports failure. The home side's new device shows as offline, and removing it or pairing again must work.
+  - A peer's `name` is untrusted: empty becomes "Unnamed device", and it's trimmed to 64 characters before it's stored.
 - [ ] **Step 2: Run.** Expected: FAIL.
 - [ ] **Step 3: Implement.** `relay-client.js` uses `ws` and does the challenge from Task 3. Add IPC handlers and preload methods. Keep `preload.js` free of Node requires beyond `electron`.
 - [ ] **Step 4: Run** `npm test`. Expected: all pass.
