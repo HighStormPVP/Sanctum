@@ -813,3 +813,201 @@ test('a throwing availability check counts as unavailable', (t) => {
   assert.deepStrictEqual(fs.readdirSync(dir), ['remote.keys']);
   assert.strictEqual(fs.readFileSync(file, 'utf8'), 'whatever');
 });
+
+// --- unlock racing lock(), reload() and protection going down ---------------
+
+const nodeCrypto = require('node:crypto');
+
+// Holds scrypt's result back until release() is called, so a test can run
+// lock() or reload() while an unlock is in flight.
+function gatedScrypt() {
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  let reached;
+  const arrived = new Promise((resolve) => { reached = resolve; });
+  const install = () => {
+    const real = nodeCrypto.scrypt;
+    nodeCrypto.scrypt = (...args) => {
+      const done = args.pop();
+      real(...args, (err, key) => { reached(); gate.then(() => done(err, key)); });
+    };
+    return () => { nodeCrypto.scrypt = real; };
+  };
+  return { install, arrived, release: () => release() };
+}
+
+async function inFlight(ks, pin, interfere) {
+  const gated = gatedScrypt();
+  const restore = gated.install();
+  try {
+    const pending = ks.unlock(pin);
+    await gated.arrived;
+    interfere();
+    gated.release();
+    return await pending;
+  } finally {
+    restore();
+  }
+}
+
+test('lock() or reload() during an in-flight correct PIN keeps the store locked', async (t) => {
+  for (const interfere of ['lock', 'reload']) {
+    const { file, make } = fixture(t);
+    const ks = make();
+    await ks.setPin(PIN);
+    ks.lock();
+    const result = await inFlight(ks, PIN, () => ks[interfere]());
+    assert.strictEqual(result.ok, false, interfere);
+    assert.ok(result.error, interfere);
+    assert.strictEqual(ks.isUnlocked(), false, interfere);
+    assert.strictEqual(ks.getIdentity(), null, interfere);
+    // The guess was counted and is not refunded.
+    assert.strictEqual(JSON.parse(fs.readFileSync(file, 'utf8')).attempts.failed, 1, interfere);
+    assert.deepStrictEqual(await ks.unlock(PIN), { ok: true }, interfere);
+  }
+});
+
+test('lock() or reload() during an in-flight tenth wrong PIN does not wipe', async (t) => {
+  for (const interfere of ['lock', 'reload']) {
+    const { file, clock, make } = fixture(t);
+    const ks = make();
+    await ks.setPin(PIN);
+    ks.lock();
+    await failTimes(ks, clock, 9);
+    const result = await inFlight(ks, WRONG, () => ks[interfere]());
+    assert.strictEqual(result.wiped, undefined, interfere);
+    assert.strictEqual(result.ok, false, interfere);
+    assert.strictEqual(ks.hasPin(), true, interfere);
+    const doc = JSON.parse(fs.readFileSync(file, 'utf8'));
+    assert.notStrictEqual(doc.pin, null, interfere);
+    assert.strictEqual(doc.attempts.failed, 10, 'counted, not refunded');
+    // One more wrong guess (after the wait) does wipe.
+    clock.t += 10 * 60 * 1000;
+    assert.deepStrictEqual(await ks.unlock(WRONG), { ok: false, wiped: true }, interfere);
+  }
+});
+
+test('a tenth wrong PIN finishing after protection went down deletes nothing', async (t) => {
+  const { file, clock, make } = fixture(t);
+  let ready = true;
+  const ks = make({ isProtectionAvailable: () => ready });
+  await ks.setPin(PIN);
+  ks.lock();
+  await failTimes(ks, clock, 9);
+  const pinBefore = JSON.parse(fs.readFileSync(file, 'utf8')).pin;
+  const result = await inFlight(ks, WRONG, () => { ready = false; ks.reload(); });
+  assert.strictEqual(ks.isAvailable(), false);
+  assert.strictEqual(result.wiped, undefined);
+  assert.strictEqual(result.ok, false);
+  // Only the attempt record changed; the keys are still there.
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(file, 'utf8')).pin, pinBefore);
+  ready = true;
+  assert.strictEqual(ks.reload(), true);
+  assert.strictEqual(ks.hasPin(), true);
+});
+
+test('unlock while already unlocked returns ok without testing or counting', async (t) => {
+  const { file, make } = fixture(t);
+  const ks = make();
+  await ks.setPin(PIN);
+  const before = fs.readFileSync(file);
+  for (let i = 0; i < 12; i++) assert.deepStrictEqual(await ks.unlock(WRONG), { ok: true });
+  assert.deepStrictEqual(await ks.unlock(undefined), { ok: true });
+  assert.strictEqual(ks.isUnlocked(), true);
+  assert.strictEqual(ks.hasPin(), true);
+  assert.deepStrictEqual(fs.readFileSync(file), before);
+  ks.addPeer(peer(1));
+  assert.strictEqual(JSON.parse(fs.readFileSync(file, 'utf8')).attempts.failed, 0);
+});
+
+// --- transient read errors at load ------------------------------------------
+
+function readOnlyFor(target, behave) {
+  return (real) => (given, ...rest) => (given === target ? behave(real, given, ...rest) : real(given, ...rest));
+}
+
+test('a read that fails briefly with EBUSY is retried at load', async (t) => {
+  const { dir, file, make } = fixture(t);
+  const first = make();
+  await first.setPin(PIN);
+  let calls = 0;
+  const ks = patched(fs, 'readFileSync', readOnlyFor(file, (real, ...args) => {
+    if (++calls <= 2) throw lockError('EBUSY');
+    return real(...args);
+  }), () => make());
+  assert.strictEqual(calls, 3);
+  assert.strictEqual(ks.isAvailable(), true);
+  assert.strictEqual(ks.hasPin(), true);
+  assert.deepStrictEqual(fs.readdirSync(dir), ['remote.keys']);
+});
+
+test('a read that keeps failing with EPERM leaves the file alone until reload() recovers', async (t) => {
+  const { dir, file, make } = fixture(t);
+  const first = make();
+  await first.setPin(PIN);
+  first.addPeer(peer(1));
+  first.setControlAllowed(true);
+  const before = fs.readFileSync(file);
+
+  let blocked = true;
+  const guard = readOnlyFor(file, (real, ...args) => {
+    if (blocked) throw lockError('EPERM');
+    return real(...args);
+  });
+  const ks = patched(fs, 'readFileSync', guard, () => make());
+  assert.strictEqual(ks.isAvailable(), false);
+  assert.strictEqual(ks.hasPin(), false);
+  assert.strictEqual(ks.getControlAllowed(), false);
+  assert.throws(() => ks.setControlAllowed(false), /in use by another program/i);
+  const refused = await ks.unlock(PIN);
+  assert.strictEqual(refused.ok, false);
+  assert.match(refused.error, /in use by another program/i);
+  assert.deepStrictEqual(fs.readFileSync(file), before);
+  assert.deepStrictEqual(fs.readdirSync(dir), ['remote.keys'], 'nothing set aside');
+
+  // Still blocked on reload(): still unavailable, still untouched.
+  assert.strictEqual(patched(fs, 'readFileSync', guard, () => ks.reload()), false);
+  assert.deepStrictEqual(fs.readdirSync(dir), ['remote.keys']);
+
+  blocked = false;
+  assert.strictEqual(ks.reload(), true);
+  assert.strictEqual(ks.hasPin(), true);
+  assert.strictEqual(ks.getControlAllowed(), true);
+  assert.deepStrictEqual(await ks.unlock(PIN), { ok: true });
+  assert.deepStrictEqual(ks.listPeers(), [peer(1)]);
+});
+
+test('an unreadable path that is not a transient lock is still set aside', (t) => {
+  const { dir, file, make } = fixture(t);
+  fs.writeFileSync(file, 'x');
+  const ks = patched(fs, 'readFileSync', readOnlyFor(file, () => { throw lockError('EIO'); }), () => make());
+  assert.strictEqual(ks.isAvailable(), true);
+  assert.strictEqual(fs.readdirSync(dir).filter((f) => f.includes('.unreadable.')).length, 1);
+});
+
+// --- the counter reset after a correct PIN ----------------------------------
+
+test('if the reset write fails after a correct PIN, the next successful write carries it', async (t) => {
+  const { file, clock, make } = fixture(t);
+  const ks = make();
+  await ks.setPin(PIN);
+  ks.lock();
+  await failTimes(ks, clock, 5);
+  assert.strictEqual(JSON.parse(fs.readFileSync(file, 'utf8')).attempts.failed, 5);
+
+  // The first write (recording the attempt) lands; the second (the reset) fails.
+  let renames = 0;
+  const result = await patched(fs, 'renameSync', (real) => (...args) => {
+    if (++renames === 2) throw lockError('ENOSPC');
+    return real(...args);
+  }, () => ks.unlock(PIN));
+  assert.deepStrictEqual(result, { ok: true });
+  assert.strictEqual(JSON.parse(fs.readFileSync(file, 'utf8')).attempts.failed, 6, 'disk still high');
+
+  ks.setControlAllowed(true); // any successful write
+  assert.strictEqual(JSON.parse(fs.readFileSync(file, 'utf8')).attempts.failed, 0);
+
+  // In memory it was already clear, so three free guesses follow.
+  ks.lock();
+  for (let i = 0; i < 3; i++) assert.deepStrictEqual(await ks.unlock(WRONG), { ok: false, waitMs: 0 });
+});
