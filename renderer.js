@@ -259,8 +259,24 @@ function saveSettings() {
 }
 
 // ============== CHATS ==============
-function createChat(modelOverride, modalityOverride, extraFields) {
+// A new chat, without touching what's on screen. A laptop's new chat stops here, because the
+// person at the home PC is doing something else.
+function addChat(model, modality, extraFields) {
   const id = 'c_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+  state.chats[id] = {
+    id, title: '', model, modality,
+    createdAt: Date.now(), updatedAt: Date.now(),
+    messages: [],
+    // Default web search ON; updateUIForChat() flips it off if the chosen
+    // model isn't tools-capable. extraFields can still override.
+    webEnabled: true,
+    ...(extraFields || {})
+  };
+  state.order.unshift(id);
+  return state.chats[id];
+}
+
+function createChat(modelOverride, modalityOverride, extraFields) {
   // Default-model priority: explicit override → currently-active chat's model
   // → the last model the user picked anywhere → first-installed fallback.
   // So new chats inherit your most recent selection instead of snapping back
@@ -278,16 +294,7 @@ function createChat(modelOverride, modalityOverride, extraFields) {
   // wanted a plain chat). Explicit modality (createAgenticChat, etc.) still
   // wins via modalityOverride.
   const modality = modalityOverride || 'chat';
-  state.chats[id] = {
-    id, title: '', model: defaultModel, modality,
-    createdAt: Date.now(), updatedAt: Date.now(),
-    messages: [],
-    // Default web search ON; updateUIForChat() flips it off if the chosen
-    // model isn't tools-capable. extraFields can still override.
-    webEnabled: true,
-    ...(extraFields || {})
-  };
-  state.order.unshift(id);
+  const { id } = addChat(defaultModel, modality, extraFields);
   // A normal chat belongs to Home; a project (modalityOverride 'agent') to
   // Code. Align the workspace so the new chat is actually visible in the list.
   state.space = modality === 'agent' ? 'code' : 'home';
@@ -326,7 +333,12 @@ function createAgenticChat() {
     model = bySize[0]?.tag || installed[0] || firstAvailableModel();
   }
   if (!model) return;
-  createChat(model, 'agent', {
+  createChat(model, 'agent', agenticChatFields());
+}
+
+// How every agentic chat starts, wherever it was asked for.
+function agenticChatFields() {
+  return {
     planMode: true,             // safer default — plan first, no execution
     approvalMode: false,        // mutex with planMode + noApproval
     noApproval: false,          // YOLO — explicit opt-in, never default
@@ -338,20 +350,25 @@ function createAgenticChat() {
     commandAllowlist: [],
     maxSteps: 5,
     contextWindow: 8192         // 8K — safe for 32 GB systems running Qwen3 30B
-  });
+  };
 }
 
 function setActive(id) {
+  const wasRemote = !!currentChat()?.remote;
   state.activeId = id;
   state.pendingAttachments = [];
+  hideRemoteGone();
   renderAttachments();
   renderActiveChat();
   renderChatList();
   saveToStorage();
+  // A remote chat's models are the home PC's, so the list is a different one.
+  if (wasRemote || currentChat()?.remote) populateModelPicker();
+  takeReturnedDraft(currentChat());
 }
 
 function deleteChat(id) {
-  if (state.chats[id]?.remote) return; // it's the home PC's to delete
+  if (state.chats[id]?.remote) { askHome(state.chats[id], 'delete'); return; } // it's the home PC's to delete
   if (state.runningChats.has(id)) stopChat(id);
   delete state.chats[id];
   state.order = state.order.filter(x => x !== id);
@@ -450,7 +467,7 @@ Title:`;
     if (title && title.length > 1) {
       c.title = title;
       saveToStorage();
-      renderActiveChat();
+      renderIfOpen(c);
       renderChatList();
     }
   } catch { /* silent — autoTitle stays */ }
@@ -1774,13 +1791,28 @@ function wireSidebar() {
   }
 }
 
+// The three safety modes and the chat field each one is. Exactly one is ever on.
+const SAFETY_MODES = { plan: 'planMode', approval: 'approvalMode', noApproval: 'noApproval' };
+
+// Every way of changing a chat's mode comes through here, so none can leave two on.
+function setSafetyMode(c, mode) {
+  for (const [name, field] of Object.entries(SAFETY_MODES)) c[field] = name === mode;
+  if (currentChat() === c) {
+    $('#toggle-plan')?.setAttribute('aria-pressed', c.planMode ? 'true' : 'false');
+    $('#toggle-approval')?.setAttribute('aria-pressed', c.approvalMode ? 'true' : 'false');
+    $('#toggle-noapproval')?.setAttribute('aria-pressed', c.noApproval ? 'true' : 'false');
+  }
+  saveToStorage();
+}
+
 function wireAgentBar() {
   const simpleToggle = (btnId, fieldName) => {
     const btn = $(`#${btnId}`);
     if (!btn) return;
     btn.addEventListener('click', () => {
       const c = currentChat();
-      if (!c || c.remote || c.modality !== 'agent') return;
+      if (!c || c.modality !== 'agent') return;
+      if (c.remote) { askHome(c, 'set-toggle', { name: fieldName, value: !c[fieldName] }); return; }
       c[fieldName] = !c[fieldName];
       btn.setAttribute('aria-pressed', c[fieldName] ? 'true' : 'false');
       saveToStorage();
@@ -1791,26 +1823,20 @@ function wireAgentBar() {
   // ONE is always on. Clicking the active mode is a no-op (no "off" state) —
   // the agent must be in some safety posture. Clicking an inactive mode
   // switches to it and turns the others off. Initial default = Plan.
-  const mutexToggle = (btnId, fieldName, opposing) => {
+  const mutexToggle = (btnId, mode) => {
     const btn = $(`#${btnId}`);
     if (!btn) return;
     btn.addEventListener('click', () => {
       const c = currentChat();
-      if (!c || c.remote || c.modality !== 'agent') return;
-      if (c[fieldName]) return; // already on — clicking again would deselect
-      c[fieldName] = true;
-      btn.setAttribute('aria-pressed', 'true');
-      for (const o of opposing) {
-        c[o.field] = false;
-        const oBtn = $(`#${o.btnId}`);
-        if (oBtn) oBtn.setAttribute('aria-pressed', 'false');
-      }
-      saveToStorage();
+      if (!c || c.modality !== 'agent') return;
+      if (c[SAFETY_MODES[mode]]) return; // already on — clicking again would deselect
+      if (c.remote) { askHome(c, 'set-mode', { mode }); return; }
+      setSafetyMode(c, mode);
     });
   };
-  mutexToggle('toggle-plan',        'planMode',     [{field: 'approvalMode', btnId: 'toggle-approval'},   {field: 'noApproval',   btnId: 'toggle-noapproval'}]);
-  mutexToggle('toggle-approval',    'approvalMode', [{field: 'planMode',     btnId: 'toggle-plan'},       {field: 'noApproval',   btnId: 'toggle-noapproval'}]);
-  mutexToggle('toggle-noapproval',  'noApproval',   [{field: 'planMode',     btnId: 'toggle-plan'},       {field: 'approvalMode', btnId: 'toggle-approval'}]);
+  mutexToggle('toggle-plan',       'plan');
+  mutexToggle('toggle-approval',   'approval');
+  mutexToggle('toggle-noapproval', 'noApproval');
   simpleToggle('toggle-readonly', 'readOnly');
   simpleToggle('toggle-nofetch',  'noFetch');
 
@@ -1922,6 +1948,8 @@ function switchSpace(space) {
   saveToStorage();
   renderChatList();
   renderActiveChat();
+  populateModelPicker();
+  takeReturnedDraft(currentChat());
 }
 
 // Reflect the current workspace in the sidebar: the toggle label/title and
@@ -1930,6 +1958,7 @@ function applySpaceChrome() {
   const code = state.space === 'code';
   const label = $('#space-toggle-label');
   const btn = $('#space-toggle');
+  paintRemoteChatButton();
   if (label) label.textContent = code ? 'Home' : 'Code';
   if (btn) {
     btn.title = code ? 'Back to your normal chats' : 'Open the Code workspace';
@@ -1959,7 +1988,7 @@ function renderChatList() {
       item.innerHTML = `
         <span class="chat-title">${escapeHtml(c.title || 'New chat')}</span>
         ${modalityBadge}
-        ${c.remote ? '' : '<span class="chat-del" title="Delete">×</span>'}
+        <span class="chat-del" title="Delete">×</span>
       `;
       item.addEventListener('click', (e) => {
         if (e.target.classList.contains('chat-del')) {
@@ -2872,19 +2901,13 @@ function wireModelPicker() {
     if (!value) return;
     const c = currentChat();
     if (!c) return;
-    if (c.remote) { setOpen(false); return; }
-
-    c.model = value;
-    // Changing the model must NOT change what kind of chat this is. An agent
-    // chat (a Code-workspace project) stays an agent chat no matter which
-    // model you pick — otherwise picking a normal model flipped its modality
-    // to 'chat', which moved it out of the Code workspace and made it look
-    // deleted. Only derive modality for non-agent chats, and never let the
-    // 'cloud'/'code' catalog categories (not runtime modes) leak in.
-    if (c.modality !== 'agent') {
-      const newMod = modalityForModel(value);
-      c.modality = (newMod === 'chat' || newMod === 'vision') ? newMod : 'chat';
+    if (c.remote) {
+      setOpen(false);
+      askHome(c, 'set-model', { model: value });
+      return;
     }
+
+    setChatModel(c, value);
     // No API key configured? Prompt the user to add one before they try.
     const picked = findPick(value);
     if (picked && pickProvider(picked) !== 'ollama' && !pickReady(picked)) {
@@ -2914,6 +2937,21 @@ function wireModelPicker() {
     renderChatList();
     populateModelPicker();
   });
+}
+
+// What picking a model means for the chat itself, wherever the pick came from.
+function setChatModel(c, value) {
+  c.model = value;
+  // Changing the model must NOT change what kind of chat this is. An agent
+  // chat (a Code-workspace project) stays an agent chat no matter which
+  // model you pick — otherwise picking a normal model flipped its modality
+  // to 'chat', which moved it out of the Code workspace and made it look
+  // deleted. Only derive modality for non-agent chats, and never let the
+  // 'cloud'/'code' catalog categories (not runtime modes) leak in.
+  if (c.modality !== 'agent') {
+    const newMod = modalityForModel(value);
+    c.modality = (newMod === 'chat' || newMod === 'vision') ? newMod : 'chat';
+  }
 }
 
 // Only chat & agent are user-selectable as the active model. Vision routers
@@ -3017,6 +3055,7 @@ function populateModelPicker() {
   // ("Claude Opus 4.8") for cloud picks instead of the raw model id.
   const activePick = findPick(activeModel);
   current.textContent = activePick?.name || activeModel || 'Select a model';
+  if (activeChat?.remote) { populateRemoteModelPicker(activeChat, menu); return; }
 
   // Anything pulled from the Downloads tab lives in download-catalog.json, not
   // models.json, so it would never reach the picker — you could download 200
@@ -3225,6 +3264,50 @@ function populateModelPicker() {
   menu.appendChild(vidGroup);
 }
 
+// A remote chat runs on the home PC, so this lists that machine's models, and nothing here can
+// install one. Names came in a frame: they only ever reach the screen as text.
+function populateRemoteModelPicker(c, menu) {
+  const info = mirror.homes.get(c.remote.deviceId)?.info;
+  menu.innerHTML = '';
+  const addGroup = (label, picks, isCloud) => {
+    if (!picks.length) return;
+    const group = document.createElement('div');
+    group.className = 'cs-group';
+    const heading = document.createElement('div');
+    heading.className = 'cs-group-label';
+    heading.textContent = label;
+    group.appendChild(heading);
+    for (const p of picks) {
+      const item = document.createElement('button');
+      item.type = 'button';
+      item.className = 'cs-item' + (p.id === c.model ? ' active' : '');
+      item.dataset.value = p.id;
+      const name = document.createElement('span');
+      name.className = 'cs-item-name';
+      name.textContent = p.name;
+      item.appendChild(name);
+      if (isCloud) {
+        const badge = document.createElement('span');
+        badge.className = 'cs-item-badge cs-item-cloud-badge';
+        badge.textContent = 'cloud · ready';
+        item.appendChild(badge);
+      }
+      group.appendChild(item);
+    }
+    menu.appendChild(group);
+  };
+  const installed = (info?.installedModels || [])
+    .map(tag => ({ tag, pick: findPick(tag) }))
+    .filter(({ pick }) => !pick || pick.category === 'installed' || (SELECTABLE_CATEGORIES.has(pick.category) && !pick.multimodal))
+    .map(({ tag, pick }) => ({ id: tag, name: pick?.name || tag }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+  const cloud = allPicks()
+    .filter(p => pickProvider(p) !== 'ollama' && info?.cloudReady?.[p.provider] === true)
+    .map(p => ({ id: p.tag || p.model_id || p.id || p.file, name: p.name }));
+  addGroup('On your home PC', installed, false);
+  addGroup('Cloud, through your home PC', cloud, true);
+}
+
 // Inline pulls from the dropdown share the same pullModel function — that way
 // pause/resume/cancel work identically whether you started from the dropdown
 // row or the install banner.
@@ -3255,7 +3338,8 @@ function renderActiveChat() {
     return;
   }
 
-  $('#chat-title').value = c.title || '';
+  // A remote chat can change while its title is being edited here.
+  if (!c.remote || $('#chat-title').hasAttribute('readonly')) $('#chat-title').value = c.title || '';
   $('#chat-title').placeholder = c.title || 'New chat';
   $('#chat-modality').textContent = modalityLabel(c.modality);
   // The model picker is now a custom dropdown — its display is synced via
@@ -3266,7 +3350,7 @@ function renderActiveChat() {
   const textLike = c.modality === 'chat' || c.modality === 'code' || c.modality === 'agent' || c.modality === 'vision';
   // One generic attach button — handles images, PDFs, and text/code files.
   // The renderer routes by file kind at send time.
-  $('#attach-file').hidden = !textLike || !!c.remote;
+  $('#attach-file').hidden = !textLike;
 
   // Agent safety bar (Plan / Approval toggles) — only relevant in agent chats.
   const agentBar = $('#agent-bar');
@@ -3321,16 +3405,6 @@ function renderActiveChat() {
     }
   }
 
-  // Sending from a laptop arrives with the actions it needs. Until then, this is a view.
-  if (c.remote) {
-    $('#composer-form')?.classList.add('disabled');
-    const composerInput = $('#composer-input');
-    if (composerInput) {
-      composerInput.disabled = true;
-      composerInput.placeholder = 'This chat runs on your home PC.';
-    }
-  }
-
   // Both toggles stay VISIBLE for any text-like chat and are greyed out when
   // the model can't do that thing — rather than disappearing. A toggle that
   // vanishes leaves the user guessing whether the feature exists; a greyed
@@ -3357,9 +3431,10 @@ function renderActiveChat() {
     btn.setAttribute('aria-pressed', on ? 'true' : 'false');
     btn.title = supported ? '' : 'This model doesn’t support this.';
   };
-  // Web: always usable on a text chat. Think: only when the model supports it.
+  // Web: always usable on a text chat. Think: only when the model supports it. On a remote chat
+  // only the home PC knows that, and it says so if the answer is no.
   setToggle('toggle-web', true, c.webEnabled === true);
-  setToggle('toggle-think', supportsThinking, c.thinkingEnabled === true);
+  setToggle('toggle-think', !!c.remote || supportsThinking, c.thinkingEnabled === true);
 
   // The abilities menu stays available for any text chat — both options live
   // inside it, greyed when unsupported.
@@ -3379,7 +3454,8 @@ function wireWebToggle() {
   if (!btn) return;
   btn.addEventListener('click', () => {
     const c = currentChat();
-    if (!c || c.remote) return;
+    if (!c) return;
+    if (c.remote) { askHome(c, 'set-toggle', { name: 'webEnabled', value: !c.webEnabled }); return; }
     // Web works for every model now (tool-calling or search-and-inject), so
     // it's never disabled — no support gate here.
     c.webEnabled = !c.webEnabled;
@@ -3394,7 +3470,8 @@ function wireThinkToggle() {
   if (!btn) return;
   btn.addEventListener('click', () => {
     const c = currentChat();
-    if (!c || c.remote) return;
+    if (!c) return;
+    if (c.remote) { askHome(c, 'set-toggle', { name: 'thinkingEnabled', value: !c.thinkingEnabled }); return; }
     if (btn.classList.contains('disabled') || !modelSupportsThinking(c.model)) return;
     c.thinkingEnabled = !c.thinkingEnabled;
     btn.setAttribute('aria-pressed', c.thinkingEnabled ? 'true' : 'false');
@@ -3584,24 +3661,29 @@ function modelForCategory(cat, chat) {
 }
 
 async function pickProjectFolder() {
-  if (currentChat()?.remote) return;
+  // A system dialog would open here, for a folder on the other machine. Task 14 adds a browser.
+  if (currentChat()?.remote) { showToast("Choose this chat's folder on the home PC."); return; }
   const r = await window.api.files.pickFolder();
   if (!r) return;
   const c = currentChat();
   if (!c || c.remote) return;
+  setProjectFolder(c, r.path);
+  renderActiveChat();
+  renderChatList();
+}
+
+function setProjectFolder(c, folder) {
   // Changing folders ends the agent's access to the old one.
   const previous = c.projectFolder;
   c.pathAllowlist = (c.pathAllowlist || []).filter(p => p !== previous);
-  c.projectFolder = r.path;
-  if (!c.pathAllowlist.includes(r.path)) c.pathAllowlist.push(r.path);
+  c.projectFolder = folder;
+  if (!c.pathAllowlist.includes(folder)) c.pathAllowlist.push(folder);
   // Adopt the folder name as the chat title when the user hasn't named the chat yet.
   if (!c.title) {
-    const folderName = r.path.split(/[\\/]/).pop();
+    const folderName = folder.split(/[\\/]/).pop();
     if (folderName) c.title = folderName;
   }
   saveToStorage();
-  renderActiveChat();
-  renderChatList();
 }
 
 function renderMessage(m) {
@@ -4389,19 +4471,33 @@ function patchInstallBannerProgress(tag) {
 // Uses webUtils.getPathForFile (Electron 32+) since File.prototype.path was
 // removed for security.
 async function attachDroppedFile(file) {
-  if (currentChat()?.remote) return;
   const filePath = window.api.files.pathForFile(file);
   if (!filePath) return;
   const att = await window.api.files.fromPath(filePath);
   if (!att || att.error) {
     const c = currentChat();
-    if (c) {
+    if (c?.remote) {
+      showToast(`Couldn't attach ${file.name}: ${att?.error || 'unknown error'}`);
+    } else if (c) {
       c.messages.push({ role: 'system', content: `Couldn't attach ${file.name}: ${att?.error || 'unknown error'}` });
       renderActiveChat();
     }
     return;
   }
+  addPendingAttachment(att);
+}
+
+// A chat on a home PC takes less than a local one, and it's kinder to say so now than at send.
+function addPendingAttachment(att) {
+  if (currentChat()?.remote) {
+    const problem = RemoteRules.attachmentProblem([...state.pendingAttachments, att]);
+    if (problem) {
+      showToast(problem);
+      return false;
+    }
+  }
   state.pendingAttachments.push(att);
+  return true;
 }
 
 // Wire window-level drag + drop. Any file dragged onto the app, regardless of
@@ -4454,11 +4550,13 @@ function wireAttachments() {
       if (c) {
         c.messages.push({ role: 'system', content: `Couldn't attach ${f.name || 'file'}: ${f.error}` });
         renderActiveChat();
+      } else if (currentChat()) {
+        showToast(`Couldn't attach ${f.name || 'file'}: ${f.error}`);
       }
       return;
     }
     if (f.kind === 'unsupported') return;
-    state.pendingAttachments.push(f);
+    addPendingAttachment(f);
     renderAttachments();
   });
 
@@ -4482,7 +4580,7 @@ function wireAttachments() {
         if (!blob) continue;
         try {
           const att = await blobToImageAttachment(blob);
-          state.pendingAttachments.push(att);
+          addPendingAttachment(att);
         } catch {/* skip bad blob */}
       }
       renderAttachments();
@@ -4564,7 +4662,6 @@ function wireTitleEdit() {
   let savedTitle = '';
 
   const enterEdit = () => {
-    if (currentChat()?.remote) return;
     if (!input.hasAttribute('readonly')) return;
     savedTitle = input.value;
     input.removeAttribute('readonly');
@@ -4578,7 +4675,19 @@ function wireTitleEdit() {
     input.setAttribute('readonly', 'true');
     btn.classList.remove('editing');
     const c = currentChat();
-    if (!c || c.remote) return;
+    if (!c) return;
+    if (c.remote) {
+      // Stays as typed if it's going to the home PC, whose answer comes back as a change.
+      const next = input.value.trim();
+      if (commit && next && next !== c.title) {
+        askHome(c, 'rename', { title: next }).then((answer) => {
+          if (!answer.ok && currentChat() === c) input.value = c.title || '';
+        });
+      } else {
+        input.value = commit ? (c.title || '') : savedTitle;
+      }
+      return;
+    }
     if (commit) {
       const next = input.value.trim();
       if (next) {
@@ -4622,8 +4731,10 @@ function wireComposer() {
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
     const c = currentChat();
-    if (!c || c.remote) return;
+    if (!c) return;
     if (c.modality === 'agent' && !c.projectFolder) return;
+    // Whether this runs or queues is for the home PC to say, when it gets there.
+    if (c.remote) { await dispatchSend(); return; }
 
     const input = $('#composer-input');
     const text = input.value.trim();
@@ -4648,27 +4759,33 @@ function wireComposer() {
   if (sendBtn) {
     sendBtn.addEventListener('click', (e) => {
       const c = currentChat();
-      if (!c || c.remote) return;
+      if (!c) return;
       if (!state.runningChats.has(c.id)) return;
       if ($('#composer-input').value.trim().length > 0) return; // let submit queue
       e.preventDefault();
       e.stopPropagation();
-      stopChat(c.id);
-      // Stop also clears queued messages — if the user stops, they probably
-      // mean "stop everything", not "stop just this one and keep going".
-      const before = c.messages.length;
-      c.messages = c.messages.filter(m => !m.queued);
-      if (c.messages.length !== before) {
-        saveToStorage();
-        renderActiveChat();
-        renderChatList();
-      }
+      stopChatAndQueue(c);
     });
   }
 
   // Keep the button icon (send arrow vs stop square) in sync with the input
   // having text — running + empty input = stop, anything else = send/queue.
   input.addEventListener('input', () => { updateSendButton(); });
+}
+
+// Stop also clears queued messages — if the user stops, they probably mean "stop
+// everything", not "stop just this one and keep going". Another device's queued words
+// weren't theirs to throw away, so those go back to whoever typed them.
+function stopChatAndQueue(c, stoppedBy = null) {
+  stopChat(c.id);
+  if (c.remote) return; // the home PC does the rest
+  const queued = c.messages.filter(m => m.queued);
+  if (!queued.length) return;
+  c.messages = c.messages.filter(m => !m.queued);
+  sendQueuedBack(c, queued, stoppedBy);
+  saveToStorage();
+  renderIfOpen(c);
+  renderChatList();
 }
 
 // Add a user message to the chat without running the model yet. Picks up the
@@ -4682,6 +4799,10 @@ function queueMessage(c, text) {
   input.value = '';
   input.style.height = 'auto';
 
+  queueOnChat(c, text, attachments);
+}
+
+function queueOnChat(c, text, attachments, fromDevice = null) {
   const userMsg = {
     role: 'user',
     content: text,
@@ -4690,9 +4811,10 @@ function queueMessage(c, text) {
     queued: true,
     _attachmentData: attachments
   };
+  if (fromDevice) userMsg._fromDevice = fromDevice;
   c.messages.push(userMsg);
   saveToStorage();
-  renderActiveChat();
+  renderIfOpen(c);
   renderChatList();
   updateSendButton();
 }
@@ -4713,15 +4835,20 @@ function restoreQueuedMessages(c) {
   const queued = c.messages.filter(m => m.role === 'user' && m.queued);
   if (!queued.length) return;
   c.messages = c.messages.filter(m => !m.queued);
-  const input = $('#composer-input');
-  if (currentChat()?.id === c.id && input && !input.value.trim()) {
-    input.value = queued.map(m => m.content).join('\n\n');
-    showToast('The reply stopped, so your queued message was not sent. It is back in the message box.');
-  } else {
-    showToast('The reply stopped, so a queued message was not sent.');
+  // What a laptop typed goes back to that laptop. This box is the home PC's own.
+  sendQueuedBack(c, queued);
+  const ours = queued.filter(m => !m._fromDevice);
+  if (ours.length) {
+    const input = $('#composer-input');
+    if (currentChat()?.id === c.id && input && !input.value.trim()) {
+      input.value = ours.map(m => m.content).join('\n\n');
+      showToast('The reply stopped, so your queued message was not sent. It is back in the message box.');
+    } else {
+      showToast('The reply stopped, so a queued message was not sent.');
+    }
   }
   saveToStorage();
-  renderActiveChat();
+  renderIfOpen(c);
 }
 
 async function processNextQueued(c) {
@@ -4731,8 +4858,9 @@ async function processNextQueued(c) {
   msg.queued = false;
   const attachments = msg._attachmentData || [];
   delete msg._attachmentData;
+  delete msg._fromDevice;
   saveToStorage();
-  renderActiveChat();
+  renderIfOpen(c);
   renderChatList();
 
   await runOllamaChat(c, attachments);
@@ -4750,29 +4878,33 @@ function pulseModelPicker() {
   setTimeout(() => t.classList.remove('pulse-attention'), 1200);
 }
 
+// Why this chat's model can't run now: 'install', 'key', or null if it can.
+function chatModelProblem(c) {
+  const pick = findPick(c.model);
+  if (pick && pickProvider(pick) !== 'ollama' && !pickReady(pick)) return 'key';
+  if (backendForModel(c.model) === 'ollama' && !state.installed.has(c.model)) return 'install';
+  return null;
+}
+
 async function dispatchSend() {
   const c = currentChat();
-  if (!c || c.remote) return;
+  if (!c) return;
   // Agentic chats are locked until a project folder is selected.
   if (c.modality === 'agent' && !c.projectFolder) {
     return;
   }
+  if (c.remote) { await sendComposerToHome(c); return; }
   const input = $('#composer-input');
   const text = input.value.trim();
   if (!text && !state.pendingAttachments.length) return;
 
-  const modality = c.modality;
-  const backend = backendForModel(c.model);
-
   // Model not usable to send with? Pulse the picker to point the user at it.
   // Two cases: an Ollama model that isn't installed, or a cloud model with no
   // API key. Both mean "you haven't got a working model selected."
-  const pick = findPick(c.model);
-  const cloudNotReady = pick && pickProvider(pick) !== 'ollama' && !pickReady(pick);
-  const ollamaNotInstalled = backend === 'ollama' && !state.installed.has(c.model);
-  if (ollamaNotInstalled || cloudNotReady) {
+  const modelProblem = chatModelProblem(c);
+  if (modelProblem) {
     pulseModelPicker();
-    if (ollamaNotInstalled) {
+    if (modelProblem === 'install') {
       const banner = $('#install-banner');
       if (banner) banner.scrollIntoView({ behavior: 'smooth', block: 'center' });
     }
@@ -4786,8 +4918,15 @@ async function dispatchSend() {
   input.value = '';
   input.style.height = 'auto';
 
+  await submitToChat(c, text, attachments);
+}
+
+// A message into a chat, from wherever it was typed. Works on the chat it's given: nothing
+// here may touch the box, the pending attachments, or a chat that happens to be on screen,
+// because a laptop's message arrives while the person at home is doing something else.
+async function submitToChat(c, text, attachments) {
   const userMsg = {
-    role: 'user', content: text, modality,
+    role: 'user', content: text, modality: c.modality,
     attachments: attachments.map(a => ({ kind: a.kind, name: a.name, pages: a.pages, ext: a.ext }))
   };
   // For video-analysis chats: stash the full video attachment (with .path) on
@@ -4798,7 +4937,7 @@ async function dispatchSend() {
   autoTitle(c, text);
   touchChat(c.id);
   saveToStorage();
-  renderActiveChat();
+  renderIfOpen(c);
   renderChatList();
 
   // First user message in this chat? Write a proper title in the background. A
@@ -4825,7 +4964,7 @@ async function dispatchSend() {
       c.messages.push(assistantMsg);
       state.runningChats.set(c.id, { channelId: null, abortRequested: false });
       updateSendButton();
-      renderActiveChat();
+      renderIfOpen(c);
       try {
         await runVideoAnalysis(c, videoAtt, assistantMsg);
       } finally {
@@ -4938,7 +5077,7 @@ async function _runOllamaChatInner(c, attachments) {
   // Mark this chat as running so the send button flips to a stop button.
   state.runningChats.set(c.id, { channelId: null, abortRequested: false });
   updateSendButton();
-  renderActiveChat();
+  renderIfOpen(c);
 
   // Model info decides the tools offered and the context size, so it has to be in
   // before either is worked out. Otherwise both can change on the next message.
@@ -5003,8 +5142,9 @@ async function _runOllamaChatInner(c, attachments) {
   // though we didn't unwrap the bytes. Agents can then read it via tools.
   const genericFiles = (attachments || []).filter(a => a.kind === 'file');
   if (genericFiles.length) {
+    // One from a laptop stayed there. Only its name came, so there's nothing to read here.
     const fileBlock = genericFiles.map(f =>
-      `\n\n[Attached file: ${f.name}${f.ext ? ` (.${f.ext})` : ''} · ${humanSize(f.size)} · path: ${f.path}]`
+      `\n\n[Attached file: ${f.name}${f.ext ? ` (.${f.ext})` : ''} · ${humanSize(f.size)} · ${f.path ? `path: ${f.path}` : 'on the device it was sent from, not readable here'}]`
     ).join('');
     history[history.length - 1].content = (history[history.length - 1].content || '') + fileBlock;
   }
@@ -5043,7 +5183,7 @@ ollama pull qwen2.5vl:7b
 …or download **Qwen2.5-VL 7B** / **Llama 3.2 Vision 11B** directly from the model picker (top-right) — they show up under *General Chat & Reasoning* with a download icon. Then re-send your message.`;
       touchChat(c.id);
       saveToStorage();
-      renderActiveChat();
+      renderIfOpen(c);
       renderChatList();
       return;
     }
@@ -5078,7 +5218,7 @@ ollama pull qwen2.5vl:7b
     assistantMsg.thinking = false;
     touchChat(c.id);
     saveToStorage();
-    renderActiveChat();
+    renderIfOpen(c);
     renderChatList();
     return;
   }
@@ -5458,7 +5598,7 @@ ollama pull qwen2.5vl:7b
   touchChat(c.id);
   saveToStorage();
   renderChatList();
-  renderActiveChat();
+  renderIfOpen(c);
 
   // A failed or stopped reply keeps the truncated title, so a title request
   // can't reload a model that just ran out of memory.
@@ -5475,8 +5615,9 @@ ollama pull qwen2.5vl:7b
 
 // Stop the current assistant turn — aborts the Ollama fetch via main process.
 function stopChat(chatId) {
+  if (state.chats[chatId]?.remote) { askHome(state.chats[chatId], 'stop'); return; }
   const run = state.runningChats.get(chatId);
-  if (!run || state.chats[chatId]?.remote) return;
+  if (!run) return;
   run.abortRequested = true;
   // Reflect the stop in the UI IMMEDIATELY so the user gets instant feedback.
   // The actual abort cycle (fetch interrupt → server-side aborted chunk →
@@ -5781,7 +5922,7 @@ async function executeToolImpl(name, args, c, offeredTools) {
     c.noApproval = false;
     c.approvedPlan = planText;
     saveToStorage();
-    try { renderActiveChat(); } catch {}
+    try { renderIfOpen(c); } catch {}
     await window.api.audit.log({ ts: new Date().toISOString(), chat: c.id, model: c.model, tool: name, args: { planLen: planText.length }, status: 'plan-approved', ok: true });
     return { result: { ok: true, message: 'Plan approved by user. The chat is now in Approval Mode — proceed to execute the plan step by step. Each write tool call will pop a per-call approval modal.' }, summary: 'plan approved', ok: true };
   }
@@ -6237,6 +6378,13 @@ function findMessageEl(msg) {
   return null;
 }
 
+// A redraw of this chat, if it's the one on screen. A redraw of some other chat would throw away
+// where the person had scrolled to. The mirror still hears about it.
+function renderIfOpen(c) {
+  if (currentChat() === c) renderActiveChat();
+  else markMirrorDirty(c.id);
+}
+
 function patchLastMessage(msg) {
   // Full re-render — call this when message structure changes (tool events
   // added, media attached, pending state toggled).  For streaming text use
@@ -6297,6 +6445,378 @@ function patchLastMessageContent(msg) {
   if (nearBottom) list.scrollTop = list.scrollHeight;
 }
 
+// ============== ACTING FROM A LAPTOP ==============
+// A laptop never changes a remote chat. It sends an action, the home PC does it, and the change
+// comes back through the mirror like any other. So there's one order of events, the order of
+// arrival at the home PC, and every device ends up showing it.
+//
+// A paired laptop can send anything, so at home RemoteRules checks a frame before anything reads
+// it. The handlers here then take named fields out of it, work on the chat the frame names and
+// never on the one on screen, and use the same functions as the local controls. Only chats with
+// c.remoteControl can be touched, except by new-chat, which makes one. Nothing here reaches
+// settings, API keys, or the connection manager.
+const REMOTE_ACTION_TIMEOUT_MS = 15000;
+const REMOTE_ACTION_REFUSED = "That isn't something this device can do.";
+const REMOTE_ACTION_FAILED = "The home PC couldn't do that.";
+const REMOTE_NOT_SHARED = 'This chat is no longer shared.';
+const REMOTE_ERROR_MAX = 300;
+
+// ---- At home ----
+
+function sharedChatById(chatId) {
+  if (!Object.prototype.hasOwnProperty.call(state.chats, chatId)) return null;
+  const c = state.chats[chatId];
+  return c && c.remoteControl === true && !c.remote ? c : null;
+}
+
+function handleRemoteAction(deviceId, frame) {
+  if (!RemoteRules.isActionId(frame.id)) return;
+  const reply = (answer) => {
+    window.api.remote.send(deviceId, { type: 'action-result', id: frame.id, ...answer }).catch(() => {});
+  };
+  if (!RemoteRules.isAllowedAction(frame)) {
+    reply({ ok: false, error: RemoteRules.attachmentProblem(frame.args?.attachments) || REMOTE_ACTION_REFUSED });
+    return;
+  }
+  const failed = () => {
+    console.warn('A remote action failed:', frame.kind);
+    return { ok: false, error: REMOTE_ACTION_FAILED };
+  };
+  // Runs now, as far as anything that changes a chat is concerned, which is what makes this the
+  // order of arrival. Only looking at the disk is left for later.
+  let answer;
+  try {
+    answer = runRemoteAction(deviceId, frame);
+  } catch {
+    answer = failed();
+  }
+  Promise.resolve(answer).catch(failed).then(reply);
+}
+
+function runRemoteAction(deviceId, frame) {
+  const args = frame.args || {};
+  if (frame.kind === 'new-chat') return remoteNewChat(args);
+  const c = sharedChatById(frame.chatId);
+  if (!c) return { ok: false, error: REMOTE_NOT_SHARED };
+  switch (frame.kind) {
+    case 'send': return remoteSend(deviceId, c, args);
+    case 'stop': stopChatAndQueue(c, deviceId); return { ok: true };
+    case 'set-model': return remoteSetModel(c, args.model);
+    case 'set-mode': return remoteSetMode(c, args.mode);
+    case 'set-toggle': return remoteSetToggle(c, args.name, args.value);
+    case 'rename': return remoteRename(c, args.title);
+    case 'delete': deleteChat(c.id); return { ok: true };
+    case 'list-dir': return remoteListDir(c, args.path);
+    case 'set-folder': return remoteSetFolder(c, args.path);
+    default: return { ok: false, error: REMOTE_ACTION_REFUSED };
+  }
+}
+
+function remoteSend(deviceId, c, args) {
+  const text = args.text.trim();
+  const attachments = (args.attachments || []).map(RemoteRules.cleanAttachment);
+  // Sending during a reply queues it, as it does at home.
+  if (state.runningChats.has(c.id)) {
+    queueOnChat(c, text, attachments, deviceId);
+    return { ok: true };
+  }
+  if (c.modality === 'agent' && !c.projectFolder) return { ok: false, error: 'This project needs a folder first.' };
+  const problem = chatModelProblem(c);
+  if (problem === 'install') return { ok: false, error: "This chat's model isn't installed on the home PC." };
+  if (problem === 'key') return { ok: false, error: "This chat's model needs an API key on the home PC." };
+  submitToChat(c, text, attachments).catch((e) => console.error('A message from a laptop failed:', e?.message));
+  return { ok: true };
+}
+
+// The picker's own rule for what can be chosen.
+function modelCanBePicked(model) {
+  const pick = findPick(model);
+  if (pick && pick.category !== 'installed') return SELECTABLE_CATEGORIES.has(pick.category) && !pick.multimodal;
+  return state.installed.has(model);
+}
+
+// A pick made here also sets the default for new chats and fills in empty ones. Those belong to
+// the person at this machine, so a laptop's pick changes this chat and nothing else.
+function remoteSetModel(c, model) {
+  if (!modelCanBePicked(model)) return { ok: false, error: "That model isn't available on the home PC." };
+  setChatModel(c, model);
+  saveToStorage();
+  renderChatList();
+  if (currentChat() === c) {
+    renderActiveChat();
+    populateModelPicker();
+  }
+  return { ok: true };
+}
+
+function remoteSetMode(c, mode) {
+  if (c.modality !== 'agent') return { ok: false, error: 'Only a project has safety modes.' };
+  if (!c[SAFETY_MODES[mode]]) setSafetyMode(c, mode);
+  return { ok: true };
+}
+
+function remoteSetToggle(c, name, value) {
+  if ((name === 'readOnly' || name === 'noFetch') && c.modality !== 'agent') return { ok: false, error: 'Only a project has that setting.' };
+  if (name === 'thinkingEnabled' && value && !modelSupportsThinking(c.model)) return { ok: false, error: "This chat's model can't do that." };
+  c[name] = value;
+  saveToStorage();
+  if (currentChat() === c) {
+    $('#toggle-web')?.setAttribute('aria-pressed', c.webEnabled === true ? 'true' : 'false');
+    $('#toggle-think')?.setAttribute('aria-pressed', c.thinkingEnabled === true ? 'true' : 'false');
+    $('#toggle-readonly')?.setAttribute('aria-pressed', c.readOnly ? 'true' : 'false');
+    $('#toggle-nofetch')?.setAttribute('aria-pressed', c.noFetch ? 'true' : 'false');
+    $('#tools-menu-btn')?.classList.toggle('has-active', !!(c.webEnabled || c.thinkingEnabled));
+  }
+  return { ok: true };
+}
+
+function remoteRename(c, title) {
+  c.title = title.trim();
+  // Stops the background title generator overriding it, as the pen editor does.
+  c.titleManual = true;
+  saveToStorage();
+  renderChatList();
+  const input = $('#chat-title');
+  if (currentChat() === c && input?.hasAttribute('readonly')) {
+    input.value = c.title;
+    input.placeholder = c.title;
+  }
+  return { ok: true };
+}
+
+function remoteNewChat(args) {
+  const model = args.model ?? (state.settings.lastModel || firstAvailableModel());
+  if (args.model !== undefined && !modelCanBePicked(model)) return { ok: false, error: "That model isn't available on the home PC." };
+  const modality = args.modality === 'agent' ? 'agent' : 'chat';
+  const c = addChat(model, modality, { ...(modality === 'agent' ? agenticChatFields() : {}), remoteControl: true });
+  saveToStorage();
+  renderChatList();
+  return { ok: true, chatId: c.id };
+}
+
+// Folder names only. The laptop's folder browser needs no more than that.
+async function remoteListDir(c, path) {
+  if (c.modality !== 'agent') return { ok: false, error: 'Only a project has a folder.' };
+  const target = path || '~';
+  const listed = await window.api.fs.listDir(target, [target]);
+  if (!listed || listed.error) return { ok: false, error: "That folder isn't available on the home PC." };
+  if (!sharedChatById(c.id)) return { ok: false, error: REMOTE_NOT_SHARED };
+  return { ok: true, path: listed.path, entries: listed.entries.filter(e => e.kind === 'dir').map(e => e.name).sort() };
+}
+
+async function remoteSetFolder(c, path) {
+  if (c.modality !== 'agent') return { ok: false, error: 'Only a project has a folder.' };
+  const turn = (mirror.folderTurns.get(c.id) || 0) + 1;
+  mirror.folderTurns.set(c.id, turn);
+  const listed = await window.api.fs.listDir(path, [path]);
+  if (!listed || listed.error) return { ok: false, error: "That folder isn't available on the home PC." };
+  if (!sharedChatById(c.id)) return { ok: false, error: REMOTE_NOT_SHARED };
+  if (mirror.folderTurns.get(c.id) !== turn) return { ok: false, error: 'Another folder was chosen after this one.' };
+  mirror.folderTurns.delete(c.id);
+  setProjectFolder(c, listed.path);
+  renderIfOpen(c);
+  renderChatList();
+  return { ok: true, path: listed.path };
+}
+
+// Queued words that aren't going to be sent, back to whoever typed them. Not to the device that
+// has just pressed Stop, which meant it.
+function sendQueuedBack(c, messages, exceptDevice = null) {
+  for (const m of messages) {
+    if (!m._fromDevice || m._fromDevice === exceptDevice) continue;
+    window.api.remote.send(m._fromDevice, {
+      type: 'queued-returned', chatId: c.id, text: m.content || '', hadAttachments: !!m._attachmentData?.length
+    }).catch(() => {});
+  }
+}
+
+// ---- On the laptop ----
+
+// Why nothing can go to this home PC right now, or null.
+function homeBlockedReason(deviceId) {
+  if (remoteChatsHidden()) return 'Remote Control is locked. Unlock it to send anything.';
+  if (!mirror.homes.get(deviceId)?.connected) return 'Home PC is offline. Reconnecting…';
+  return null;
+}
+
+// Always answers, with { ok, error? } and whatever the action gives back.
+function actionToHome(deviceId, chatId, kind, args, extraWaitMs = 0) {
+  const blocked = homeBlockedReason(deviceId);
+  if (blocked) return Promise.resolve({ ok: false, error: blocked });
+  const id = 'a_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
+  const frame = { type: 'action', id, kind };
+  if (chatId !== undefined) frame.chatId = chatId;
+  if (args !== undefined) frame.args = args;
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => settleAction(id, { ok: false, error: 'The home PC did not answer.' }), REMOTE_ACTION_TIMEOUT_MS + extraWaitMs);
+    mirror.actions.set(id, { deviceId, resolve, timer });
+    const unsent = { ok: false, error: 'It could not be sent to the home PC.' };
+    window.api.remote.send(deviceId, frame).then((sent) => {
+      if (!sent) settleAction(id, unsent);
+    }, () => settleAction(id, unsent));
+  });
+}
+
+function settleAction(id, answer) {
+  const pending = mirror.actions.get(id);
+  if (!pending) return;
+  mirror.actions.delete(id);
+  clearTimeout(pending.timer);
+  pending.resolve(answer);
+}
+
+// A home can send anything here too, and an answer only counts from the device that was asked.
+function finishAction(deviceId, frame) {
+  const pending = mirror.actions.get(frame.id);
+  if (!pending || pending.deviceId !== deviceId) return;
+  if (frame.ok !== true) {
+    settleAction(frame.id, { ok: false, error: typeof frame.error === 'string' ? frame.error.slice(0, REMOTE_ERROR_MAX) : REMOTE_ACTION_FAILED });
+    return;
+  }
+  const answer = { ok: true };
+  if (typeof frame.chatId === 'string') answer.chatId = frame.chatId;
+  if (typeof frame.path === 'string') answer.path = frame.path;
+  if (Array.isArray(frame.entries)) answer.entries = frame.entries.filter(name => typeof name === 'string');
+  settleAction(frame.id, answer);
+}
+
+// An action on a chat. The change itself comes back through the mirror, so all there is to do
+// here is say so if it didn't happen.
+function askHome(c, kind, args) {
+  return actionToHome(c.remote.deviceId, c.remote.chatId, kind, args).then((answer) => {
+    if (!answer.ok) showToast(answer.error);
+    return answer;
+  });
+}
+
+async function sendComposerToHome(c) {
+  const input = $('#composer-input');
+  const text = input.value.trim();
+  const attachments = state.pendingAttachments.slice();
+  if (!text && !attachments.length) return;
+  const blocked = homeBlockedReason(c.remote.deviceId);
+  if (blocked) {
+    showToast(`Your message wasn't sent. ${blocked}`);
+    return;
+  }
+  const tooMuch = RemoteRules.attachmentProblem(attachments, text.length);
+  if (tooMuch) {
+    showToast(tooMuch);
+    return;
+  }
+
+  const key = c.id;
+  state.pendingAttachments = [];
+  renderAttachments();
+  input.value = '';
+  input.style.height = 'auto';
+  updateSendButton();
+
+  const args = { text };
+  if (attachments.length) args.attachments = attachments.map(RemoteRules.cleanAttachment);
+  // Attachments take time to cross a slow connection before anything can answer. A second per
+  // MiB, so a message that's on its way isn't given back and sent twice.
+  const mib = attachments.reduce((sum, a) => sum + (a.base64?.length || a.text?.length || 0), 0) / (1024 * 1024);
+  const answer = await actionToHome(c.remote.deviceId, c.remote.chatId, 'send', args, Math.ceil(mib) * 1000);
+  if (answer.ok) return;
+  returnToBox(key, text, attachments);
+  showToast(`Your message wasn't sent. ${answer.error}`);
+}
+
+// What didn't get sent goes back where it was typed. If that chat isn't on screen it waits there
+// for when it is, because in this box it would go to whichever chat is open. If that chat has
+// gone, this box is the only place left.
+function returnToBox(key, text, attachments = []) {
+  const c = state.chats[key];
+  if (!c) {
+    putInBox(text, attachments);
+    showRemoteGone();
+  } else if (currentChat() === c) {
+    putInBox(text, attachments);
+  } else {
+    c._returned = {
+      text: c._returned?.text ? `${c._returned.text}\n\n${text}` : text,
+      attachments: [...(c._returned?.attachments || []), ...attachments]
+    };
+  }
+}
+
+// Anything typed since stays, after what's coming back.
+function putInBox(text, attachments = []) {
+  const input = $('#composer-input');
+  if (text) input.value = input.value.trim() ? `${text}\n\n${input.value}` : text;
+  input.dispatchEvent(new Event('input'));
+  state.pendingAttachments.push(...attachments);
+  renderAttachments();
+  updateSendButton();
+}
+
+function takeReturnedDraft(c) {
+  if (!c?._returned) return;
+  const { text, attachments } = c._returned;
+  delete c._returned;
+  putInBox(text, attachments);
+}
+
+function applyQueuedReturned(deviceId, frame) {
+  if (typeof frame.chatId !== 'string' || typeof frame.text !== 'string' || frame.text.length > RemoteRules.MAX_MESSAGE_BYTES) return;
+  const key = remoteChatKey(deviceId, frame.chatId);
+  if (!state.chats[key]) return;
+  returnToBox(key, frame.text);
+  showToast(frame.hadAttachments === true
+    ? "A queued message wasn't sent. Its words are back in the message box, but its files need attaching again."
+    : "A queued message wasn't sent. It's back in the message box.");
+}
+
+function showRemoteGone() {
+  const notice = $('#remote-gone');
+  if (!notice) return;
+  notice.querySelector('span').textContent = $('#composer-input').value.trim()
+    ? 'This chat is no longer shared. What you typed is still in the message box.'
+    : 'This chat is no longer shared.';
+  notice.hidden = false;
+}
+
+function hideRemoteGone() {
+  const notice = $('#remote-gone');
+  if (notice) notice.hidden = true;
+}
+
+function connectedHomeId() {
+  const open = currentChat()?.remote?.deviceId;
+  if (open && mirror.homes.get(open)?.connected) return open;
+  for (const [id, home] of mirror.homes) {
+    if (home.connected) return id;
+  }
+  return null;
+}
+
+// So nobody's stuck if nothing's shared yet. Task 14's folder browser is what a project needs,
+// so this only makes plain chats for now.
+function paintRemoteChatButton() {
+  const btn = $('#new-remote-chat');
+  if (!btn) return;
+  const deviceId = connectedHomeId();
+  btn.hidden = !deviceId || state.space !== 'home' || remoteChatsHidden();
+  if (deviceId) btn.querySelector('span').textContent = `New chat on ${mirror.homes.get(deviceId).info?.name || 'home PC'}`;
+}
+
+async function newRemoteChat(deviceId) {
+  const answer = await actionToHome(deviceId, undefined, 'new-chat', { modality: 'chat' });
+  if (!answer.ok) { showToast(answer.error); return; }
+  if (typeof answer.chatId !== 'string') return;
+  mirror.openOnArrival = remoteChatKey(deviceId, answer.chatId);
+  openIfAwaited(mirror.openOnArrival);
+}
+
+function openIfAwaited(key) {
+  if (mirror.openOnArrival !== key || !state.chats[key]) return;
+  mirror.openOnArrival = null;
+  state.space = chatSpace(state.chats[key]);
+  applySpaceChrome();
+  setActive(key);
+}
+
 // ============== CHAT MIRROR ==============
 // Remote Control's mirror, both ends of it. One install can be a home PC to some devices and
 // a laptop to others, so both run side by side. lib/chat-mirror.js has how a chat becomes ops.
@@ -6309,8 +6829,10 @@ function patchLastMessageContent(msg) {
 //
 // WATCHING, from devices with role 'home'. Remote chats live in state.chats like any other, as
 // remote:<deviceId>:<chatId> with c.remote set, so they use the same rendering. Only frames
-// change them: every control that changes a chat refuses a remote one, because a change made
-// only here would be a drift nothing notices. They never reach the disk.
+// change them: every control asks the home PC instead of changing a remote chat, because a
+// change made only here would be a drift nothing notices. They never reach the disk.
+//
+// ACTING, from a laptop. See the section below this one.
 //
 // A session being replaced can lose frames still in its buffers, so a connection coming back
 // always means a new snapshot. A laptop that sees a gap in the numbering, or ops that don't
@@ -6318,6 +6840,13 @@ function patchLastMessageContent(msg) {
 const MIRROR_TICK_MS = 100;
 const MIRROR_SWEEP_MS = 2000;
 const MIRROR_SNAPSHOT_GRACE_MS = 1500;
+// A snapshot is one frame while it fits easily. The connection manager refuses a frame over
+// 48 MiB, so a chat that can't fit under this can't be sent at all.
+const MIRROR_SPLIT_BYTES = 32 * 1024 * 1024;
+const MIRROR_FRAME_LIMIT_BYTES = 47 * 1024 * 1024;
+const MIRROR_MAX_PARTS = 100000;
+const MIRROR_RETRY_MS = 1000;
+const MIRROR_RETRY_MAX_MS = 30000;
 
 const mirror = {
   // Serving.
@@ -6326,6 +6855,7 @@ const mirror = {
   sent: new Map(),           // chatId -> the snapshot last sent
   sentRunning: new Set(),    // chatIds
   sentHome: null,            // JSON of the home details last sent
+  tooLarge: new Set(),       // chatIds of chats no frame can hold
   dirtyAll: false,
   dirty: new Set(),
   timer: null,
@@ -6333,7 +6863,11 @@ const mirror = {
   // Watching.
   homes: new Map(),          // deviceId -> { connected, offlineAt, expected, awaitingSnapshot, info, clockOffset }
   hidden: false,             // locked, so remote chats are off the screen
-  resumeId: null             // the remote chat that was open when that happened
+  resumeId: null,            // the remote chat that was open when that happened
+  // Acting.
+  actions: new Map(),        // id -> { deviceId, resolve, timer }, waiting for an answer
+  openOnArrival: null,       // a chat made here, to open when it gets here
+  folderTurns: new Map()     // chatId -> the latest set-folder to arrive, so a slow check can't undo a later one
 };
 
 function wireChatMirror() {
@@ -6343,6 +6877,11 @@ function wireChatMirror() {
   remote.status().then(mirrorOnStatus).catch(() => {});
   setInterval(() => markMirrorDirty(), MIRROR_SWEEP_MS);
   setInterval(paintRemoteClocks, 1000);
+  $('#remote-gone button')?.addEventListener('click', hideRemoteGone);
+  $('#new-remote-chat')?.addEventListener('click', () => {
+    const deviceId = connectedHomeId();
+    if (deviceId) newRemoteChat(deviceId);
+  });
 }
 
 function mirrorOnStatus(status) {
@@ -6362,6 +6901,8 @@ function mirrorOnStatus(status) {
     if (!devices.some(d => d.id === id && d.role === 'laptop' && d.connected)) dropLaptop(id);
   }
   reflectRemoteLock();
+  paintRemoteChatButton();
+  paintRemoteComposer();
 }
 
 function mirrorOnFrame(deviceId, frame) {
@@ -6371,8 +6912,19 @@ function mirrorOnFrame(deviceId, frame) {
     if (role === 'laptop') addLaptop(deviceId);
     return;
   }
+  // An action only comes from a laptop this one serves.
+  if (frame.type === 'action') {
+    if (role === 'laptop') handleRemoteAction(deviceId, frame);
+    return;
+  }
   // Only a device this one treats as its home PC gets to put chats here.
   if (role !== 'home') return;
+  if (frame.type === 'action-result') { finishAction(deviceId, frame); return; }
+  if (frame.type === 'queued-returned') { applyQueuedReturned(deviceId, frame); return; }
+  if (frame.type === 'mirror-too-large') {
+    showToast('A shared chat is too large to show on this device. Open it on the home PC.');
+    return;
+  }
   if (!Number.isSafeInteger(frame.seq) || frame.seq < 1) return;
   const home = mirrorHome(deviceId);
   if (frame.type === 'mirror-snapshot') {
@@ -6407,17 +6959,19 @@ function scheduleMirrorTick(ms) {
 }
 
 function addLaptop(deviceId) {
-  if (!mirror.laptops.has(deviceId)) mirror.laptops.set(deviceId, { seq: 0 });
+  if (!mirror.laptops.has(deviceId)) mirror.laptops.set(deviceId, { seq: 0, split: false, failures: 0, retryTimer: null });
   mirror.needsSnapshot.add(deviceId);
   scheduleMirrorTick(0);
 }
 
 function dropLaptop(deviceId) {
+  clearTimeout(mirror.laptops.get(deviceId)?.retryTimer);
   mirror.laptops.delete(deviceId);
   mirror.needsSnapshot.delete(deviceId);
   if (!mirror.laptops.size) {
     mirror.sent.clear();
     mirror.sentRunning.clear();
+    mirror.tooLarge.clear();
   }
 }
 
@@ -6444,7 +6998,27 @@ function sendToLaptop(deviceId, frame) {
   const laptop = mirror.laptops.get(deviceId);
   if (!laptop) return;
   laptop.seq += 1;
-  window.api.remote.send(deviceId, { ...frame, seq: laptop.seq }).catch(() => {});
+  window.api.remote.send(deviceId, { ...frame, seq: laptop.seq }).then((sent) => {
+    if (!sent) mirrorFrameFailed(deviceId);
+    else if (frame.type === 'mirror-snapshot') laptop.failures = 0;
+  }, () => mirrorFrameFailed(deviceId));
+}
+
+// A frame that couldn't go leaves that laptop behind, with nothing to tell it so. Something too
+// big for one frame is the likely reason, so next time it gets the snapshot a chat at a time.
+function mirrorFrameFailed(deviceId) {
+  const laptop = mirror.laptops.get(deviceId);
+  if (!laptop || laptop.retryTimer !== null) return;
+  console.warn('A mirror frame could not be sent. Sending a new snapshot, a chat at a time.');
+  laptop.split = true;
+  const delay = Math.min(MIRROR_RETRY_MS * 2 ** laptop.failures, MIRROR_RETRY_MAX_MS);
+  laptop.failures += 1;
+  laptop.retryTimer = setTimeout(() => {
+    laptop.retryTimer = null;
+    if (mirror.laptops.get(deviceId) !== laptop) return;
+    mirror.needsSnapshot.add(deviceId);
+    scheduleMirrorTick(0);
+  }, delay);
 }
 
 function sendToLaptops(frame) {
@@ -6506,6 +7080,7 @@ function sendMirrorChanges(shared, everything, dirty) {
     if (shared.has(id)) continue;
     mirror.sent.delete(id);
     mirror.sentRunning.delete(id);
+    mirror.tooLarge.delete(id);
     sendToLaptops({ type: 'mirror-remove', chatId: id });
   }
   for (const [id, c] of shared) {
@@ -6514,12 +7089,12 @@ function sendMirrorChanges(shared, everything, dirty) {
       const next = ChatMirror.snapshotChat(c);
       const ops = ChatMirror.diffChat(mirror.sent.get(id) || null, next);
       mirror.sent.set(id, next);
-      if (ops.length) sendToLaptops({ type: 'mirror-ops', chatId: id, ops });
+      if (ops.length && !mirror.tooLarge.has(id)) sendToLaptops({ type: 'mirror-ops', chatId: id, ops });
     }
     if (running !== mirror.sentRunning.has(id)) {
       if (running) mirror.sentRunning.add(id);
       else mirror.sentRunning.delete(id);
-      sendToLaptops({ type: 'mirror-run', chatId: id, running });
+      if (!mirror.tooLarge.has(id)) sendToLaptops({ type: 'mirror-run', chatId: id, running });
     }
   }
 }
@@ -6527,9 +7102,30 @@ function sendMirrorChanges(shared, everything, dirty) {
 // Only after sendMirrorChanges, so this is the point every other laptop has reached too.
 // `now` lets the laptop show running times against this machine's clock.
 function sendMirrorSnapshot(deviceId) {
-  sendToLaptop(deviceId, { type: 'mirror-snapshot', chats: [...mirror.sent.values()], home: mirrorHomeDetails(), now: Date.now() });
+  const laptop = mirror.laptops.get(deviceId);
+  if (!laptop) return;
+  const chats = [];
+  let total = 0;
+  for (const [id, chat] of mirror.sent) {
+    const bytes = new Blob([JSON.stringify(chat)]).size;
+    if (bytes > MIRROR_FRAME_LIMIT_BYTES) {
+      mirror.tooLarge.add(id);
+    } else {
+      mirror.tooLarge.delete(id);
+      chats.push(chat);
+      total += bytes;
+    }
+  }
+  const frame = { type: 'mirror-snapshot', home: mirrorHomeDetails(), now: Date.now() };
+  if (chats.length > 1 && (laptop.split || total > MIRROR_SPLIT_BYTES)) {
+    chats.forEach((chat, i) => sendToLaptop(deviceId, { ...frame, part: i + 1, of: chats.length, chats: [chat] }));
+  } else {
+    sendToLaptop(deviceId, { ...frame, chats });
+  }
+  // A chat left out of a snapshot leaves the laptop. It shouldn't just seem to have gone.
+  if (mirror.tooLarge.size) window.api.remote.send(deviceId, { type: 'mirror-too-large' }).catch(() => {});
   for (const id of mirror.sent.keys()) {
-    sendToLaptop(deviceId, { type: 'mirror-run', chatId: id, running: mirror.sentRunning.has(id) });
+    if (!mirror.tooLarge.has(id)) sendToLaptop(deviceId, { type: 'mirror-run', chatId: id, running: mirror.sentRunning.has(id) });
   }
 }
 
@@ -6585,6 +7181,7 @@ function forgetHome(deviceId) {
   for (const c of remoteChatsOf(deviceId)) dropRemoteChat(c.id);
   mirror.homes.delete(deviceId);
   paintRemoteOffline();
+  paintRemoteChatButton();
 }
 
 function addRemoteChat(deviceId, chatId) {
@@ -6611,18 +7208,36 @@ function applyMirrorOps(deviceId, home, chatId, ops) {
   } catch (e) {
     console.warn('a remote chat could not be drawn', e);
   }
+  openIfAwaited(c.id);
 }
 
 // Goes through the same diff as streaming, so a snapshot that changes nothing paints nothing,
 // and messages keep their objects, and with them their place on screen.
+//
+// A snapshot too large for one frame comes in parts, a chat at a time. Chats stay until the last
+// part has said they aren't coming, and a part out of turn means asking for the lot again.
 function applyMirrorSnapshot(deviceId, home, frame) {
   if (!Array.isArray(frame.chats)) return;
+  const parted = frame.part !== undefined || frame.of !== undefined;
+  if (parted) {
+    const makesSense = Number.isSafeInteger(frame.part) && Number.isSafeInteger(frame.of)
+      && frame.part >= 1 && frame.part <= frame.of && frame.of <= MIRROR_MAX_PARTS;
+    const inTurn = frame.part === 1 || (frame.part === home.nextPart && frame.seq === home.expected);
+    if (!makesSense || !inTurn) {
+      home.nextPart = null;
+      requestMirrorSnapshot(deviceId, home);
+      return;
+    }
+  }
   home.info = ChatMirror.cleanHome(frame.home);
   home.clockOffset = Number.isFinite(frame.now) ? frame.now - Date.now() : 0;
   home.expected = frame.seq + 1;
-  home.awaitingSnapshot = false;
+  if (!parted || frame.part === 1) home.incoming = new Set();
+  const { incoming } = home;
+  const more = parted && frame.part < frame.of;
+  home.nextPart = more ? frame.part + 1 : null;
+  home.awaitingSnapshot = more;
 
-  const incoming = new Set();
   for (const raw of frame.chats) {
     if (!raw || typeof raw.id !== 'string') continue;
     const key = remoteChatKey(deviceId, raw.id);
@@ -6638,6 +7253,8 @@ function applyMirrorSnapshot(deviceId, home, frame) {
       console.warn('a remote chat could not be applied', e);
     }
   }
+  if (more) return;
+  home.incoming = null;
   for (const c of remoteChatsOf(deviceId)) {
     if (!incoming.has(c.id)) dropRemoteChat(c.id);
   }
@@ -6645,6 +7262,9 @@ function applyMirrorSnapshot(deviceId, home, frame) {
   renderChatList();
   paintRemoteOffline();
   paintRemoteClocks();
+  paintRemoteChatButton();
+  if (currentChat()?.remote?.deviceId === deviceId) populateModelPicker();
+  if (mirror.openOnArrival) openIfAwaited(mirror.openOnArrival);
 }
 
 function applyMirrorRun(key, running) {
@@ -6658,12 +7278,27 @@ function applyMirrorRun(key, running) {
 }
 
 function dropRemoteChat(key) {
-  if (!state.chats[key]) return;
+  const c = state.chats[key];
+  if (!c) return;
   delete state.chats[key];
   state.order = state.order.filter(id => id !== key);
   state.runningChats.delete(key);
-  if (state.activeId === key) leaveRemoteChat();
-  else renderChatList();
+  if (state.activeId === key) {
+    // Everything being typed stays where it is. Leaving would clear what was attached.
+    const attachments = state.pendingAttachments;
+    leaveRemoteChat();
+    state.pendingAttachments = attachments;
+    renderAttachments();
+    updateSendButton();
+    populateModelPicker();
+    showRemoteGone();
+  } else {
+    renderChatList();
+  }
+  if (c._returned) {
+    putInBox(c._returned.text, c._returned.attachments);
+    showRemoteGone();
+  }
 }
 
 // Where to go when the open remote chat has to leave the screen.
@@ -6715,6 +7350,15 @@ function paintRemoteOffline() {
   const c = currentChat();
   if (c?.remote && !mirror.homes.get(c.remote.deviceId)?.connected) list.setAttribute('data-remote-offline', '1');
   else list.removeAttribute('data-remote-offline');
+  paintRemoteComposer();
+}
+
+// Says in the box why nothing can be sent, until Task 11 draws the banner.
+function paintRemoteComposer() {
+  const c = currentChat();
+  const input = $('#composer-input');
+  if (!c?.remote || !input || input.disabled) return;
+  input.placeholder = homeBlockedReason(c.remote.deviceId) || composerPlaceholder(c.modality);
 }
 
 // The home PC paints these from timers of its own, which don't run here.

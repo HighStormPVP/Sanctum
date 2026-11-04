@@ -55,6 +55,11 @@
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg>
         <span>New chat</span>
       </button>
+      <!-- A chat on a paired home PC, whichever chat is open -->
+      <button class="new-chat" id="new-remote-chat" hidden title="Start a new chat on your home PC, shared with this device">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg>
+        <span>New chat on home PC</span>
+      </button>
       <!-- Code workspace: agentic projects -->
       <button class="new-chat new-agentic" id="new-project" hidden title="Start a new agentic coding project with Plan + Approval enabled">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg>
@@ -159,6 +164,11 @@
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
           <span>You need to select a project folder to start chatting.</span>
           <button type="button" id="folder-needed-pick">Choose folder</button>
+        </div>
+
+        <div class="folder-needed" id="remote-gone" hidden>
+          <span>This chat is no longer shared.</span>
+          <button type="button">OK</button>
         </div>
 
         <form class="composer" id="composer-form">
@@ -547,6 +557,7 @@
 
   <script src="lib/agent-rules.js"></script>
   <script src="lib/chat-mirror.js"></script>
+  <script src="lib/remote-rules.js"></script>
   <script src="renderer.js"></script>
 </body>
 </html>
