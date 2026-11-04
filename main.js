@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, dialog, protocol, net, shell: electronShell } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, protocol, net, shell: electronShell, safeStorage } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
@@ -10,6 +10,9 @@ const { safeFetchText } = require('./lib/url-rules');
 const { grepInWorker } = require('./lib/grep-runner');
 const { detectRepetitionLoop, splitOutputLines, quoteWindowsArg, encodePowerShell } = require('./lib/text-rules');
 const { killTree } = require('./lib/kill-tree');
+const { createKeystore } = require('./lib/remote/keystore');
+const { createManager: createRemoteManager } = require('./lib/remote/manager');
+const remoteRelayClient = require('./lib/remote/relay-client');
 
 // Chunks sent before an invoke returns are lost, because the preload can't listen
 // for a channel until it knows the name. This holds them until the reply is out.
@@ -459,6 +462,14 @@ app.whenReady().then(() => {
     }
   });
 
+  // Before the window, so the renderer's first call finds it. A problem here costs
+  // Remote Control, not the app.
+  try {
+    startRemoteControl();
+  } catch (e) {
+    console.error('[remote] could not start:', e.message);
+  }
+
   createWindow();
 
   mcpManager = new McpManager({
@@ -500,6 +511,7 @@ app.on('before-quit', (e) => {
 
   const cleanup = (async () => {
     // Kill in-flight generations first so nothing reloads a model behind us.
+    if (remoteManager) { try { remoteManager.shutdown(); } catch {} }
     for (const [, entry] of activeChatStreams) { try { entry.controller.abort(); } catch {} }
     for (const task of backgroundTasks.values()) { if (task.proc) killTree(task.proc); }
     for (const entry of videoProcesses.values()) { entry.aborted = true; if (entry.proc) killTree(entry.proc); }
@@ -519,6 +531,82 @@ app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(
 app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
 
 ipcMain.handle('config:get', () => ({ ollamaUrl: OLLAMA_URL }));
+
+// =================== REMOTE CONTROL ===================
+// All of the logic is in lib/remote/. This is only the Electron wiring.
+let remoteManager = null;
+
+// The address holds the relay's secret. It's only ever read from here and passed on, and
+// never logged.
+function remoteAddressStore(file) {
+  return {
+    load() {
+      try {
+        return JSON.parse(fs.readFileSync(file, 'utf8')).address ?? null;
+      } catch {
+        return null;
+      }
+    },
+    save(address) {
+      if (address === null) fs.rmSync(file, { force: true });
+      else fs.writeFileSync(file, JSON.stringify({ address }), { mode: 0o600 });
+    }
+  };
+}
+
+function startRemoteControl() {
+  const userData = app.getPath('userData');
+  const keystore = createKeystore({
+    file: path.join(userData, 'remote-keys.json'),
+    // The keystore hands over JSON text as bytes, and safeStorage takes a string.
+    protect: (bytes) => safeStorage.encryptString(Buffer.from(bytes).toString('utf8')),
+    unprotect: (bytes) => Buffer.from(safeStorage.decryptString(Buffer.from(bytes)), 'utf8'),
+    isProtectionAvailable: () => safeStorage.isEncryptionAvailable()
+  });
+  remoteManager = createRemoteManager({
+    keystore,
+    relay: remoteRelayClient,
+    addressStore: remoteAddressStore(path.join(userData, 'remote-service.json')),
+    deviceName: os.hostname()
+  });
+  remoteManager.onFrame((deviceId, frame) => sendToLocalUi('remote:frame', { deviceId, frame }));
+  remoteManager.onStatus((status) => sendToLocalUi('remote:status', status));
+}
+
+function sendToLocalUi(channel, payload) {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  try { mainWindow.webContents.send(channel, payload); } catch {}
+}
+
+// Only this app's own page in its main window, so never a preview, and never another
+// window such as the hidden one that carries direct connections.
+function isLocalUi(e) {
+  return Boolean(mainWindow) && !mainWindow.isDestroyed()
+    && e.sender === mainWindow.webContents
+    && e.senderFrame === e.sender.mainFrame
+    && e.senderFrame.url.startsWith('file:');
+}
+
+function handleRemote(channel, handler) {
+  ipcMain.handle(channel, (e, args) => {
+    if (!isLocalUi(e)) throw new Error("Remote Control can only be used from this app's own window.");
+    if (!remoteManager) throw new Error("Remote Control didn't start.");
+    return handler(args ?? {});
+  });
+}
+
+handleRemote('remote:status', () => remoteManager.status());
+handleRemote('remote:setAddress', ({ url }) => remoteManager.setAddress(url));
+handleRemote('remote:setPin', ({ pin }) => remoteManager.setPin(pin));
+handleRemote('remote:unlock', ({ pin }) => remoteManager.unlock(pin));
+handleRemote('remote:lock', () => remoteManager.lock());
+handleRemote('remote:createCode', () => remoteManager.createCode());
+handleRemote('remote:cancelCode', () => remoteManager.cancelCode());
+handleRemote('remote:pair', ({ code, name }) => remoteManager.pair(code, name));
+handleRemote('remote:removeDevice', ({ id }) => remoteManager.removeDevice(id));
+// handleRemote has checked the sender by now, which is what makes this claim true.
+handleRemote('remote:setControlAllowed', ({ allowed }) => remoteManager.setControlAllowed(allowed, { fromLocalUi: true }));
+handleRemote('remote:send', ({ deviceId, frame }) => remoteManager.send(deviceId, frame));
 
 // =================== MCP SERVERS ===================
 ipcMain.handle('mcp:list', () => mcpManager ? mcpManager.listServers() : []);

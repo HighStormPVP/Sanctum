@@ -182,6 +182,30 @@ contextBridge.exposeInMainWorld('api', {
     }
   },
 
+  remote: {
+    status:     ()            => ipcRenderer.invoke('remote:status'),
+    setAddress: (url)         => ipcRenderer.invoke('remote:setAddress', { url }),
+    setPin:     (pin)         => ipcRenderer.invoke('remote:setPin', { pin }),
+    unlock:     (pin)         => ipcRenderer.invoke('remote:unlock', { pin }),
+    lock:       ()            => ipcRenderer.invoke('remote:lock'),
+    createCode: ()            => ipcRenderer.invoke('remote:createCode'),
+    cancelCode: ()            => ipcRenderer.invoke('remote:cancelCode'),
+    pair:       (code, name)  => ipcRenderer.invoke('remote:pair', { code, name }),
+    removeDevice: (id)        => ipcRenderer.invoke('remote:removeDevice', { id }),
+    setControlAllowed: (allowed) => ipcRenderer.invoke('remote:setControlAllowed', { allowed }),
+    send:       (deviceId, frame) => ipcRenderer.invoke('remote:send', { deviceId, frame }),
+    onFrame: (cb) => {
+      const wrapped = (_e, { deviceId, frame }) => cb(deviceId, frame);
+      ipcRenderer.on('remote:frame', wrapped);
+      return () => ipcRenderer.removeListener('remote:frame', wrapped);
+    },
+    onStatus: (cb) => {
+      const wrapped = (_e, status) => cb(status);
+      ipcRenderer.on('remote:status', wrapped);
+      return () => ipcRenderer.removeListener('remote:status', wrapped);
+    }
+  },
+
   shell: {
     run:        (command, cwd) => ipcRenderer.invoke('shell:run', { command, cwd }),
     runAsync:   (command, cwd, allowlist) => ipcRenderer.invoke('shell:run_async', { command, cwd, allowlist }),
