@@ -9,6 +9,7 @@ const assert = require('node:assert');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { pathToFileURL } = require('node:url');
 const { startPair, waitFor, sleep, SECRET, PIN, TRANSPORT_PAGE } = require('./harness.js');
 
 const PARTITION = 'remote-transport';
@@ -277,6 +278,117 @@ test('the preload surface', async (t) => {
       const source = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
       assert.ok(!source.includes('getAllWindows'));
       assert.ok(!source.includes('getAllWebContents'));
+    });
+
+    await s.test('its page comes from a scheme of its own, on its session alone, and only that one page', async () => {
+      assert.deepEqual(
+        await hidden.evaluate(() => [location.protocol, location.host, location.pathname]),
+        ['aio-transport:', 'app', '/remote-transport.html']
+      );
+      const results = await home.app.evaluate(async ({ session }, partition) => {
+        const own = session.fromPartition(partition);
+        const status = (url, options) => own.fetch(url, options).then((r) => r.status, () => 'failed');
+        const page = await own.fetch('aio-transport://app/remote-transport.html');
+        return {
+          handledOnOwn: own.protocol.isProtocolHandled('aio-transport'),
+          handledOnDefault: session.defaultSession.protocol.isProtocolHandled('aio-transport'),
+          fromDefault: await session.defaultSession.fetch('aio-transport://app/remote-transport.html').then((r) => r.status, () => 'failed'),
+          good: page.status,
+          type: page.headers.get('content-type'),
+          hasCsp: (await page.text()).includes('Content-Security-Policy'),
+          withLog: await status('aio-transport://app/remote-transport.html?log=1'),
+          others: await Promise.all([
+            'aio-transport://app/',
+            'aio-transport://app/main.js',
+            'aio-transport://app/preload.js',
+            'aio-transport://app/remote-transport-preload.js',
+            'aio-transport://app/package.json',
+            'aio-transport://app/../main.js',
+            'aio-transport://app/remote-transport.html/../main.js',
+            'aio-transport://app/remote-transport.html/..%2fmain.js',
+            'aio-transport://app/%2e%2e/main.js',
+            'aio-transport://app/REMOTE-TRANSPORT.HTML',
+            'aio-transport://app/remote-transport.html/',
+            'aio-transport://other/remote-transport.html'
+          ].map((url) => status(url))),
+          posted: await status('aio-transport://app/remote-transport.html', { method: 'POST' })
+        };
+      }, PARTITION);
+      assert.deepEqual(results, {
+        handledOnOwn: true,
+        handledOnDefault: false,
+        fromDefault: 'failed',
+        good: 200,
+        type: 'text/html; charset=utf-8',
+        hasCsp: true,
+        withLog: 200,
+        others: Array(12).fill(404),
+        posted: 404
+      });
+    });
+
+    // Run last among these, since it reloads the page without its CSP. Without the CSP is the
+    // case that counts: an exploit wouldn't be bound by it, so what's left has to hold alone.
+    await s.test("a file: URL doesn't load from it, even with its CSP out of the way", async () => {
+      const target = path.join(dir, 'file-target.html');
+      fs.writeFileSync(target, '<!DOCTYPE html><title>target</title>');
+      const targetUrl = pathToFileURL(target).href;
+      // A frame refused a load can still report the URL, on its error page, so what counts is
+      // whether the target's own document is in there.
+      const framesHoldingTarget = (pageName) =>
+        home.app.evaluate(async ({ BrowserWindow }, wanted) => {
+          const win = BrowserWindow.getAllWindows().find((w) => w.webContents.getURL().includes(wanted));
+          const titles = await Promise.all(win.webContents.mainFrame.frames.map((frame) =>
+            Promise.race([
+              frame.executeJavaScript('document.title').catch(() => 'unreachable'),
+              new Promise((resolve) => setTimeout(() => resolve('no answer'), 1000))
+            ])));
+          return titles.filter((title) => title === 'target').length;
+        }, pageName);
+      const attempt = (url) =>
+        hidden.evaluate(async (fileUrl) => {
+          const fetched = await fetch(fileUrl).then(() => 'loaded', () => 'failed');
+          const framed = await new Promise((resolve) => {
+            const iframe = document.createElement('iframe');
+            iframe.onload = () => resolve('load event');
+            iframe.onerror = () => resolve('error event');
+            iframe.src = fileUrl;
+            document.body.append(iframe);
+            setTimeout(() => resolve('nothing'), 1500);
+          });
+          return { fetched, framed };
+        }, url);
+
+      // As shipped.
+      assert.equal((await attempt(targetUrl)).fetched, 'failed');
+      assert.equal(await framesHoldingTarget(TRANSPORT_PAGE), 0);
+
+      const cdp = await hidden.context().newCDPSession(hidden);
+      await cdp.send('Page.enable');
+      await cdp.send('Page.setBypassCSP', { enabled: true });
+      await hidden.reload();
+      await waitFor('the probe after the reload', () => hidden.evaluate(() => Boolean(window.__probe)));
+      const without = await attempt(targetUrl);
+      assert.equal(without.fetched, 'failed');
+      assert.equal(await framesHoldingTarget(TRANSPORT_PAGE), 0, 'the file: URL loaded in a frame');
+
+      // The same attempt from a page that does have a file: origin, in the same session: the
+      // frame loads, so not seeing one above means something.
+      const control = path.join(dir, 'control.html');
+      fs.writeFileSync(control, `<!DOCTYPE html><iframe src="${targetUrl}"></iframe>`);
+      const controlTitles = await home.app.evaluate(async ({ BrowserWindow }, [file, partition]) => {
+        const win = new BrowserWindow({ show: false, webPreferences: { partition, sandbox: true } });
+        await win.loadFile(file);
+        const titles = await Promise.all(win.webContents.mainFrame.frames.map((frame) => frame.executeJavaScript('document.title')));
+        win.destroy();
+        return titles;
+      }, [control, PARTITION]);
+      assert.deepEqual(controlTitles, ['target']);
+
+      await cdp.send('Page.setBypassCSP', { enabled: false });
+      await hidden.reload();
+      await cdp.detach();
+      await home.waitForPath('direct', 90000);
     });
 
     await home.app.evaluate(({ session }, partition) => {

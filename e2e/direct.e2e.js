@@ -75,6 +75,10 @@ test('direct connections', async (t) => {
         ['undefined', 'undefined', 'undefined', ['emit', 'onCommand']]
       );
 
+      // Direct is up at this point, so WebRTC works from this page and origin.
+      assert.equal(await page.evaluate(() => location.protocol), 'aio-transport:');
+      assert.equal(await device.path(), 'direct');
+
       // It can't open anything, go anywhere, or reach anything: the same denial as the main
       // window, and a CSP that stops what the page itself tries.
       const url = page.url();

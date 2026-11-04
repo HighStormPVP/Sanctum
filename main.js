@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, dialog, protocol, net, shell: electronShell, safeStorage } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, protocol, net, session, shell: electronShell, safeStorage } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
@@ -373,7 +373,8 @@ setInterval(() => {
 // Register custom protocol for cached media (must run before app ready)
 protocol.registerSchemesAsPrivileged([
   { scheme: 'aio-media', privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true } },
-  { scheme: 'aio-preview', privileges: { standard: true, secure: true } }
+  { scheme: 'aio-preview', privileges: { standard: true, secure: true } },
+  { scheme: 'aio-transport', privileges: { standard: true, secure: true } }
 ]);
 
 let mainWindow;
@@ -552,12 +553,30 @@ ipcMain.handle('config:get', () => ({ ollamaUrl: OLLAMA_URL }));
 // All of the logic is in lib/remote/. This is only the Electron wiring.
 let remoteManager = null;
 let remoteTransportWindow = null;
+const REMOTE_TRANSPORT_PARTITION = 'remote-transport';
+const REMOTE_TRANSPORT_URL = 'aio-transport://app/remote-transport.html';
 
 // For the tests in e2e/ only, so never in a packaged app, and nothing a peer says reaches them.
 //   log        the hidden window keeps a record of what it was handed
 //   no-stun    no STUN server, so a test only touches this machine's own networking
 //   block-ice  no candidates cross, so a data channel can never form
 const remoteTestFlags = new Set(app.isPackaged ? [] : String(process.env.SANCTUM_REMOTE_TEST || '').split(','));
+
+// A renderer that has loaded a file: page can read other file: URLs, which an exploit there
+// could use on the main window's storage files whatever the CSP says. So this page comes from
+// a scheme of its own, on its session alone, and it's the only thing that scheme serves. Going
+// through fs is what reads it from the app's archive in a packaged build.
+function serveRemoteTransportPage() {
+  session.fromPartition(REMOTE_TRANSPORT_PARTITION).protocol.handle('aio-transport', async (request) => {
+    const url = new URL(request.url);
+    const wanted = new URL(REMOTE_TRANSPORT_URL);
+    if (request.method !== 'GET' || url.host !== wanted.host || url.pathname !== wanted.pathname) {
+      return new Response(null, { status: 404 });
+    }
+    const page = await fs.promises.readFile(path.join(__dirname, 'remote-transport.html'));
+    return new Response(page, { headers: { 'content-type': 'text/html; charset=utf-8' } });
+  });
+}
 
 // Direct connections need WebRTC, which Electron only has in a renderer, so they live in this
 // window. It's hidden and sandboxed, and only ever sees ciphertext. None if the main window is
@@ -574,9 +593,9 @@ function openRemoteTransport({ onEvent, onGone }) {
       sandbox: true,
       nodeIntegration: false,
       backgroundThrottling: false,
-      // Its own session, in memory only. The main window's file:// storage holds the chats and
-      // API keys, and in the same session this page would share the origin and read them.
-      partition: 'remote-transport'
+      // Its own session, in memory only, away from the main window's storage, which holds the
+      // chats and API keys.
+      partition: REMOTE_TRANSPORT_PARTITION
     }
   });
   remoteTransportWindow = win;
@@ -595,7 +614,7 @@ function openRemoteTransport({ onEvent, onGone }) {
     if (remoteTransportWindow === win) remoteTransportWindow = null;
     onGone();
   });
-  win.loadFile(path.join(__dirname, 'remote-transport.html'), remoteTestFlags.has('log') ? { query: { log: '1' } } : {}).catch(() => {});
+  win.loadURL(remoteTestFlags.has('log') ? `${REMOTE_TRANSPORT_URL}?log=1` : REMOTE_TRANSPORT_URL).catch(() => {});
   return {
     send(command) {
       if (!win.isDestroyed()) contents.send('remote-transport:command', command);
@@ -653,6 +672,7 @@ function remoteAutoUnlockFile(file) {
 }
 
 function startRemoteControl() {
+  serveRemoteTransportPage();
   const userData = app.getPath('userData');
   // Both callers hand over text as bytes, and safeStorage takes a string.
   const protect = (bytes) => safeStorage.encryptString(Buffer.from(bytes).toString('utf8'));
