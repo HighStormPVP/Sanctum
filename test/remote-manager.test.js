@@ -2348,7 +2348,6 @@ test('pair with a PIN replaces the secret, the file goes, and the device follows
   const { code } = await realHome.manager.createCode();
   world.relay.pump();
   const pairing = device.manager.pair(code, 'Both', '424242');
-  await until('the PIN to be set', () => device.manager.status().hasPin);
   world.relay.pump();
   const answer = await pairing;
   assert.equal(answer.ok, true, answer.error);
@@ -2430,7 +2429,7 @@ test("a bad PIN to pair leaves everything as it was", async (t) => {
   assert.deepEqual(device.autoUnlock.store.bytes, sealed);
 });
 
-test('a brand new device pairing with a PIN never makes a secret', async (t) => {
+test('a brand new device pairing with a PIN ends up with that PIN and no secret file', async (t) => {
   const world = newWorld(t);
   const home = await world.device('Home');
   const laptop = await world.device('Laptop', { pin: false });
@@ -2439,13 +2438,16 @@ test('a brand new device pairing with a PIN never makes a secret', async (t) => 
   const { code } = await home.manager.createCode();
   world.relay.pump();
   const pairing = laptop.manager.pair(code, 'Laptop', PIN);
-  await until('the PIN to be set', () => laptop.manager.status().hasPin);
+  await until('its identity to exist', () => laptop.keystore.hasPin());
   world.relay.pump();
   assert.equal((await pairing).ok, true);
-  assert.equal(laptop.autoUnlock.store.writes, 0);
+  assert.equal(laptop.autoUnlock.store.bytes, null);
+  assert.equal(laptop.manager.status().hasPin, true);
   assert.equal(laptop.manager.status().locked, false);
-});
 
+  laptop.manager.lock();
+  assert.equal((await laptop.manager.unlock(PIN)).ok, true);
+});
 test('pair on a device that already has a PIN ignores the argument', async (t) => {
   const world = newWorld(t);
   const home = await world.device('Home');
@@ -2562,29 +2564,376 @@ test('a crash just after a real PIN leaves a file that costs one attempt, once, 
   assert.equal(device.manager.status().locked, false);
 });
 
-test('a secret that cannot be opened for now stays, and nothing is guessed', async (t) => {
+test('a secret file the system cannot open, with protection available, means damage: start unpaired and say so once', async (t) => {
+  const world = newWorld(t);
+  const home = await world.device('Home', { pin: false });
+  const laptop = await world.device('Laptop');
+  home.start();
+  laptop.start();
+  assert.equal((await pairNow(world, home, laptop)).answer.ok, true);
+  world.relay.pump();
+  const oldId = deviceIdFromPublicKey(home.keystore.getIdentity().publicKey);
+
+  home.autoUnlock.store.failUnprotect = true;
+  home.restart();
+
+  // The file is gone, and the keystore's is set aside the way a corrupt one is.
+  assert.equal(home.autoUnlock.store.bytes, null);
+  assert.equal(fs.existsSync(home.file), false);
+  const asideDir = path.dirname(home.file);
+  assert.equal(fs.readdirSync(asideDir).filter((name) => name.startsWith(`${path.basename(home.file)}.unreadable.`)).length, 1);
+
+  const first = home.manager.status();
+  assert.equal(first.keysReset, true);
+  assert.equal(first.locked, true);
+  assert.equal(first.hasPin, false);
+  assert.equal(first.needsPin, false);
+  assert.equal(first.storageAvailable, true);
+  assert.deepEqual(first.devices, []);
+  assert.equal(home.manager.status().keysReset, false);
+
+  // Not stuck: it works as a new device, with a new identity and nobody paired.
+  assert.equal((await home.manager.unlock(PIN)).error, 'No PIN has been set.');
+  home.autoUnlock.store.failUnprotect = false;
+  assert.ok((await home.manager.createCode()).code);
+  assert.notEqual(deviceIdFromPublicKey(home.keystore.getIdentity().publicKey), oldId);
+  assert.deepEqual(home.keystore.listPeers(), []);
+  assert.equal(home.manager.status().locked, false);
+  assert.equal(home.manager.status().keysReset, false);
+});
+
+test('keysReset waits for status(), however many status events go out first', async (t) => {
   const world = newWorld(t);
   const home = await world.device('Home', { pin: false });
   home.start();
   await home.manager.createCode();
-  const sealed = home.autoUnlock.store.bytes;
+  home.manager.cancelCode();
 
   home.autoUnlock.store.failUnprotect = true;
+  home.statuses.length = 0;
   home.restart();
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(home.manager.status().locked, true);
-  assert.deepEqual(home.autoUnlock.store.bytes, sealed);
-  // A person's guesses can't use up the attempts on a key nobody knows, or wipe it.
-  for (let i = 0; i < 10; i++) {
-    world.keystoreOffset += 10 * MINUTES;
-    assert.equal((await home.manager.unlock('000000')).ok, false);
-  }
-
   home.autoUnlock.store.failUnprotect = false;
-  home.restart();
-  await until('it to unlock itself', () => !home.manager.status().locked);
+  await home.manager.createCode();
+  home.manager.cancelCode();
+
+  assert.ok(home.statuses.length > 0);
+  assert.ok(home.statuses.every((status) => status.keysReset === true));
+  assert.equal(home.manager.status().keysReset, true);
+  assert.equal(home.manager.status().keysReset, false);
 });
 
+test('a device that never had a damaged file never says keysReset', async (t) => {
+  const world = newWorld(t);
+  const home = await world.device('Home', { pin: false });
+  home.start();
+  assert.equal(home.manager.status().keysReset, false);
+  await home.manager.createCode();
+  assert.equal(home.manager.status().keysReset, false);
+  home.restart();
+  await until('it to unlock itself', () => !home.manager.status().locked);
+  assert.equal(home.manager.status().keysReset, false);
+});
+
+test('with protection unavailable, a secret file stays and nothing resets', async (t) => {
+  const world = newWorld(t);
+  const file = world.newFile();
+  let available = true;
+  const make = () =>
+    createKeystore({ file, protect: (bytes) => bytes, unprotect: (bytes) => bytes, kdfCost: FAST, isProtectionAvailable: () => available });
+  const first = await world.device('First', { pin: false, keystore: make() });
+  first.start();
+  await first.manager.createCode();
+  first.manager.shutdown();
+  const sealed = first.autoUnlock.store.bytes;
+
+  available = false;
+  const device = await world.device('Device', { pin: false, keystore: make() });
+  device.autoUnlock.store.bytes = sealed;
+  device.autoUnlock.store.failUnprotect = true;
+  device.start();
+  const status = device.manager.status();
+  assert.equal(status.storageAvailable, false);
+  assert.equal(status.keysReset, false);
+  assert.deepEqual(device.autoUnlock.store.bytes, sealed);
+  assert.equal(fs.existsSync(file), true);
+
+  // Back again and readable: nothing was lost.
+  available = true;
+  device.autoUnlock.store.failUnprotect = false;
+  assert.equal(device.manager.status().storageAvailable, true);
+  await until('it to unlock itself', () => !device.manager.status().locked);
+  assert.equal(device.manager.status().keysReset, false);
+});
+
+test('protection going away at the moment of the failure is not taken for damage', async (t) => {
+  const world = newWorld(t);
+  const file = world.newFile();
+  let available = true;
+  const make = () =>
+    createKeystore({ file, protect: (bytes) => bytes, unprotect: (bytes) => bytes, kdfCost: FAST, isProtectionAvailable: () => available });
+  const first = await world.device('First', { pin: false, keystore: make() });
+  first.start();
+  await first.manager.createCode();
+  first.manager.shutdown();
+  const sealed = first.autoUnlock.store.bytes;
+
+  const device = await world.device('Device', { pin: false, keystore: make() });
+  device.autoUnlock.store.bytes = sealed;
+  const realUnprotect = device.autoUnlock.unprotect;
+  device.autoUnlock.unprotect = () => {
+    available = false;
+    throw new Error('no secure storage');
+  };
+  device.start();
+  assert.deepEqual(device.autoUnlock.store.bytes, sealed);
+  assert.equal(fs.existsSync(file), true);
+  assert.equal(device.manager.status().keysReset, false);
+  assert.equal(device.manager.status().storageAvailable, false);
+
+  available = true;
+  device.autoUnlock.unprotect = realUnprotect;
+  assert.equal(device.manager.status().storageAvailable, true);
+  await until('it to unlock itself', () => !device.manager.status().locked);
+});
+
+test('a self-unlock the keystore could not finish tries again, and guesses never reach it', async (t) => {
+  const world = newWorld(t);
+  const file = world.newFile();
+  const first = await world.device('First', { pin: false, file });
+  first.start();
+  await first.manager.createCode();
+  first.manager.shutdown();
+
+  const real = world.keystore(file);
+  const calls = [];
+  const flaky = {
+    ...real,
+    unlock(pin) {
+      calls.push(pin);
+      return calls.length === 1 ? Promise.resolve({ ok: false, error: 'Could not record the attempt.' }) : real.unlock(pin);
+    }
+  };
+  const device = await world.device('Device', { pin: false, keystore: flaky });
+  device.autoUnlock.store.bytes = first.autoUnlock.store.bytes;
+  device.start();
+  await until('the first try', () => calls.length === 1);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(device.manager.status().locked, true);
+  assert.ok(device.autoUnlock.store.bytes);
+
+  assert.equal((await device.manager.unlock('000000')).ok, false);
+  assert.equal(calls.length, 1);
+
+  world.run(5000);
+  assert.equal(calls.length, 2);
+  await until('it to unlock itself', () => !device.manager.status().locked);
+  assert.equal(device.manager.status().hasPin, false);
+});
+
+test('shutdown cancels a self-unlock waiting to try again', async (t) => {
+  const world = newWorld(t);
+  const file = world.newFile();
+  const first = await world.device('First', { pin: false, file });
+  first.start();
+  await first.manager.createCode();
+  first.manager.shutdown();
+
+  let calls = 0;
+  const real = world.keystore(file);
+  const failing = {
+    ...real,
+    unlock() {
+      calls += 1;
+      return Promise.resolve({ ok: false, error: 'Could not record the attempt.' });
+    }
+  };
+  const device = await world.device('Device', { pin: false, keystore: failing });
+  device.autoUnlock.store.bytes = first.autoUnlock.store.bytes;
+  device.start();
+  await until('the first try', () => calls === 1);
+  await new Promise((resolve) => setImmediate(resolve));
+  device.manager.shutdown();
+  world.run(MINUTES);
+  assert.equal(calls, 1);
+  assert.equal(world.clock.pendingTimers(), 0);
+});
+
+test('a wrong code leaves the secret in place and the device self-unlocking, with the PIN unused', async (t) => {
+  const world = newWorld(t);
+  const device = await world.device('Device', { pin: false });
+  device.start();
+  await device.manager.createCode();
+  device.manager.cancelCode();
+  const sealed = device.autoUnlock.store.bytes;
+  rawHost(world.relay, { code: 'ABCDEF' });
+  world.relay.pump();
+
+  const pairing = device.manager.pair('ZZZZZZ', 'Device', '424242');
+  world.relay.pump();
+  assert.deepEqual(await pairing, { ok: false, error: WRONG_CODE_RETRY });
+
+  const status = device.manager.status();
+  assert.equal(status.hasPin, false);
+  assert.equal(status.needsPin, false);
+  assert.equal(status.locked, false);
+  assert.deepEqual(device.autoUnlock.store.bytes, sealed);
+  device.manager.lock();
+  assert.equal(device.manager.status().idleLocked, false);
+
+  device.restart();
+  await until('it to unlock itself', () => !device.manager.status().locked);
+  assert.equal(device.manager.status().hasPin, false);
+});
+
+test('a home PC that goes silent, or no code waiting, also leaves the secret in place', async (t) => {
+  const world = newWorld(t);
+  const device = await world.device('Device', { pin: false });
+  device.start();
+  await device.manager.createCode();
+  device.manager.cancelCode();
+  world.relay.pump();
+  const sealed = device.autoUnlock.store.bytes;
+
+  const none = device.manager.pair('ABCDEF', 'Device', '424242');
+  world.relay.pump();
+  assert.equal((await none).ok, false);
+  assert.deepEqual(device.autoUnlock.store.bytes, sealed);
+
+  world.relay.connectPairing({ role: 'host', onOpen() {}, onNone() {}, onClose() {}, onMessage() {} });
+  world.relay.pump();
+  const silent = device.manager.pair('ABCDEG', 'Device', '424242');
+  world.relay.pump();
+  world.run(30 * 1000);
+  assert.equal((await silent).ok, false);
+  assert.deepEqual(device.autoUnlock.store.bytes, sealed);
+  assert.equal(device.manager.status().hasPin, false);
+});
+
+test('a brand new device that types a wrong code keeps no PIN, and can serve as a home PC after all', async (t) => {
+  const world = newWorld(t);
+  const device = await world.device('Device', { pin: false });
+  device.start();
+  rawHost(world.relay, { code: 'ABCDEF' });
+  world.relay.pump();
+
+  const pairing = device.manager.pair('ZZZZZZ', 'Device', '424242');
+  await until('its identity to exist', () => device.keystore.hasPin());
+  world.relay.pump();
+  assert.deepEqual(await pairing, { ok: false, error: WRONG_CODE_RETRY });
+  assert.equal(device.manager.status().hasPin, false);
+  assert.ok(device.autoUnlock.store.bytes);
+  assert.equal(device.manager.status().locked, false);
+  device.restart();
+  await until('it to unlock itself', () => !device.manager.status().locked);
+});
+
+test('a PIN in the wrong format is refused up front, before anyone is contacted', async (t) => {
+  const world = newWorld(t);
+  const device = await world.device('Device', { pin: false });
+  device.start();
+  await device.manager.createCode();
+  device.manager.cancelCode();
+  const contacts = world.relay.pairConnects.length;
+  for (const pin of ['123', 'abcdef', '12345', 123456]) {
+    const answer = await device.manager.pair('ABCDEF', 'Device', pin);
+    assert.equal(answer.ok, false);
+    assert.equal(answer.error, 'The PIN must be at least 6 digits.');
+  }
+  assert.equal(world.relay.pairConnects.length, contacts);
+
+  // And a brand new device doesn't make a secret for one.
+  const fresh = await world.device('Fresh', { pin: false });
+  fresh.start();
+  assert.equal((await fresh.manager.pair('ABCDEF', 'Fresh', '123')).ok, false);
+  assert.equal(fresh.autoUnlock.store.writes, 0);
+  assert.equal(fresh.keystore.hasPin(), false);
+});
+
+test('a PIN that cannot be set after pairing keeps the pairing, says so, and can be set again', async (t) => {
+  const world = newWorld(t);
+  const home = await world.device('Home');
+  const real = world.keystore();
+  let refuse = false;
+  const keystore = {
+    ...real,
+    setPin: (pin) => (refuse ? Promise.resolve({ ok: false, error: 'Could not save the PIN.' }) : real.setPin(pin))
+  };
+  const device = await world.device('Device', { pin: false, keystore });
+  home.start();
+  device.start();
+  await device.manager.createCode();
+  device.manager.cancelCode();
+  const sealed = device.autoUnlock.store.bytes;
+
+  refuse = true;
+  const { code } = await home.manager.createCode();
+  world.relay.pump();
+  const pairing = device.manager.pair(code, 'Device', '424242');
+  world.relay.pump();
+  const answer = await pairing;
+  assert.equal(answer.ok, true);
+  assert.equal(answer.device.id, home.id);
+  assert.equal(answer.device.role, 'home');
+  assert.equal(answer.pinError, 'Could not save the PIN.');
+
+  world.relay.pump();
+  assert.equal(real.listPeers()[0].deviceId, home.id);
+  const status = device.manager.status();
+  assert.equal(status.needsPin, true);
+  assert.equal(status.hasPin, false);
+  assert.equal(status.devices[0].connected, true);
+  assert.deepEqual(device.autoUnlock.store.bytes, sealed);
+
+  // The same path works from here.
+  refuse = false;
+  assert.equal((await device.manager.setPin('12')).ok, false);
+  assert.equal(device.manager.status().needsPin, true);
+  assert.deepEqual((await device.manager.setPin('424242')), { ok: true });
+  const after = device.manager.status();
+  assert.equal(after.needsPin, false);
+  assert.equal(after.hasPin, true);
+  assert.equal(device.autoUnlock.store.bytes, null);
+  assert.equal(after.devices[0].connected, true);
+
+  device.manager.lock();
+  assert.equal(device.manager.status().idleLocked, true);
+  assert.equal((await device.manager.unlock('424242')).ok, true);
+});
+
+test('needsPin survives a restart while a home PC is paired on the secret', async (t) => {
+  const world = newWorld(t);
+  const home = await world.device('Home');
+  const file = world.newFile();
+  const real = world.keystore(file);
+  let refuse = false;
+  const keystore = {
+    ...real,
+    setPin: (pin) => (refuse ? Promise.resolve({ ok: false, error: 'Could not save the PIN.' }) : real.setPin(pin))
+  };
+  const device = await world.device('Device', { pin: false, keystore, file });
+  home.start();
+  device.start();
+  await device.manager.createCode();
+  device.manager.cancelCode();
+  refuse = true;
+  const { code } = await home.manager.createCode();
+  world.relay.pump();
+  const pairing = device.manager.pair(code, 'Device', '424242');
+  world.relay.pump();
+  assert.equal((await pairing).ok, true);
+
+  device.restart();
+  await until('it to unlock itself', () => !device.manager.status().locked);
+  world.relay.pump();
+  const status = device.manager.status();
+  assert.equal(status.needsPin, true);
+  assert.equal(status.hasPin, false);
+  assert.equal(status.devices[0].role, 'home');
+  assert.equal(status.devices[0].connected, true);
+  assert.deepEqual(await device.manager.setPin('424242'), { ok: true });
+  assert.equal(device.manager.status().needsPin, false);
+  assert.equal(device.autoUnlock.store.bytes, null);
+});
 // ---- The real relay client, against a fake socket ----
 
 class FakeSocket extends EventEmitter {

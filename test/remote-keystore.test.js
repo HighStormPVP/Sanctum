@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
-const { createKeystore, DEFAULT_KDF_COST, waitAfter } = require(path.join(__dirname, '..', 'lib', 'remote', 'keystore.js'));
+const { createKeystore, DEFAULT_KDF_COST, waitAfter, pinFormatError } = require(path.join(__dirname, '..', 'lib', 'remote', 'keystore.js'));
 
 // Cheap scrypt so the suite stays fast. One test checks the production default.
 const FAST = { N: 16, r: 8, p: 1 };
@@ -1010,4 +1010,57 @@ test('if the reset write fails after a correct PIN, the next successful write ca
   // In memory it was already clear, so three free guesses follow.
   ks.lock();
   for (let i = 0; i < 3; i++) assert.deepStrictEqual(await ks.unlock(WRONG), { ok: false, waitMs: 0 });
+});
+
+test('setAsideAsDamaged moves the file away, keeps a copy, and leaves an empty unpaired store', async (t) => {
+  const dir = tempDir(t);
+  const file = path.join(dir, 'keys.json');
+  const store = createKeystore({ file, kdfCost: FAST, ...identityFns });
+  assert.deepEqual(await store.setPin(PIN), { ok: true });
+  store.setControlAllowed(true);
+  store.lock();
+
+  assert.equal(store.setAsideAsDamaged(), true);
+  assert.equal(store.hasPin(), false);
+  assert.equal(store.isUnlocked(), false);
+  assert.equal(store.getControlAllowed(), false);
+  assert.equal(fs.existsSync(file), false);
+  assert.equal(fs.readdirSync(dir).filter((name) => name.startsWith('keys.json.unreadable.')).length, 1);
+
+  // A new store on the same path agrees, and it can start over.
+  const again = createKeystore({ file, kdfCost: FAST, ...identityFns });
+  assert.equal(again.hasPin(), false);
+  assert.deepEqual(await again.setPin(PIN), { ok: true });
+});
+
+test('setAsideAsDamaged also locks a store that was open', async (t) => {
+  const dir = tempDir(t);
+  const file = path.join(dir, 'keys.json');
+  const store = createKeystore({ file, kdfCost: FAST, ...identityFns });
+  await store.setPin(PIN);
+  assert.equal(store.isUnlocked(), true);
+  assert.equal(store.setAsideAsDamaged(), true);
+  assert.equal(store.isUnlocked(), false);
+  assert.equal(store.getIdentity(), null);
+});
+
+test('setAsideAsDamaged touches nothing while secure storage is unavailable', async (t) => {
+  const dir = tempDir(t);
+  const file = path.join(dir, 'keys.json');
+  const first = createKeystore({ file, kdfCost: FAST, ...identityFns });
+  await first.setPin(PIN);
+
+  const store = createKeystore({ file, kdfCost: FAST, ...identityFns, isProtectionAvailable: () => false });
+  assert.equal(store.setAsideAsDamaged(), false);
+  assert.equal(fs.existsSync(file), true);
+  assert.deepEqual(fs.readdirSync(dir), ['keys.json']);
+});
+
+test('pinFormatError is the rule setPin uses', async (t) => {
+  for (const good of ['123456', '0000000000', '1'.repeat(40)]) assert.equal(pinFormatError(good), null);
+  const store = createKeystore({ file: path.join(tempDir(t), 'keys.json'), kdfCost: FAST, ...identityFns });
+  for (const bad of ['12345', 'abcdef', '12345a', '', 123456, null, undefined]) {
+    assert.ok(pinFormatError(bad));
+    assert.deepEqual(await store.setPin(bad), { ok: false, error: pinFormatError(bad) });
+  }
 });
