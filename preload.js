@@ -30,7 +30,11 @@ contextBridge.exposeInMainWorld('api', {
   platform: process.platform,
   // The resolved shell the agent's run_command will spawn (name = display
   // label, path = full binary path).
-  shell: SHELL_INFO,
+  shellInfo: SHELL_INFO,
+  // The real answer. The value above is only a guess, because the sandboxed
+  // preload can't check the disk for Git Bash.
+  getShellInfo: () => ipcRenderer.invoke('shell:info'),
+  preview: { create: (html) => ipcRenderer.invoke('preview:create', html) },
   config: () => ipcRenderer.invoke('config:get'),
   catalog: () => ipcRenderer.invoke('models:catalog'),
   // Hardware profile for the Download tab's fit meter. Cached in main after
@@ -90,7 +94,8 @@ contextBridge.exposeInMainWorld('api', {
       return new Promise((resolve) => {
         const handler = (_e, payload) => {
           // Surface the channelId on each chunk so the renderer can wire stop.
-          onChunk({ ...payload, _channelId: channelId });
+          try { onChunk({ ...payload, _channelId: channelId }); }
+          catch (err) { console.error('chat chunk handler failed:', err); }
           if (payload.done) {
             ipcRenderer.removeListener(channelId, handler);
             resolve();
@@ -99,15 +104,23 @@ contextBridge.exposeInMainWorld('api', {
         ipcRenderer.on(channelId, handler);
       });
     },
-    chatAbort: (channelId) => ipcRenderer.invoke('ollama:chat-abort', channelId)
+    chatAbort: (channelId) => ipcRenderer.invoke('ollama:chat-abort', channelId),
+    // Evict every model Ollama currently holds in memory. Returns
+    // { unloaded: [names], freedBytes }.
+    unloadAll: () => ipcRenderer.invoke('ollama:unload-all'),
+    // Names of the fully loaded models, or null if Ollama can't be reached.
+    ps: () => ipcRenderer.invoke('ollama:ps'),
+    // Live GGUF metadata for a model. Returns { model_info, details } or { error }.
+    show: (tag) => ipcRenderer.invoke('ollama:show', tag)
   },
 
   cloud: {
-    chat: async ({ provider, apiKey, model, messages, tools, options }, onChunk) => {
-      const { channelId } = await ipcRenderer.invoke('cloud:chat', { provider, apiKey, model, messages, tools, options });
+    chat: async ({ provider, apiKey, model, messages, tools, options, images }, onChunk) => {
+      const { channelId } = await ipcRenderer.invoke('cloud:chat', { provider, apiKey, model, messages, tools, options, images });
       return new Promise((resolve) => {
         const handler = (_e, payload) => {
-          onChunk({ ...payload, _channelId: channelId });
+          try { onChunk({ ...payload, _channelId: channelId }); }
+          catch (err) { console.error('chat chunk handler failed:', err); }
           if (payload.done) {
             ipcRenderer.removeListener(channelId, handler);
             resolve();

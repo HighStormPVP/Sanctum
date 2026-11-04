@@ -1750,7 +1750,7 @@
         "abliterated",
         "uncensored"
       ],
-      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+      "blurb": "Abliterated build — the learned refusal direction is removed from the weights, so it answers prompts the base model would decline. Abliteration edits the weights: expect a few points off reasoning and instruction-following, and somewhat more sycophancy."
     },
     {
       "id": "hh-r1-7b",
@@ -1766,7 +1766,7 @@
         "abliterated",
         "uncensored"
       ],
-      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+      "blurb": "Abliterated build — the learned refusal direction is removed from the weights, so it answers prompts the base model would decline. Abliteration edits the weights: expect a few points off reasoning and instruction-following, and somewhat more sycophancy."
     },
     {
       "id": "hh-r1-8b",
@@ -1782,7 +1782,7 @@
         "abliterated",
         "uncensored"
       ],
-      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+      "blurb": "Abliterated build — the learned refusal direction is removed from the weights, so it answers prompts the base model would decline. Abliteration edits the weights: expect a few points off reasoning and instruction-following, and somewhat more sycophancy."
     },
     {
       "id": "hh-r1-14b",
@@ -1798,7 +1798,7 @@
         "abliterated",
         "uncensored"
       ],
-      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+      "blurb": "Abliterated build — the learned refusal direction is removed from the weights, so it answers prompts the base model would decline. Abliteration edits the weights: expect a few points off reasoning and instruction-following, and somewhat more sycophancy."
     },
     {
       "id": "hh-r1-32b",
@@ -1814,7 +1814,7 @@
         "abliterated",
         "uncensored"
       ],
-      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+      "blurb": "Abliterated build — the learned refusal direction is removed from the weights, so it answers prompts the base model would decline. Abliteration edits the weights: expect a few points off reasoning and instruction-following, and somewhat more sycophancy."
     },
     {
       "id": "hh-r1-70b",
@@ -1830,7 +1830,7 @@
         "abliterated",
         "uncensored"
       ],
-      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+      "blurb": "Abliterated build — the learned refusal direction is removed from the weights, so it answers prompts the base model would decline. Abliteration edits the weights: expect a few points off reasoning and instruction-following, and somewhat more sycophancy."
     },
     {
       "id": "hh-qwen3-0.6b",
@@ -1848,7 +1848,7 @@
         "abliterated",
         "uncensored"
       ],
-      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+      "blurb": "Abliterated build — the learned refusal direction is removed from the weights, so it answers prompts the base model would decline. Abliteration edits the weights: expect a few points off reasoning and instruction-following, and somewhat more sycophancy."
     },
     {
       "id": "hh-qwen3-1.7b",
@@ -1866,7 +1866,7 @@
         "abliterated",
         "uncensored"
       ],
-      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+      "blurb": "Abliterated build — the learned refusal direction is removed from the weights, so it answers prompts the base model would decline. Abliteration edits the weights: expect a few points off reasoning and instruction-following, and somewhat more sycophancy."
     },
     {
       "id": "hh-qwen3-4b",
@@ -1883,7 +1883,7 @@
         "abliterated",
         "uncensored"
       ],
-      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+      "blurb": "Abliterated build — the learned refusal direction is removed from the weights, so it answers prompts the base model would decline. Abliteration edits the weights: expect a few points off reasoning and instruction-following, and somewhat more sycophancy."
     },
     {
       "id": "hh-qwen3-8b",
@@ -1900,7 +1900,7 @@
         "abliterated",
         "uncensored"
       ],
-      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+      "blurb": "Abliterated build — the learned refusal direction is removed from the weights, so it answers prompts the base model would decline. Abliteration edits the weights: expect a few points off reasoning and instruction-following, and somewhat more sycophancy."
     },
     {
       "id": "hh-qwen3-14b",
@@ -1917,7 +1917,7 @@
         "abliterated",
         "uncensored"
       ],
-      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+      "blurb": "Abliterated build — the learned refusal direction is removed from the weights, so it answers prompts the base model would decline. Abliteration edits the weights: expect a few points off reasoning and instruction-following, and somewhat more sycophancy."
     },
     {
       "id": "hh-qwen3-30b",
@@ -1935,7 +1935,7 @@
         "abliterated",
         "uncensored"
       ],
-      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+      "blurb": "Abliterated build — the learned refusal direction is removed from the weights, so it answers prompts the base model would decline. Abliteration edits the weights: expect a few points off reasoning and instruction-following, and somewhat more sycophancy."
     },
     {
       "id": "hh-qwen3-32b",
@@ -1952,7 +1952,7 @@
         "abliterated",
         "uncensored"
       ],
-      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+      "blurb": "Abliterated build — the learned refusal direction is removed from the weights, so it answers prompts the base model would decline. Abliteration edits the weights: expect a few points off reasoning and instruction-following, and somewhat more sycophancy."
     },
     {
       "id": "hh-qwen3-235b",
@@ -1970,7 +1970,7 @@
         "abliterated",
         "uncensored"
       ],
-      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+      "blurb": "Abliterated build — the learned refusal direction is removed from the weights, so it answers prompts the base model would decline. Abliteration edits the weights: expect a few points off reasoning and instruction-following, and somewhat more sycophancy."
     },
     {
       "id": "qwen3.5-0.8b",
@@ -2099,7 +2099,7 @@
         "abliterated",
         "uncensored"
       ],
-      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+      "blurb": "Abliterated build — the learned refusal direction is removed from the weights, so it answers prompts the base model would decline. Abliteration edits the weights: expect a few points off reasoning and instruction-following, and somewhat more sycophancy."
     },
     {
       "id": "hh-qwen35-2b",
@@ -2117,7 +2117,7 @@
         "abliterated",
         "uncensored"
       ],
-      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+      "blurb": "Abliterated build — the learned refusal direction is removed from the weights, so it answers prompts the base model would decline. Abliteration edits the weights: expect a few points off reasoning and instruction-following, and somewhat more sycophancy."
     },
     {
       "id": "hh-qwen35-4b",
@@ -2134,7 +2134,7 @@
         "abliterated",
         "uncensored"
       ],
-      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+      "blurb": "Abliterated build — the learned refusal direction is removed from the weights, so it answers prompts the base model would decline. Abliteration edits the weights: expect a few points off reasoning and instruction-following, and somewhat more sycophancy."
     },
     {
       "id": "hh-qwen35-9b",
@@ -2152,7 +2152,7 @@
         "abliterated",
         "uncensored"
       ],
-      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+      "blurb": "Abliterated build — the learned refusal direction is removed from the weights, so it answers prompts the base model would decline. Abliteration edits the weights: expect a few points off reasoning and instruction-following, and somewhat more sycophancy."
     },
     {
       "id": "hh-qwen35-27b",
@@ -2170,7 +2170,7 @@
         "abliterated",
         "uncensored"
       ],
-      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+      "blurb": "Abliterated build — the learned refusal direction is removed from the weights, so it answers prompts the base model would decline. Abliteration edits the weights: expect a few points off reasoning and instruction-following, and somewhat more sycophancy."
     },
     {
       "id": "hh-qwen35-35b",
@@ -2188,7 +2188,7 @@
         "abliterated",
         "uncensored"
       ],
-      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+      "blurb": "Abliterated build — the learned refusal direction is removed from the weights, so it answers prompts the base model would decline. Abliteration edits the weights: expect a few points off reasoning and instruction-following, and somewhat more sycophancy."
     },
     {
       "id": "hh-qwen35-122b",
@@ -2206,7 +2206,7 @@
         "abliterated",
         "uncensored"
       ],
-      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+      "blurb": "Abliterated build — the learned refusal direction is removed from the weights, so it answers prompts the base model would decline. Abliteration edits the weights: expect a few points off reasoning and instruction-following, and somewhat more sycophancy."
     },
     {
       "id": "hh-qwen36-27b",
@@ -2224,7 +2224,7 @@
         "abliterated",
         "uncensored"
       ],
-      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+      "blurb": "Abliterated build — the learned refusal direction is removed from the weights, so it answers prompts the base model would decline. Abliteration edits the weights: expect a few points off reasoning and instruction-following, and somewhat more sycophancy."
     },
     {
       "id": "hh-qwen36-35b",
@@ -2242,7 +2242,7 @@
         "abliterated",
         "uncensored"
       ],
-      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+      "blurb": "Abliterated build — the learned refusal direction is removed from the weights, so it answers prompts the base model would decline. Abliteration edits the weights: expect a few points off reasoning and instruction-following, and somewhat more sycophancy."
     },
     {
       "id": "hh-gemma3-270m",
@@ -2258,7 +2258,7 @@
         "abliterated",
         "uncensored"
       ],
-      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+      "blurb": "Abliterated build — the learned refusal direction is removed from the weights, so it answers prompts the base model would decline. Abliteration edits the weights: expect a few points off reasoning and instruction-following, and somewhat more sycophancy."
     },
     {
       "id": "hh-gemma3-1b",
@@ -2274,7 +2274,7 @@
         "abliterated",
         "uncensored"
       ],
-      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+      "blurb": "Abliterated build — the learned refusal direction is removed from the weights, so it answers prompts the base model would decline. Abliteration edits the weights: expect a few points off reasoning and instruction-following, and somewhat more sycophancy."
     },
     {
       "id": "hh-gemma3-4b",
@@ -2290,7 +2290,7 @@
         "abliterated",
         "uncensored"
       ],
-      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+      "blurb": "Abliterated build — the learned refusal direction is removed from the weights, so it answers prompts the base model would decline. Abliteration edits the weights: expect a few points off reasoning and instruction-following, and somewhat more sycophancy."
     },
     {
       "id": "hh-gemma3-12b",
@@ -2306,7 +2306,7 @@
         "abliterated",
         "uncensored"
       ],
-      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+      "blurb": "Abliterated build — the learned refusal direction is removed from the weights, so it answers prompts the base model would decline. Abliteration edits the weights: expect a few points off reasoning and instruction-following, and somewhat more sycophancy."
     },
     {
       "id": "hh-gemma3-27b",
@@ -2322,7 +2322,7 @@
         "abliterated",
         "uncensored"
       ],
-      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+      "blurb": "Abliterated build — the learned refusal direction is removed from the weights, so it answers prompts the base model would decline. Abliteration edits the weights: expect a few points off reasoning and instruction-following, and somewhat more sycophancy."
     },
     {
       "id": "hh-gemma4-e2b",
@@ -2339,7 +2339,7 @@
         "abliterated",
         "uncensored"
       ],
-      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+      "blurb": "Abliterated build — the learned refusal direction is removed from the weights, so it answers prompts the base model would decline. Abliteration edits the weights: expect a few points off reasoning and instruction-following, and somewhat more sycophancy."
     },
     {
       "id": "hh-gemma4-e4b",
@@ -2355,7 +2355,7 @@
         "abliterated",
         "uncensored"
       ],
-      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+      "blurb": "Abliterated build — the learned refusal direction is removed from the weights, so it answers prompts the base model would decline. Abliteration edits the weights: expect a few points off reasoning and instruction-following, and somewhat more sycophancy."
     },
     {
       "id": "hh-gemma4-12b",
@@ -2372,7 +2372,7 @@
         "abliterated",
         "uncensored"
       ],
-      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+      "blurb": "Abliterated build — the learned refusal direction is removed from the weights, so it answers prompts the base model would decline. Abliteration edits the weights: expect a few points off reasoning and instruction-following, and somewhat more sycophancy."
     },
     {
       "id": "hh-gemma4-26b",
@@ -2389,7 +2389,7 @@
         "abliterated",
         "uncensored"
       ],
-      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+      "blurb": "Abliterated build — the learned refusal direction is removed from the weights, so it answers prompts the base model would decline. Abliteration edits the weights: expect a few points off reasoning and instruction-following, and somewhat more sycophancy."
     },
     {
       "id": "hh-gemma4-31b",
@@ -2406,7 +2406,7 @@
         "abliterated",
         "uncensored"
       ],
-      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+      "blurb": "Abliterated build — the learned refusal direction is removed from the weights, so it answers prompts the base model would decline. Abliteration edits the weights: expect a few points off reasoning and instruction-following, and somewhat more sycophancy."
     },
     {
       "id": "hh-gemma4-48b",
@@ -2423,7 +2423,7 @@
         "abliterated",
         "uncensored"
       ],
-      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+      "blurb": "Abliterated build — the learned refusal direction is removed from the weights, so it answers prompts the base model would decline. Abliteration edits the weights: expect a few points off reasoning and instruction-following, and somewhat more sycophancy."
     },
     {
       "id": "hh-gptoss-20b",
@@ -2441,7 +2441,7 @@
         "abliterated",
         "uncensored"
       ],
-      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+      "blurb": "Abliterated build — the learned refusal direction is removed from the weights, so it answers prompts the base model would decline. Abliteration edits the weights: expect a few points off reasoning and instruction-following, and somewhat more sycophancy."
     },
     {
       "id": "hh-gptoss-120b",
@@ -2459,7 +2459,7 @@
         "abliterated",
         "uncensored"
       ],
-      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+      "blurb": "Abliterated build — the learned refusal direction is removed from the weights, so it answers prompts the base model would decline. Abliteration edits the weights: expect a few points off reasoning and instruction-following, and somewhat more sycophancy."
     },
     {
       "id": "hh-qwq-32b",
@@ -2476,7 +2476,7 @@
         "abliterated",
         "uncensored"
       ],
-      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+      "blurb": "Abliterated build — the learned refusal direction is removed from the weights, so it answers prompts the base model would decline. Abliteration edits the weights: expect a few points off reasoning and instruction-following, and somewhat more sycophancy."
     },
     {
       "id": "hh-glm47-30b",
@@ -2493,7 +2493,7 @@
         "abliterated",
         "uncensored"
       ],
-      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+      "blurb": "Abliterated build — the learned refusal direction is removed from the weights, so it answers prompts the base model would decline. Abliteration edits the weights: expect a few points off reasoning and instruction-following, and somewhat more sycophancy."
     },
     {
       "id": "hh-qwen3vl-2b",
@@ -2510,7 +2510,7 @@
         "abliterated",
         "uncensored"
       ],
-      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+      "blurb": "Abliterated build — the learned refusal direction is removed from the weights, so it answers prompts the base model would decline. Abliteration edits the weights: expect a few points off reasoning and instruction-following, and somewhat more sycophancy."
     },
     {
       "id": "hh-qwen3vl-4b",
@@ -2527,7 +2527,7 @@
         "abliterated",
         "uncensored"
       ],
-      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+      "blurb": "Abliterated build — the learned refusal direction is removed from the weights, so it answers prompts the base model would decline. Abliteration edits the weights: expect a few points off reasoning and instruction-following, and somewhat more sycophancy."
     },
     {
       "id": "hh-qwen3vl-8b",
@@ -2544,7 +2544,7 @@
         "abliterated",
         "uncensored"
       ],
-      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+      "blurb": "Abliterated build — the learned refusal direction is removed from the weights, so it answers prompts the base model would decline. Abliteration edits the weights: expect a few points off reasoning and instruction-following, and somewhat more sycophancy."
     },
     {
       "id": "hh-qwen3vl-30b",
@@ -2561,7 +2561,7 @@
         "abliterated",
         "uncensored"
       ],
-      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+      "blurb": "Abliterated build — the learned refusal direction is removed from the weights, so it answers prompts the base model would decline. Abliteration edits the weights: expect a few points off reasoning and instruction-following, and somewhat more sycophancy."
     },
     {
       "id": "hh-qwen3vl-32b",
@@ -2578,7 +2578,7 @@
         "abliterated",
         "uncensored"
       ],
-      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+      "blurb": "Abliterated build — the learned refusal direction is removed from the weights, so it answers prompts the base model would decline. Abliteration edits the weights: expect a few points off reasoning and instruction-following, and somewhat more sycophancy."
     },
     {
       "id": "dolphin-mixtral-8x7b",
@@ -3245,7 +3245,7 @@
         "abliterated",
         "uncensored"
       ],
-      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+      "blurb": "Abliterated build — the learned refusal direction is removed from the weights, so it answers prompts the base model would decline. Abliteration edits the weights: expect a few points off reasoning and instruction-following, and somewhat more sycophancy."
     },
     {
       "id": "hh-qwen3coder-480b",
@@ -3262,7 +3262,7 @@
         "abliterated",
         "uncensored"
       ],
-      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+      "blurb": "Abliterated build — the learned refusal direction is removed from the weights, so it answers prompts the base model would decline. Abliteration edits the weights: expect a few points off reasoning and instruction-following, and somewhat more sycophancy."
     },
     {
       "id": "hh-qwen25coder-7b",
@@ -3278,7 +3278,7 @@
         "abliterated",
         "uncensored"
       ],
-      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+      "blurb": "Abliterated build — the learned refusal direction is removed from the weights, so it answers prompts the base model would decline. Abliteration edits the weights: expect a few points off reasoning and instruction-following, and somewhat more sycophancy."
     },
     {
       "id": "hh-qwen25coder-14b",
@@ -3294,7 +3294,7 @@
         "abliterated",
         "uncensored"
       ],
-      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+      "blurb": "Abliterated build — the learned refusal direction is removed from the weights, so it answers prompts the base model would decline. Abliteration edits the weights: expect a few points off reasoning and instruction-following, and somewhat more sycophancy."
     },
     {
       "id": "hh-qwen25coder-32b",
@@ -3310,7 +3310,7 @@
         "abliterated",
         "uncensored"
       ],
-      "blurb": "Abliterated build — the learned refusal direction is removed, so it answers prompts the base model would decline. Same weights and quality otherwise."
+      "blurb": "Abliterated build — the learned refusal direction is removed from the weights, so it answers prompts the base model would decline. Abliteration edits the weights: expect a few points off reasoning and instruction-following, and somewhat more sycophancy."
     },
     {
       "id": "qwen3-coder-flash",

@@ -2,7 +2,7 @@
 
 A private, local-first AI workspace. Electron desktop app. Chat, vision, code, video analysis, and agentic tasks — everything runs on the user's own machine via Ollama, with optional cloud models (Claude, Gemini) when the user supplies an API key.
 
-Current version: **v0.3.9**. Repo: `HighStormPVP/Sanctum`.
+Current version: **v0.4.6**. Repo: `HighStormPVP/Sanctum`.
 
 ## Running it
 
@@ -23,11 +23,25 @@ Three files carry almost everything:
 
 | File | Lines | Role |
 |---|---|---|
-| `renderer.js` | ~5.3K | All UI, chat loop, tool execution, state |
-| `main.js` | ~1.9K | IPC handlers, Ollama + cloud streaming, fs/shell/web |
+| `renderer.js` | ~6.9K | All UI, chat loop, tool execution, state |
+| `main.js` | ~2.5K | IPC handlers, Ollama + cloud streaming, fs/shell/web |
 | `preload.js` | ~230 | contextBridge — the only renderer↔main surface |
 
-Plus `index.html` (markup), `style.css` (~3K lines), `models.json` (catalog), `lib/mcp-*.js` (MCP client/manager).
+Plus `index.html` (markup), `style.css` (~3.5K lines), `models.json` (catalog), `lib/mcp-*.js` (MCP client/manager).
+
+Rules that decide what's allowed live in `lib/`, free of Electron, so `npm test` can run them without launching the app:
+
+| File | Rules |
+|---|---|
+| `lib/agent-rules.js` | Safety modes, command pre-approval. Loaded by the renderer through a `<script>` tag, and by tests through `require` |
+| `lib/fs-rules.js` | Path allowlist, `apply_patch` replacement, file walking |
+| `lib/url-rules.js` | `web_fetch` limits: no private addresses, redirect checks, timeout, size cap |
+| `lib/grep-runner.js` | Agent grep in a worker with a time limit |
+| `lib/cloud-params.js` | Per-model thinking, effort, fallback, and image rules |
+| `lib/text-rules.js` | Repetition guard, output line splitting, Windows argument quoting |
+| `lib/kill-tree.js` | Stops a process and everything it started |
+
+`npm test` runs them. The renderer's sandboxed preload can't read the disk, so anything it needs from the system comes through IPC.
 
 `contextIsolation: true`, `nodeIntegration: false`. Renderer touches the OS **only** through `window.api`.
 
@@ -72,12 +86,15 @@ The contract: every provider emits `{ message: { content?, tool_calls? }, done, 
 - Never date-suffix model ids. `claude-haiku-4-5-20251001` → 400. It's just `claude-haiku-4-5`.
 - Default `max_tokens: 64000` for streaming, not 8192 — hitting the cap truncates mid-thought and reads as "send is broken".
 - Empty `{type:'text', text:''}` blocks are rejected. Skip the message entirely if it has no text and no tool_use.
-- Thinking: Opus 4.x / Sonnet 4.6 → `{type: 'adaptive'}`. Haiku 4.5 → manual only, `{type: 'enabled', budget_tokens: N}`.
+- Thinking rules differ by model, and a wrong value is a 400. They live in `lib/cloud-params.js`: Opus 5.5 and Fable 5.x can't turn thinking off, so "off" means low effort. Sonnet 5.5 turns it off with `{type: 'between_tools'}`. Haiku 5.5 rejects `budget_tokens`; Haiku 4.x needs it.
+- Replay tool turns unchanged. Signed thinking blocks travel on `tool_calls[0]._anthropic_content`.
+- A decline is HTTP 200 with `stop_reason: 'refusal'`. Opus, Sonnet 5.5, and Fable send `fallbacks: 'default'`; Haiku 5.5 has no fallback.
 
 **Gemini:**
 - Tool schemas reject `$schema` and `additionalProperties` — `toGeminiTools` sanitizes recursively.
 - Tool results are user-role messages with `parts: [{functionResponse: {name, response}}]`. `response` must be an object; wrap bare strings as `{result: str}`. The `name` must match the original `functionCall.name` — that's why history entries carry `tool_name` alongside `tool_call_id`.
-- Thinking: Pro is structurally always-on (`thinking_level: LOW` is the floor, no true off). Flash/Flash-Lite accept `thinking_budget: 0` to disable.
+- Thinking: Gemini 3+ has no off switch. "Off" means the lowest level that model accepts (see `lib/cloud-params.js`).
+- Function calls carry a `thoughtSignature`, which has to go back on the same part or the next tool round can be rejected.
 
 **Both:** SSE parsing normalizes `\r\n → \n` before splitting frames on `\n\n`. Cloud errors must NOT go through `friendlyOllamaError` — it rewrites "fetch failed" into "Couldn't reach Ollama", which is nonsense for an Anthropic call.
 
@@ -157,8 +174,10 @@ Mac CI ships `.zip`, not `.dmg` (APFS `hdiutil` bug on Apple Silicon runners).
 
 ## Conventions
 
-- Assistant messages render flat (no bubble); user messages keep the purple bubble.
+- Assistant messages render flat (no bubble); user messages use a solid bubble (`--bubble`).
 - Composer caps at 5 lines (~130px), then scrolls internally.
 - Markdown renderer handles both asterisk and underscore bold/italic. Underscore patterns use word-boundary lookarounds so `snake_case` survives.
 - Debug logs: `%APPDATA%/sanctum/chat-debug.log` (chat streams), `pull-debug.log` (model pulls).
 - Aesthetics: contemporary and sleek. No retro/instrument-panel/scan-line treatments.
+- Visual identity: a quiet room with one lamp on. Spruce surfaces, warm text, amber for what's live. No gradients, glows, or sparkle icons, except the sidebar logo, which keeps its original violet-to-cyan S at the owner's request. The taskbar and installer use Electron's default icon, also at the owner's request, so don't add an app icon unless asked. One lamp dot marks a working model.
+- Fonts ship in `assets/fonts/`. Nothing is loaded from a CDN.

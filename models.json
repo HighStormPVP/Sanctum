@@ -6,62 +6,72 @@
       "backend": "cloud",
       "picks": [
         {
-          "id": "claude-opus-4-8",
-          "name": "Claude Opus 4.8",
+          "id": "claude-fable-5-1",
+          "name": "Claude Fable 5.1",
           "provider": "anthropic",
-          "model_id": "claude-opus-4-8",
-          "why": "Anthropic's flagship — top-tier reasoning, code, and agentic tool use. Best for hard agent tasks where local models stall. Requires an Anthropic API key.",
-          "context": 200000,
+          "model_id": "claude-fable-5-1",
+          "why": "Anthropic's most capable model, for the hardest reasoning and long agent runs. Replies can take several minutes, and thinking is always on. Requires an Anthropic API key.",
+          "context": 1000000,
           "tools_capable": true,
           "thinking_capable": true
         },
         {
-          "id": "claude-sonnet-4-6",
-          "name": "Claude Sonnet 4.6",
+          "id": "claude-opus-5-5",
+          "name": "Claude Opus 5.5",
           "provider": "anthropic",
-          "model_id": "claude-sonnet-4-6",
-          "why": "Balanced cost/quality — fast enough for everyday chat, smart enough for serious agentic work. The default cloud pick. Requires an Anthropic API key.",
-          "context": 200000,
+          "model_id": "claude-opus-5-5",
+          "why": "Strong on agentic coding and long, complex work. Thinking is always on, and the toggle changes how much effort it spends. Requires an Anthropic API key.",
+          "context": 1000000,
           "tools_capable": true,
           "thinking_capable": true
         },
         {
-          "id": "claude-haiku-4-5",
-          "name": "Claude Haiku 4.5",
+          "id": "claude-sonnet-5-5",
+          "name": "Claude Sonnet 5.5",
           "provider": "anthropic",
-          "model_id": "claude-haiku-4-5",
-          "why": "Fastest Claude tier — quick conversational answers and low-latency tool calls. First Haiku with extended thinking (manual budget, no adaptive). Requires an Anthropic API key.",
-          "context": 200000,
+          "model_id": "claude-sonnet-5-5",
+          "why": "Fast enough for everyday chat and capable enough for serious agent work. The default cloud pick. Requires an Anthropic API key.",
+          "context": 1000000,
           "tools_capable": true,
           "thinking_capable": true
         },
         {
-          "id": "gemini-3-1-pro-preview",
-          "name": "Gemini 3.1 Pro (Preview)",
-          "provider": "google",
-          "model_id": "gemini-3.1-pro-preview",
-          "why": "Google's most advanced model — reasoning-first design optimized for complex agentic workflows and coding. Preview status. Thinking is always on (LOW is the floor). Requires a Google AI Studio API key.",
-          "context": 1048576,
+          "id": "claude-haiku-5-5",
+          "name": "Claude Haiku 5.5",
+          "provider": "anthropic",
+          "model_id": "claude-haiku-5-5",
+          "why": "The fastest Claude, for quick answers and low-latency tool calls. Requires an Anthropic API key.",
+          "context": 1000000,
           "tools_capable": true,
           "thinking_capable": true
         },
         {
-          "id": "gemini-3-5-flash",
-          "name": "Gemini 3.5 Flash",
+          "id": "gemini-4-argon",
+          "name": "Gemini 4 Argon",
           "provider": "google",
-          "model_id": "gemini-3.5-flash",
-          "why": "GA Flash model — the most intelligent Flash tier for sustained frontier performance on agentic and coding tasks. Great default cloud pick that balances cost and quality. Requires a Google AI Studio API key.",
-          "context": 1048576,
+          "model_id": "gemini-4-argon",
+          "why": "Google's flagship reasoning model. Thinking is always on, and the toggle changes how deep it goes. Requires a Google AI Studio API key.",
+          "context": 1000000,
           "tools_capable": true,
           "thinking_capable": true
         },
         {
-          "id": "gemini-3-1-flash-lite",
-          "name": "Gemini 3.1 Flash-Lite",
+          "id": "gemini-3-8-flash",
+          "name": "Gemini 3.8 Flash",
           "provider": "google",
-          "model_id": "gemini-3.1-flash-lite",
-          "why": "The most cost-efficient Gemini — optimized for low-latency, high-volume traffic. Pick this when you want a cheap fast cloud answer. Requires a Google AI Studio API key.",
-          "context": 1048576,
+          "model_id": "gemini-3.8-flash",
+          "why": "Google's newest Flash model, balancing speed and quality for agent and coding work. Requires a Google AI Studio API key.",
+          "context": 1000000,
+          "tools_capable": true,
+          "thinking_capable": true
+        },
+        {
+          "id": "gemini-3-5-flash-lite",
+          "name": "Gemini 3.5 Flash-Lite",
+          "provider": "google",
+          "model_id": "gemini-3.5-flash-lite",
+          "why": "Google's fastest low-cost option, for quick answers and high-volume use. Requires a Google AI Studio API key.",
+          "context": 1000000,
           "tools_capable": true,
           "thinking_capable": true
         }
@@ -218,5 +228,16 @@
         }
       ]
     }
+  },
+  "renamed_models": {
+    "claude-opus-4-8": "claude-opus-5-5",
+    "claude-sonnet-4-6": "claude-sonnet-5-5",
+    "claude-haiku-4-5": "claude-haiku-5-5",
+    "gemini-3-1-pro-preview": "gemini-4-argon",
+    "gemini-3.1-pro-preview": "gemini-4-argon",
+    "gemini-3-5-flash": "gemini-3-8-flash",
+    "gemini-3.5-flash": "gemini-3-8-flash",
+    "gemini-3-1-flash-lite": "gemini-3-5-flash-lite",
+    "gemini-3.1-flash-lite": "gemini-3-5-flash-lite"
   }
 }

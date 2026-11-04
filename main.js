@@ -1,10 +1,43 @@
-const { app, BrowserWindow, ipcMain, dialog, protocol, net } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, protocol, net, shell: electronShell } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
 const os = require('os');
 const { exec, spawn } = require('child_process');
 const { McpManager } = require('./lib/mcp-manager');
+const { isWithinRoots, applyExactPatch, globToRegex, walkFiles } = require('./lib/fs-rules');
+const { safeFetchText } = require('./lib/url-rules');
+const { grepInWorker } = require('./lib/grep-runner');
+const { detectRepetitionLoop, splitOutputLines, quoteWindowsArg, encodePowerShell } = require('./lib/text-rules');
+const { killTree } = require('./lib/kill-tree');
+
+// Chunks sent before an invoke returns are lost, because the preload can't listen
+// for a channel until it knows the name. This holds them until the reply is out.
+function deferredSender(sender, channelId) {
+  const send = (p) => { try { if (!sender.isDestroyed()) sender.send(channelId, p); } catch {} };
+  let queue = [];
+  setImmediate(() => { const held = queue; queue = null; held.forEach(send); });
+  return (p) => { if (queue) queue.push(p); else send(p); };
+}
+
+// Apps opened from Finder or a desktop launcher get a minimal PATH, which hides
+// Homebrew's ffmpeg, npx, and brew. Windows apps get the full PATH already.
+function fixPackagedPath() {
+  if (!app.isPackaged || process.platform === 'win32') return;
+  const loginShell = process.env.SHELL || (process.platform === 'darwin' ? '/bin/zsh' : '/bin/bash');
+  try {
+    const child = spawn(loginShell, ['-ilc', 'printf "%s" "$PATH"'], { stdio: ['ignore', 'pipe', 'ignore'] });
+    let out = '';
+    const timer = setTimeout(() => { try { child.kill(); } catch {} }, 3000);
+    child.stdout.on('data', (d) => { out += d.toString(); });
+    child.on('error', () => clearTimeout(timer));
+    child.on('exit', () => {
+      clearTimeout(timer);
+      if (out.trim()) process.env.PATH = `${out.trim()}:${process.env.PATH || ''}`;
+    });
+  } catch {}
+}
+fixPackagedPath();
 
 let mcpManager = null;
 function broadcastMcpUpdate() {
@@ -90,7 +123,7 @@ async function probeWindowsGpu() {
       if ($q -and $q -gt $vram) { $vram = $q }
     };
     Write-Output ("{0}|{1}" -f $g.Name, $vram)`;
-  const out = await execOut(`powershell -NoProfile -NonInteractive -Command "${ps.replace(/"/g, '\\"').replace(/\s+/g, ' ')}"`, 8000);
+  const out = await execOut(`powershell -NoProfile -NonInteractive -EncodedCommand ${encodePowerShell(ps)}`, 8000);
   const line = out.split('\n').map(s => s.trim()).filter(Boolean).pop();
   if (!line || !line.includes('|')) return null;
   const [name, raw] = line.split('|');
@@ -322,11 +355,21 @@ setInterval(() => {
 
 // Register custom protocol for cached media (must run before app ready)
 protocol.registerSchemesAsPrivileged([
-  { scheme: 'aio-media', privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true } }
+  { scheme: 'aio-media', privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true } },
+  { scheme: 'aio-preview', privileges: { standard: true, secure: true } }
 ]);
 
 let mainWindow;
 let CACHE_DIR;
+
+const previewPages = new Map();
+ipcMain.handle('preview:create', (_e, html) => {
+  const id = crypto.randomBytes(12).toString('hex');
+  previewPages.set(id, String(html ?? ''));
+  // Only a few previews can be open at once, so old ones can go.
+  while (previewPages.size > 20) previewPages.delete(previewPages.keys().next().value);
+  return `aio-preview://${id}/`;
+});
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -334,7 +377,7 @@ function createWindow() {
     height: 860,
     minWidth: 900,
     minHeight: 600,
-    backgroundColor: '#0b0d12',
+    backgroundColor: '#131c1b',
     title: 'Sanctum',
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
@@ -343,6 +386,33 @@ function createWindow() {
     }
   });
   mainWindow.setMenuBarVisibility(false);
+
+  // Web links open in the user's browser, never in a window of this app. The app
+  // itself only ever shows its own page.
+  const contents = mainWindow.webContents;
+  const openOutside = (url) => {
+    if (/^https?:\/\//i.test(url)) electronShell.openExternal(url).catch(() => {});
+  };
+  contents.setWindowOpenHandler(({ url }) => {
+    openOutside(url);
+    return { action: 'deny' };
+  });
+  contents.on('will-navigate', (e, url) => {
+    if (url.startsWith('file:')) return;
+    e.preventDefault();
+    openOutside(url);
+  });
+
+  // A reload or a closed window takes the Stop button with it, so nothing could
+  // end a generation that was left running.
+  const abortStreams = () => {
+    for (const [, entry] of activeChatStreams) { try { entry.controller.abort(); } catch {} }
+  };
+  contents.on('did-start-navigation', (details) => {
+    if (details.isMainFrame && !details.isSameDocument) abortStreams();
+  });
+  contents.once('destroyed', abortStreams);
+
   mainWindow.loadFile(path.join(__dirname, 'index.html'));
 }
 
@@ -362,6 +432,19 @@ function mimeFor(filePath) {
 app.whenReady().then(() => {
   CACHE_DIR = path.join(app.getPath('userData'), 'media-cache');
   fs.mkdirSync(CACHE_DIR, { recursive: true });
+
+  // HTML previews of model-written code. Serving them from their own scheme gives
+  // them their own script policy, because the app's policy blocks inline scripts.
+  // The CSP sandbox gives them an opaque origin, so they can't reach window.api.
+  protocol.handle('aio-preview', (request) => {
+    const id = new URL(request.url).hostname;
+    return new Response(previewPages.get(id) ?? 'Preview expired. Reload it from the chat.', {
+      headers: {
+        'content-type': 'text/html; charset=utf-8',
+        'content-security-policy': 'sandbox allow-scripts allow-forms allow-modals allow-popups'
+      }
+    });
+  });
 
   protocol.handle('aio-media', async (request) => {
     try {
@@ -418,6 +501,8 @@ app.on('before-quit', (e) => {
   const cleanup = (async () => {
     // Kill in-flight generations first so nothing reloads a model behind us.
     for (const [, entry] of activeChatStreams) { try { entry.controller.abort(); } catch {} }
+    for (const task of backgroundTasks.values()) { if (task.proc) killTree(task.proc); }
+    for (const entry of videoProcesses.values()) { entry.aborted = true; if (entry.proc) killTree(entry.proc); }
     const unloaded = await unloadAllOllamaModels();
     if (unloaded.length) dlog(`quit · unloaded ${unloaded.length} model(s): ${unloaded.join(', ')}`);
     if (mcpManager) { try { await mcpManager.stopAll(); } catch {} }
@@ -480,6 +565,12 @@ ipcMain.handle('models:download_catalog', () => {
 
 // Candidate locations where the official Windows installer drops ollama.exe.
 function ollamaInstallCandidates() {
+  if (process.platform === 'darwin') {
+    return ['/Applications/Ollama.app/Contents/Resources/ollama', '/usr/local/bin/ollama', '/opt/homebrew/bin/ollama'];
+  }
+  if (process.platform !== 'win32') {
+    return ['/usr/local/bin/ollama', '/usr/bin/ollama', path.join(os.homedir(), '.local', 'bin', 'ollama')];
+  }
   return [
     path.join(os.homedir(), 'AppData', 'Local', 'Programs', 'Ollama', 'ollama.exe'),
     path.join(os.homedir(), 'AppData', 'Local', 'Programs', 'Ollama', 'ollama app.exe'),
@@ -513,15 +604,31 @@ ipcMain.handle('ollama:detect', async () => {
 ipcMain.handle('ollama:start', async () => {
   // Prefer the tray app launcher if present — it ensures the server starts the
   // way the Ollama installer intended (auto-starts on subsequent logins, etc.).
+  const isWin = process.platform === 'win32';
   const tray = path.join(os.homedir(), 'AppData', 'Local', 'Programs', 'Ollama', 'ollama app.exe');
-  const cli  = path.join(os.homedir(), 'AppData', 'Local', 'Programs', 'Ollama', 'ollama.exe');
+  const macApp = '/Applications/Ollama.app';
   let toLaunch = null;
   let args = [];
-  if (fs.existsSync(tray)) { toLaunch = tray; }
-  else if (fs.existsSync(cli)) { toLaunch = cli; args = ['serve']; }
-  else { return { error: 'ollama not found in default install locations' }; }
+  if (isWin && fs.existsSync(tray)) { toLaunch = tray; }
+  else if (process.platform === 'darwin' && fs.existsSync(macApp)) { toLaunch = 'open'; args = ['-a', 'Ollama']; }
+  else {
+    const cli = findOllamaExe();
+    if (!cli) return { error: 'ollama not found in default install locations' };
+    toLaunch = cli;
+    args = ['serve'];
+  }
   try {
-    const child = spawn(toLaunch, args, { detached: true, stdio: 'ignore', windowsHide: true });
+    // q8_0 KV cache roughly halves context memory, letting big contexts fit —
+    // but Ollama silently ignores OLLAMA_KV_CACHE_TYPE unless flash attention is
+    // on. This only takes effect when Sanctum is the one starting Ollama; an
+    // already-running service keeps its own env, which is why the fit engine
+    // keeps 30% headroom rather than trusting the q8 assumption.
+    const child = spawn(toLaunch, args, {
+      detached: true, stdio: 'ignore', windowsHide: true,
+      env: { ...process.env, OLLAMA_FLASH_ATTENTION: '1', OLLAMA_KV_CACHE_TYPE: 'q8_0' }
+    });
+    // Without a listener, a failed launch would be an uncaught exception here.
+    child.on('error', () => {});
     child.unref();
     // Wait briefly for the server to come up
     for (let i = 0; i < 30; i++) {
@@ -536,10 +643,15 @@ ipcMain.handle('ollama:start', async () => {
 
 ipcMain.handle('ollama:install', async (evt) => {
   const channelId = `ollama:install:${Date.now()}:${Math.random().toString(36).slice(2)}`;
-  const send = (msg) => { try { evt.sender.send(channelId, msg); } catch {} };
+  const send = deferredSender(evt.sender, channelId);
 
   (async () => {
     try {
+      if (process.platform !== 'win32') {
+        const where = process.platform === 'darwin' ? 'Download it from ollama.com/download' : 'Install it from ollama.com/download';
+        send({ error: `Sanctum can only install Ollama automatically on Windows. ${where}, then reopen Sanctum.`, done: true });
+        return;
+      }
       // 1) Download OllamaSetup.exe from the official URL.
       send({ phase: 'downloading', message: 'Downloading installer from ollama.com…' });
       const tmpFile = path.join(os.tmpdir(), `OllamaSetup-${Date.now()}.exe`);
@@ -578,6 +690,7 @@ ipcMain.handle('ollama:install', async (evt) => {
           stdio: 'ignore',
           windowsHide: false
         });
+        child.on('error', (e) => send({ error: `Failed to launch installer: ${e.message}`, done: true }));
         child.unref();
       } catch (e) {
         send({ error: `Failed to launch installer: ${e.message}`, done: true });
@@ -612,6 +725,78 @@ ipcMain.handle('ollama:list', async () => {
     return await res.json();
   } catch (e) {
     return { error: e.message, models: [] };
+  }
+});
+
+// Force-unload on demand. Reuses the same eviction path the freeze watchdog
+// and quit cleanup use: ask Ollama what's resident (/api/ps), then keep_alive:0
+// each one so the weights leave memory NOW instead of squatting for the 5-min
+// keep_alive window. Wired to the Settings button + rebindable shortcut so the
+// user can reclaim VRAM/RAM whenever they want (e.g. before launching a game or
+// another GPU job). Returns the models that were resident and their reported
+// size, so the renderer can say exactly what it freed.
+ipcMain.handle('ollama:unload-all', async () => {
+  let resident = [];
+  try {
+    const res = await fetch(`${OLLAMA_URL}/api/ps`, { signal: AbortSignal.timeout(2500) });
+    if (!res.ok) return { unloaded: [], freedBytes: 0, error: `Ollama returned ${res.status}` };
+    const j = await res.json();
+    resident = (j.models || []).map(m => ({
+      name: m.name || m.model,
+      sizeBytes: m.size_vram || m.size || 0
+    })).filter(m => m.name);
+  } catch {
+    // A busy Ollama can time out here while still holding memory, so this can't
+    // be reported as "nothing was loaded".
+    return { unloaded: [], freedBytes: 0, error: "Couldn't reach Ollama" };
+  }
+
+  const names = resident.map(m => m.name);
+  const done = [];
+  await Promise.all(names.map(async (n) => { if (await unloadOllamaModel(n)) done.push(n); }));
+  const freedBytes = resident
+    .filter(m => done.includes(m.name))
+    .reduce((sum, m) => sum + (m.sizeBytes || 0), 0);
+  const failed = names.filter(n => !done.includes(n));
+  return { unloaded: done, failed, freedBytes };
+});
+
+// Names of the models fully loaded right now. A model that is still loading
+// isn't listed yet, which is how the chat tells "loading" from "reading".
+// Returns null when Ollama can't be asked, so callers don't mistake that for
+// "nothing is loaded".
+ipcMain.handle('ollama:ps', async () => {
+  try {
+    const res = await fetch(`${OLLAMA_URL}/api/ps`, { signal: AbortSignal.timeout(2500) });
+    if (!res.ok) return null;
+    const j = await res.json();
+    return (j.models || []).map(m => m.name || m.model).filter(Boolean);
+  } catch { return null; }
+});
+
+// Live GGUF metadata for a model (expert counts, KV geometry, context length).
+// The fit engine uses this to size MoE models by their ACTIVE params rather than
+// total weights, and to compute a real context suggestion instead of guessing.
+// Cached per tag — a model's metadata never changes for a given pull; errors are
+// not cached so a transient failure can retry.
+const modelInfoCache = new Map();
+ipcMain.handle('ollama:show', async (_e, tag) => {
+  if (!tag) return { error: 'no tag' };
+  if (modelInfoCache.has(tag)) return modelInfoCache.get(tag);
+  try {
+    const res = await fetch(`${OLLAMA_URL}/api/show`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: tag }),
+      signal: AbortSignal.timeout(6000)
+    });
+    if (!res.ok) return { error: `Ollama /api/show ${res.status}` };
+    const j = await res.json();
+    const out = { model_info: j.model_info || null, details: j.details || null, capabilities: j.capabilities || null };
+    modelInfoCache.set(tag, out);
+    return out;
+  } catch (e) {
+    return { error: e.message };
   }
 });
 
@@ -698,6 +883,7 @@ ipcMain.handle('ollama:pull', async (evt, tag) => {
 // Uninstall a model. Frees its disk blobs via Ollama's /api/delete.
 ipcMain.handle('ollama:delete', async (_e, tag) => {
   if (!tag) return { error: 'no tag specified' };
+  modelInfoCache.delete(tag);   // metadata cache is stale once the model is gone
   try {
     const res = await fetch(`${OLLAMA_URL}/api/delete`, {
       method: 'DELETE',
@@ -742,6 +928,14 @@ ipcMain.handle('ollama:pull-abort', async (_e, { channelId, removeFiles }) => {
 // exactly the memory that froze the machine.
 const activeChatStreams = new Map();
 
+// Detect a degenerate repetition loop at the tail of the streamed text — the
+// model emitting the same short fragment over and over ("AndBoxMeshMaterial"
+// ×700), which is how a local model can burn 12K+ tokens and poison a chat.
+// Returns the offending unit if the tail ends in a cycle unmistakably long
+// enough to be degenerate, else null. Cheap: scans only a bounded tail, and the
+// caller only runs it every ~200 chars. Thresholds are deliberately high so
+// real content (a repeated code line, a divider) never trips it — 1.2K straight
+// chars of one exact repeating unit does not occur in legitimate output.
 ipcMain.handle('ollama:chat', async (evt, { model, messages, images, tools, options }) => {
   const channelId = `ollama:chat:stream:${Date.now()}:${Math.random().toString(36).slice(2)}`;
   const controller = new AbortController();
@@ -787,6 +981,8 @@ ipcMain.handle('ollama:chat', async (evt, { model, messages, images, tools, opti
       let chunkCount = 0;
       let totalContent = '';
       let toolCallCount = 0;
+      let totalThinking = '';
+      let lastLoopCheckLen = 0;   // only re-scan for a loop every ~200 new chars
       while (true) {
         let value, done;
         try { ({ value, done } = await reader.read()); }
@@ -804,11 +1000,33 @@ ipcMain.handle('ollama:chat', async (evt, { model, messages, images, tools, opti
             const obj = JSON.parse(line);
             chunkCount++;
             if (obj.message?.content) totalContent += obj.message.content;
+            if (typeof obj.message?.thinking === 'string') totalThinking += obj.message.thinking;
             if (obj.message?.tool_calls) toolCallCount += obj.message.tool_calls.length;
             if (chunkCount <= 2 || obj.done || obj.error) {
               dlog(`#${chunkCount} ${JSON.stringify(obj).slice(0, 300)}`);
             }
             evt.sender.send(channelId, obj);
+
+            // Repetition-loop guard. If the model has spiralled into repeating
+            // one fragment, stop it now — before it burns the whole budget and
+            // poisons the chat history — rather than streaming thousands more
+            // copies. We abort Ollama, drop a short visible note through the
+            // normal content path (so no renderer change is needed), and end.
+            const generatedLen = totalContent.length + totalThinking.length;
+            if (generatedLen - lastLoopCheckLen >= 200) {
+              lastLoopCheckLen = generatedLen;
+              // Reasoning can spiral too, and there it would run to the token cap unseen.
+              const unit = detectRepetitionLoop(totalContent) || detectRepetitionLoop(totalThinking);
+              if (unit) {
+                dlog(`LOOP GUARD · stopped · unit=${JSON.stringify(unit.slice(0, 40))} contentLen=${totalContent.length} eval≈${chunkCount}`);
+                try { controller.abort(); } catch {}
+                evt.sender.send(channelId, {
+                  message: { content: '\n\n_[Stopped automatically — the model started repeating itself. Try again, lower the context, or switch to a stronger model for this edit.]_' }
+                });
+                evt.sender.send(channelId, { done: true, loopStopped: true, eval_count: chunkCount });
+                return;
+              }
+            }
           } catch (e) {
             dlog(`parse fail: ${line.slice(0, 200)}`);
           }
@@ -846,6 +1064,14 @@ ipcMain.handle('ollama:chat-abort', (_e, channelId) => {
 //   { error, done }
 //   { aborted, done }
 const ANTHROPIC_VERSION = '2023-06-01';
+const {
+  anthropicThinkingParams,
+  anthropicUsesFallbacks,
+  ANTHROPIC_FALLBACK_BETA,
+  geminiThinkingConfig,
+  addImagesToAnthropic,
+  addImagesToGemini
+} = require(path.join(__dirname, 'lib', 'cloud-params.js'));
 
 function toAnthropicTools(tools) {
   if (!Array.isArray(tools) || !tools.length) return undefined;
@@ -887,6 +1113,15 @@ function toAnthropicMessages(messages) {
     }
     flushToolResults();
     if (m.role === 'assistant') {
+      // A turn from the tool loop carries the exact blocks the API sent,
+      // including signed thinking. They have to go back unchanged and in order.
+      const original = Array.isArray(m.tool_calls)
+        ? m.tool_calls.find(tc => Array.isArray(tc._anthropic_content))?._anthropic_content
+        : null;
+      if (original?.length) {
+        out.push({ role: 'assistant', content: original });
+        continue;
+      }
       const blocks = [];
       // Anthropic rejects empty text content blocks — only push the text
       // block if it has actual content. Tool calls still get their own
@@ -913,25 +1148,9 @@ function toAnthropicMessages(messages) {
   return { system: sys.join('\n\n').trim() || undefined, messages: out };
 }
 
-// Translate the renderer's boolean thinking_enabled into the Anthropic-native
-// shape, which differs by model family:
-//   Opus 4.x / Sonnet 4.6  → {type: "adaptive"}  (omit when off — both work)
-//   Haiku 4.5              → {type: "enabled", budget_tokens: N}  (manual only)
-// Anything else → no thinking param.
-function anthropicThinkingParam(model, enabled) {
-  if (!enabled) return null;
-  if (/^claude-haiku/i.test(model)) {
-    // Haiku 4.5 manual budget. budget_tokens must be < max_tokens (we send
-    // 64000). 10K is generous for a Haiku reasoning pass without dominating
-    // the response budget.
-    return { type: 'enabled', budget_tokens: 10000 };
-  }
-  // Opus 4.x, Sonnet 4.6, and Fable 5 family all accept adaptive.
-  return { type: 'adaptive' };
-}
-
-async function streamAnthropic({ apiKey, model, messages, tools, options, controller, evt, channelId, dlog }) {
+async function streamAnthropic({ apiKey, model, messages, tools, options, images, controller, evt, channelId, dlog }) {
   const { system, messages: anthropicMsgs } = toAnthropicMessages(messages);
+  addImagesToAnthropic(anthropicMsgs, images);
   const body = {
     model,
     messages: anthropicMsgs,
@@ -944,16 +1163,22 @@ async function streamAnthropic({ apiKey, model, messages, tools, options, contro
   if (system) body.system = system;
   const tdef = toAnthropicTools(tools);
   if (tdef) body.tools = tdef;
-  const tparam = anthropicThinkingParam(model, options?.thinking_enabled);
-  if (tparam) body.thinking = tparam;
+  Object.assign(body, anthropicThinkingParams(model, !!options?.thinking_enabled));
+  const headers = {
+    'content-type': 'application/json',
+    'x-api-key': apiKey,
+    'anthropic-version': ANTHROPIC_VERSION
+  };
+  // Lets the API retry a safety decline on another model instead of ending the
+  // reply. The model that answers can differ from the one that was picked.
+  if (anthropicUsesFallbacks(model)) {
+    body.fallbacks = 'default';
+    headers['anthropic-beta'] = ANTHROPIC_FALLBACK_BETA;
+  }
 
   const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      'x-api-key': apiKey,
-      'anthropic-version': ANTHROPIC_VERSION
-    },
+    headers,
     body: JSON.stringify(body),
     signal: controller.signal
   });
@@ -972,8 +1197,12 @@ async function streamAnthropic({ apiKey, model, messages, tools, options, contro
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buf = '';
-  const toolUses = new Map(); // index → { id, name, jsonAcc }
+  const toolUses = new Map(); // index → { id, name, jsonAcc, block }
   const thinkingBlocks = new Set(); // content-block indices that are thinking
+  // Every block in the order received, so a tool turn can be replayed unchanged.
+  let assembled = [];
+  const openBlocks = new Map(); // index → entry in assembled
+  let refusal = null;
   let inputTokens = 0;
   let outputTokens = 0;
   let frameCount = 0;
@@ -1006,24 +1235,57 @@ async function streamAnthropic({ apiKey, model, messages, tools, options, contro
       try { obj = JSON.parse(json); } catch { continue; }
       frameCount++;
 
+      // Overloads and other failures can arrive mid-stream with HTTP 200 already
+      // sent. Ignoring them made a failure look like a short, normal reply.
+      if (obj.type === 'error') {
+        dlog(`anthropic stream error: ${JSON.stringify(obj.error).slice(0, 300)}`);
+        evt.sender.send(channelId, { error: obj.error?.message || 'Anthropic reported a streaming error.', done: true });
+        return;
+      }
+
       if (obj.type === 'message_start') {
         inputTokens = obj.message?.usage?.input_tokens || 0;
         outputTokens = obj.message?.usage?.output_tokens || 0;
       } else if (obj.type === 'content_block_start') {
-        if (obj.content_block?.type === 'tool_use') {
-          toolUses.set(obj.index, {
-            id: obj.content_block.id,
-            name: obj.content_block.name,
-            jsonAcc: ''
-          });
-        } else if (obj.content_block?.type === 'thinking') {
-          // Timing signal. Note that with display:"omitted" (the default on
-          // Opus 4.7/4.8) the thinking text streams empty — but the blocks
-          // still arrive, so start/stop remains accurate.
+        const startType = obj.content_block?.type;
+        if (startType === 'fallback') {
+          // Another model took over on this same stream. Thinking and tool
+          // calls from before this point can't be sent back or acted on; text
+          // already shown stays. The marker itself isn't part of the replay.
+          dlog(`anthropic fallback ${obj.content_block.from?.model} -> ${obj.content_block.to?.model}`);
+          assembled = assembled.filter(b => b.type === 'text');
+          openBlocks.clear();
+          toolUses.clear();
+          if (thinkingBlocks.size) {
+            thinkingBlocks.clear();
+            evt.sender.send(channelId, { thinking: { phase: 'end' } });
+          }
+        } else if (startType === 'tool_use') {
+          const block = { type: 'tool_use', id: obj.content_block.id, name: obj.content_block.name, input: {} };
+          assembled.push(block);
+          toolUses.set(obj.index, { id: block.id, name: block.name, jsonAcc: '', block });
+        } else if (startType === 'text') {
+          const block = { type: 'text', text: obj.content_block.text || '' };
+          assembled.push(block);
+          openBlocks.set(obj.index, block);
+        } else if (startType === 'thinking') {
+          const block = { type: 'thinking', thinking: obj.content_block.thinking || '', signature: obj.content_block.signature || '' };
+          assembled.push(block);
+          openBlocks.set(obj.index, block);
+          // Start and stop stay accurate even when the text streams empty.
           thinkingBlocks.add(obj.index);
           evt.sender.send(channelId, { thinking: { phase: 'start' } });
+        } else if (startType === 'redacted_thinking') {
+          assembled.push({ ...obj.content_block });
         }
       } else if (obj.type === 'content_block_delta') {
+        const open = openBlocks.get(obj.index);
+        if (open && obj.delta?.type === 'text_delta') open.text += obj.delta.text || '';
+        if (open && obj.delta?.type === 'signature_delta') open.signature = obj.delta.signature || '';
+        if (open && obj.delta?.type === 'thinking_delta' && obj.delta.thinking) {
+          open.thinking += obj.delta.thinking;
+          evt.sender.send(channelId, { thinking: { text: obj.delta.thinking } });
+        }
         if (obj.delta?.type === 'text_delta' && obj.delta.text) {
           if (!firstTextSent) { firstTextSent = true; dlog(`anthropic first text delta after ${frameCount} frames`); }
           evt.sender.send(channelId, { message: { content: obj.delta.text } });
@@ -1038,23 +1300,37 @@ async function streamAnthropic({ apiKey, model, messages, tools, options, contro
         }
         const tu = toolUses.get(obj.index);
         if (tu) {
-          let parsed = {};
-          try { parsed = tu.jsonAcc ? JSON.parse(tu.jsonAcc) : {}; } catch {}
-          evt.sender.send(channelId, {
-            message: {
-              tool_calls: [{
-                id: tu.id,
-                function: { name: tu.name, arguments: parsed }
-              }]
-            }
-          });
+          try { tu.block.input = tu.jsonAcc ? JSON.parse(tu.jsonAcc) : {}; } catch { tu.block.input = {}; }
         }
       } else if (obj.type === 'message_delta') {
         if (obj.usage?.output_tokens) outputTokens = obj.usage.output_tokens;
+        if (obj.delta?.stop_reason === 'refusal') {
+          refusal = obj.delta.stop_details || {};
+          dlog(`anthropic refusal category=${refusal.category || 'none'}`);
+        }
       } else if (obj.type === 'message_stop') {
         // emitted below via the final done chunk
       }
     }
+  }
+  if (refusal) {
+    // A decline is a successful response with nothing useful in it, so without
+    // this the reply would just stop with no explanation.
+    const wrote = assembled.some(b => b.type === 'text' && b.text);
+    evt.sender.send(channelId, {
+      message: {
+        content: `${wrote ? '\n\n' : ''}**Claude declined this request.**${wrote ? ' The text above may be incomplete.' : ''} Try rewording it, or switch to another model.`
+      }
+    });
+  } else {
+    // Sent together at the end, once every block is complete, so the replay
+    // copy on the first call is whole. A tool can't start before this anyway.
+    const calls = assembled.filter(b => b.type === 'tool_use').map((b, i) => ({
+      id: b.id,
+      function: { name: b.name, arguments: b.input },
+      ...(i === 0 ? { _anthropic_content: assembled.filter(x => x.type !== 'text' || x.text) } : {})
+    }));
+    if (calls.length) evt.sender.send(channelId, { message: { tool_calls: calls } });
   }
   evt.sender.send(channelId, {
     done: true,
@@ -1133,7 +1409,12 @@ function toGeminiContents(messages) {
           const name = tc.function?.name || tc.name;
           let args = tc.function?.arguments || tc.arguments || {};
           if (typeof args === 'string') { try { args = JSON.parse(args); } catch { args = {}; } }
-          parts.push({ functionCall: { name, args } });
+          // Gemini 3+ signs its function calls. The signature has to come back
+          // on the same part or the next tool round can be rejected.
+          parts.push({
+            functionCall: { name, args },
+            ...(tc.thought_signature ? { thoughtSignature: tc.thought_signature } : {})
+          });
         }
       }
       if (!parts.length) continue;
@@ -1146,24 +1427,11 @@ function toGeminiContents(messages) {
   return { systemInstruction: sysParts.length ? { parts: [{ text: sysParts.join('\n\n') }] } : undefined, contents: out };
 }
 
-// Translate thinking_enabled into Gemini's thinkingConfig:
-//   3.1 Pro   → always-on (LOW is the floor). thinking_level: HIGH if enabled,
-//               LOW if disabled — gives the user a meaningful 'cheaper' toggle
-//               even though it's never fully off.
-//   3.5 Flash / 3.1 Flash-Lite → thinking_budget: 0 disables; otherwise
-//               thinking_level: HIGH for full reasoning.
-function geminiThinkingConfig(model, enabled) {
-  const isPro = /pro/i.test(model);
-  if (isPro) {
-    return { thinking_level: enabled ? 'HIGH' : 'LOW' };
-  }
-  // Flash / Flash-Lite family
-  if (!enabled) return { thinking_budget: 0 };
-  return { thinking_level: 'HIGH' };
-}
+const GEMINI_EARLY_STOPS = new Set(['SAFETY', 'RECITATION', 'BLOCKLIST', 'PROHIBITED_CONTENT', 'SPII', 'MALFORMED_FUNCTION_CALL', 'MAX_TOKENS', 'MISSING_THOUGHT_SIGNATURE', 'OTHER']);
 
-async function streamGoogle({ apiKey, model, messages, tools, options, controller, evt, channelId, dlog }) {
+async function streamGoogle({ apiKey, model, messages, tools, options, images, controller, evt, channelId, dlog }) {
   const { systemInstruction, contents } = toGeminiContents(messages);
+  addImagesToGemini(contents, images);
   const body = { contents };
   if (systemInstruction) body.systemInstruction = systemInstruction;
   const gtools = toGeminiTools(tools);
@@ -1175,7 +1443,8 @@ async function streamGoogle({ apiKey, model, messages, tools, options, controlle
   // that don't care. Skip the param when undefined (non-thinking-capable
   // models would 400 on an unknown field on older Flash builds).
   if (options?.thinking_enabled !== undefined) {
-    generationConfig.thinkingConfig = geminiThinkingConfig(model, !!options.thinking_enabled);
+    const thinkingConfig = geminiThinkingConfig(model, !!options.thinking_enabled);
+    if (thinkingConfig) generationConfig.thinkingConfig = thinkingConfig;
   }
   if (Object.keys(generationConfig).length) body.generationConfig = generationConfig;
 
@@ -1205,6 +1474,7 @@ async function streamGoogle({ apiKey, model, messages, tools, options, controlle
   let outputTokens = 0;
   let frameCount = 0;
   let inThought = false;
+  let earlyStop = null;
 
   while (true) {
     let value, done;
@@ -1229,6 +1499,17 @@ async function streamGoogle({ apiKey, model, messages, tools, options, controlle
       try { obj = JSON.parse(json); } catch { continue; }
       frameCount++;
 
+      if (obj.error) {
+        dlog(`google stream error: ${JSON.stringify(obj.error).slice(0, 300)}`);
+        evt.sender.send(channelId, { error: obj.error.message || 'Google reported a streaming error.', done: true });
+        return;
+      }
+      if (obj.promptFeedback?.blockReason) {
+        evt.sender.send(channelId, { error: `Gemini blocked this request (${obj.promptFeedback.blockReason}). Try rewording it, or switch to another model.`, done: true });
+        return;
+      }
+      if (GEMINI_EARLY_STOPS.has(obj.candidates?.[0]?.finishReason)) earlyStop = obj.candidates[0].finishReason;
+
       if (obj.usageMetadata) {
         if (obj.usageMetadata.promptTokenCount) inputTokens = obj.usageMetadata.promptTokenCount;
         if (obj.usageMetadata.candidatesTokenCount) outputTokens = obj.usageMetadata.candidatesTokenCount;
@@ -1244,7 +1525,13 @@ async function streamGoogle({ apiKey, model, messages, tools, options, controlle
           inThought = isThought;
           evt.sender.send(channelId, { thinking: { phase: isThought ? 'start' : 'end' } });
         }
-        if (isThought) continue;   // don't leak reasoning into the answer
+        if (isThought) {
+          // Never shown as part of the answer; only feeds the live token count.
+          if (typeof part.text === 'string' && part.text) {
+            evt.sender.send(channelId, { thinking: { text: part.text } });
+          }
+          continue;
+        }
         if (typeof part.text === 'string' && part.text.length) {
           evt.sender.send(channelId, { message: { content: part.text } });
         }
@@ -1253,7 +1540,8 @@ async function streamGoogle({ apiKey, model, messages, tools, options, controlle
             message: {
               tool_calls: [{
                 id: `gem_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
-                function: { name: part.functionCall.name, arguments: part.functionCall.args || {} }
+                function: { name: part.functionCall.name, arguments: part.functionCall.args || {} },
+                ...(part.thoughtSignature ? { thought_signature: part.thoughtSignature } : {})
               }]
             }
           });
@@ -1261,7 +1549,10 @@ async function streamGoogle({ apiKey, model, messages, tools, options, controlle
       }
     }
   }
-  dlog(`anthropic stream end · frames=${frameCount} inputTokens=${inputTokens} outputTokens=${outputTokens}`);
+  if (inThought) evt.sender.send(channelId, { thinking: { phase: 'end' } });
+  if (earlyStop) {
+    evt.sender.send(channelId, { message: { content: `\n\n**Gemini stopped early (${earlyStop}).** This reply may be incomplete.` } });
+  }
   dlog(`google stream end · frames=${frameCount} inputTokens=${inputTokens} outputTokens=${outputTokens}`);
   evt.sender.send(channelId, {
     done: true,
@@ -1270,7 +1561,7 @@ async function streamGoogle({ apiKey, model, messages, tools, options, controlle
   });
 }
 
-ipcMain.handle('cloud:chat', async (evt, { provider, apiKey, model, messages, tools, options }) => {
+ipcMain.handle('cloud:chat', async (evt, { provider, apiKey, model, messages, tools, options, images }) => {
   const channelId = `cloud:chat:stream:${Date.now()}:${Math.random().toString(36).slice(2)}`;
   const controller = new AbortController();
   // local: false — cloud streams consume no local memory, so the freeze
@@ -1283,14 +1574,15 @@ ipcMain.handle('cloud:chat', async (evt, { provider, apiKey, model, messages, to
   (async () => {
     dlog(`=== cloud chat start · provider=${provider} model=${model} msgs=${messages?.length} tools=${tools ? tools.length : 0} ===`);
     try {
+      await new Promise(r => setImmediate(r));   // let the channel listener attach first
       if (!apiKey) {
         evt.sender.send(channelId, { error: `No API key set for ${provider}. Open Settings → API Keys to add one.`, done: true });
         return;
       }
       if (provider === 'anthropic') {
-        await streamAnthropic({ apiKey, model, messages, tools, options, controller, evt, channelId, dlog });
+        await streamAnthropic({ apiKey, model, messages, tools, options, images, controller, evt, channelId, dlog });
       } else if (provider === 'google') {
-        await streamGoogle({ apiKey, model, messages, tools, options, controller, evt, channelId, dlog });
+        await streamGoogle({ apiKey, model, messages, tools, options, images, controller, evt, channelId, dlog });
       } else {
         evt.sender.send(channelId, { error: `Unknown cloud provider: ${provider}`, done: true });
       }
@@ -1484,7 +1776,8 @@ ipcMain.handle('shell:task_kill', async (_e, taskId) => {
   const task = backgroundTasks.get(taskId);
   if (!task) return { error: 'task not found' };
   if (task.status !== 'running') return { error: `task already ${task.status}` };
-  try { task.status = 'killed'; task.proc?.kill(); } catch {}
+  task.status = 'killed';
+  killTree(task.proc);
   return { ok: true };
 });
 
@@ -1518,8 +1811,7 @@ const LANG_RUNNERS = {
 
 ipcMain.handle('shell:run_code_stream', async (e, { lang, code }) => {
   const channelId = `runcode_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
-  const sender = e.sender;
-  const safeSend = (payload) => { try { if (!sender.isDestroyed()) sender.send(channelId, payload); } catch {} };
+  const safeSend = deferredSender(e.sender, channelId);
 
   const runner = LANG_RUNNERS[(lang || '').toLowerCase()];
   if (!runner) {
@@ -1541,9 +1833,14 @@ ipcMain.handle('shell:run_code_stream', async (e, { lang, code }) => {
 
   let proc;
   try {
-    proc = spawn(runner.cmd, spawnArgs, {
+    // npx is a .cmd file on Windows, which only starts through a shell. "bash"
+    // there can be the WSL launcher, so use the Git Bash found at boot.
+    const viaShell = process.platform === 'win32' && runner.cmd === 'npx';
+    const cmd = runner.cmd === 'bash' && /bash/i.test(SHELL.path || '') ? SHELL.path : runner.cmd;
+    proc = spawn(cmd, viaShell ? spawnArgs.map(quoteWindowsArg) : spawnArgs, {
       cwd: os.tmpdir(),
       windowsHide: true,
+      shell: viaShell,
       env: { ...process.env, PYTHONUNBUFFERED: '1', PYTHONIOENCODING: 'utf-8' }
     });
   } catch (err) {
@@ -1562,14 +1859,16 @@ ipcMain.handle('shell:run_code_stream', async (e, { lang, code }) => {
   backgroundTasks.set(taskId, task);
   safeSend({ kind: 'start', taskId, command: task.command });
 
+  // Only the tail is kept, so a program printing forever can't fill main's memory.
+  const keepTail = (s) => (s.length > 200_000 ? s.slice(-200_000) : s);
   proc.stdout.on('data', (d) => {
     const text = d.toString();
-    task.stdout += text;
+    task.stdout = keepTail(task.stdout + text);
     safeSend({ kind: 'stdout', text });
   });
   proc.stderr.on('data', (d) => {
     const text = d.toString();
-    task.stderr += text;
+    task.stderr = keepTail(task.stderr + text);
     safeSend({ kind: 'stderr', text });
   });
   proc.on('error', (err) => {
@@ -1601,7 +1900,8 @@ ipcMain.handle('shell:run_code_kill', async (_e, taskId) => {
   const task = backgroundTasks.get(taskId);
   if (!task) return { error: 'task not found' };
   if (task.status !== 'running') return { error: `task already ${task.status}` };
-  try { task.status = 'killed'; task.proc?.kill(); } catch (e) { return { error: e.message }; }
+  task.status = 'killed';
+  killTree(task.proc);
   return { ok: true };
 });
 
@@ -1623,12 +1923,14 @@ function execAsync(cmd, args = [], opts = {}) {
     let stdout = '', stderr = '';
     const isWin = process.platform === 'win32';
     let proc;
+    const { onSpawn, ...spawnOpts } = opts;
     try {
-      proc = spawn(cmd, args, { windowsHide: true, ...opts });
+      proc = spawn(cmd, args, { windowsHide: true, ...spawnOpts });
     } catch (e) {
       resolve({ ok: false, error: e.message, stdout: '', stderr: '' });
       return;
     }
+    if (onSpawn) onSpawn(proc);
     proc.stdout?.on('data', (d) => stdout += d.toString());
     proc.stderr?.on('data', (d) => stderr += d.toString());
     proc.on('error', (e) => resolve({ ok: false, error: e.message, stdout, stderr }));
@@ -1656,8 +1958,7 @@ ipcMain.handle('video:detect_deps', async () => {
 
 ipcMain.handle('video:install_dep', async (e, { dep }) => {
   const channelId = `vidinstall_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
-  const sender = e.sender;
-  const safeSend = (p) => { try { if (!sender.isDestroyed()) sender.send(channelId, p); } catch {} };
+  const safeSend = deferredSender(e.sender, channelId);
 
   // Pick the right installer per platform. ffmpeg uses winget on Windows,
   // Homebrew on macOS, the distro package manager hint on Linux. Whisper goes
@@ -1813,7 +2114,8 @@ async function doVideoExtract({ videoPath, chatId, fps, safeSend, procEntry }) {
     '-vn', '-ar', '16000', '-ac', '1',
     audioPath
   ];
-  const audioResult = await execAsync('ffmpeg', audioArgs);
+  const audioResult = await execAsync('ffmpeg', audioArgs, { onSpawn: (p) => { procEntry.proc = p; } });
+  procEntry.proc = null;
   const audioOk = audioResult.ok && fs.existsSync(audioPath);
   if (procEntry.aborted) { safeSend({ kind: 'aborted', done: true }); return; }
 
@@ -1847,7 +2149,7 @@ ipcMain.handle('video:abort', async (_e, { channelId }) => {
   const entry = videoProcesses.get(channelId);
   if (!entry) return { error: 'channel not found' };
   entry.aborted = true;
-  try { entry.proc?.kill('SIGKILL'); } catch {}
+  killTree(entry.proc);
   return { ok: true };
 });
 
@@ -1906,10 +2208,9 @@ print("___WHISPER_JSON_END___")
     proc.stdout.on('data', (d) => {
       const text = d.toString();
       buf += text;
-      let idx;
-      while ((idx = buf.indexOf('\n')) !== -1) {
-        const line = buf.slice(0, idx);
-        buf = buf.slice(idx + 1);
+      const split = splitOutputLines(buf);
+      buf = split.rest;
+      for (const line of split.lines) {
         if (line === '___WHISPER_JSON_START___') { collecting = true; continue; }
         if (line === '___WHISPER_JSON_END___')  {
           try { safeSend({ kind: 'transcript', data: JSON.parse(payload) }); }
@@ -2067,12 +2368,10 @@ ipcMain.handle('web:search', async (_evt, query) => {
 ipcMain.handle('web:fetch', async (_evt, url) => {
   try {
     if (!url || !/^https?:\/\//.test(url)) return { error: 'http(s) url required' };
-    const res = await fetch(url, { headers: { 'User-Agent': UA, 'Accept': 'text/html,*/*' }, redirect: 'follow' });
-    if (!res.ok) return { error: `fetch ${res.status}` };
-    const ctype = res.headers.get('content-type') || '';
-    const text = await res.text();
-    if (ctype.includes('json')) return { url, content: text.slice(0, 20000), kind: 'json' };
-    return { url, content: stripTags(text).slice(0, 20000), kind: 'html' };
+    const res = await safeFetchText(url, { headers: { 'User-Agent': UA, 'Accept': 'text/html,*/*' } });
+    if (res.error) return { error: res.error };
+    if (res.contentType.includes('json')) return { url: res.url, content: res.text.slice(0, 20000), kind: 'json' };
+    return { url: res.url, content: stripTags(res.text).slice(0, 20000), kind: 'html' };
   } catch (e) {
     return { error: e.message };
   }
@@ -2090,15 +2389,10 @@ function resolveSafe(p) {
   return path.isAbsolute(resolved) ? resolved : path.resolve(os.homedir(), resolved);
 }
 
+// An empty list allows nothing. The renderer answers that error by asking the
+// user, so a chat with no project folder still works, one approved path at a time.
 function withinAllowlist(filePath, allowlist) {
-  if (!allowlist || !allowlist.length) return true;
-  for (const a of allowlist) {
-    const root = resolveSafe(a);
-    if (!root) continue;
-    if (filePath === root) return true;
-    if (filePath.startsWith(root + path.sep)) return true;
-  }
-  return false;
+  return isWithinRoots(filePath, (allowlist || []).map(resolveSafe).filter(Boolean));
 }
 
 ipcMain.handle('fs:read_file', async (_e, requestedPath, allowlist) => {
@@ -2156,7 +2450,7 @@ ipcMain.handle('fs:apply_patch', async (_e, { path: p, find, replace, allowlist 
     const matches = orig.split(find).length - 1;
     if (matches === 0) return { error: 'find string not found in file' };
     if (matches > 1) return { error: `find string matches ${matches} times — make it more specific` };
-    const next = orig.replace(find, replace ?? '');
+    const next = applyExactPatch(orig, find, replace);
     fs.writeFileSync(fp, next, 'utf-8');
     return { path: fp, before_lines: orig.split('\n').length, after_lines: next.split('\n').length };
   } catch (e) { return { error: e.message }; }
@@ -2185,46 +2479,6 @@ ipcMain.handle('audit:open', async () => {
 });
 
 // =================== GLOB / GREP ===================
-// Custom glob → regex (no external deps). `**` matches any chars including /,
-// `*` matches anything except /, `?` matches one char.
-function globToRegex(pattern) {
-  let p = pattern.replace(/\\/g, '/');
-  let re = '';
-  let i = 0;
-  while (i < p.length) {
-    const c = p[i];
-    if (c === '*') {
-      if (p[i + 1] === '*') { re += '.*'; i += 2; if (p[i] === '/') i++; }
-      else { re += '[^/]*'; i++; }
-    } else if (c === '?') { re += '[^/]'; i++; }
-    else if ('.+^${}()|[]\\'.includes(c)) { re += '\\' + c; i++; }
-    else { re += c; i++; }
-  }
-  return new RegExp('^' + re + '$', 'i');
-}
-
-const SKIP_DIRS = new Set(['node_modules', '.git', '.svn', '.hg', 'dist', 'build', '.next', '.nuxt', '__pycache__', '.venv', 'venv', 'target', '.idea', '.vscode']);
-
-function walkFiles(root, opts = {}) {
-  const { maxFiles = 10000, allowlist = null } = opts;
-  const out = [];
-  const stack = [root];
-  while (stack.length && out.length < maxFiles) {
-    const dir = stack.pop();
-    let entries;
-    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { continue; }
-    for (const e of entries) {
-      if (e.name.startsWith('.') && e.name !== '.env') continue;
-      if (SKIP_DIRS.has(e.name)) continue;
-      const full = path.join(dir, e.name);
-      if (allowlist && !withinAllowlist(full, allowlist)) continue;
-      if (e.isDirectory()) stack.push(full);
-      else if (e.isFile()) out.push(full);
-    }
-  }
-  return out;
-}
-
 ipcMain.handle('fs:glob', async (_e, { pattern, root, allowlist }) => {
   try {
     const r = resolveSafe(root || os.homedir());
@@ -2232,7 +2486,7 @@ ipcMain.handle('fs:glob', async (_e, { pattern, root, allowlist }) => {
     if (!withinAllowlist(r, allowlist)) return { error: 'root outside allowed roots' };
     if (!pattern || typeof pattern !== 'string') return { error: 'pattern required' };
     const re = globToRegex(pattern);
-    const all = walkFiles(r, { allowlist });
+    const all = walkFiles(r);
     const matches = [];
     for (const f of all) {
       const rel = path.relative(r, f).replace(/\\/g, '/');
@@ -2248,34 +2502,7 @@ ipcMain.handle('fs:grep', async (_e, { pattern, root, glob: globFilter, caseInse
     if (!r) return { error: 'root required' };
     if (!withinAllowlist(r, allowlist)) return { error: 'root outside allowed roots' };
     if (!pattern || typeof pattern !== 'string') return { error: 'pattern required' };
-    let re;
-    try { re = new RegExp(pattern, caseInsensitive ? 'i' : ''); }
-    catch (e) { return { error: 'invalid regex: ' + e.message }; }
-    const fileRe = globFilter ? globToRegex(globFilter) : null;
-    const files = walkFiles(r, { allowlist });
-    const matches = [];
-    const MAX_MATCHES = 100;
-    const MAX_FILE_SIZE = 1024 * 1024;
-    outer:
-    for (const file of files) {
-      const rel = path.relative(r, file).replace(/\\/g, '/');
-      if (fileRe && !fileRe.test(rel)) continue;
-      let content;
-      try {
-        const stat = fs.statSync(file);
-        if (stat.size > MAX_FILE_SIZE) continue;
-        content = fs.readFileSync(file, 'utf-8');
-      } catch { continue; }
-      if (content.indexOf('\0') !== -1) continue;
-      const lines = content.split('\n');
-      for (let i = 0; i < lines.length; i++) {
-        if (re.test(lines[i])) {
-          matches.push({ file: rel, line: i + 1, text: lines[i].slice(0, 300) });
-          if (matches.length >= MAX_MATCHES) break outer;
-        }
-      }
-    }
-    return { root: r, matches, count: matches.length };
+    return await grepInWorker({ pattern, root: r, globFilter, caseInsensitive });
   } catch (e) { return { error: e.message }; }
 });
 
@@ -2283,24 +2510,26 @@ ipcMain.handle('fs:grep', async (_e, { pattern, root, glob: globFilter, caseInse
 ipcMain.handle('shell:run', async (_e, { command, cwd }) => {
   return new Promise((resolve) => {
     const wd = cwd ? resolveSafe(cwd) : os.homedir();
-    exec(command, {
+    let timedOut = false;
+    const child = exec(command, {
       cwd: wd,
-      timeout: 60_000,
       maxBuffer: 4 * 1024 * 1024,
       // SHELL is the resolved shell at boot — Git Bash on Windows when it's
       // installed, else cmd.exe; /bin/sh on macOS/Linux.
       shell: SHELL.path,
       windowsHide: true
     }, (err, stdout, stderr) => {
+      clearTimeout(timer);
       resolve({
         command,
         cwd: wd,
         exitCode: err ? (typeof err.code === 'number' ? err.code : 1) : 0,
         stdout: (stdout || '').slice(0, 20_000),
         stderr: (stderr || '').slice(0, 20_000),
-        timedOut: !!err?.killed
+        timedOut
       });
     });
+    const timer = setTimeout(() => { timedOut = true; killTree(child); }, 60_000);
   });
 });
 

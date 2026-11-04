@@ -44,6 +44,7 @@ const state = {
 // ============== BOOT ==============
 (async function init() {
   state.catalog = await window.api.catalog();
+  try { state.shellInfo = await window.api.getShellInfo(); } catch {}
   // Needed at boot, not lazily: the model picker resolves installed models
   // through this catalog, and every capability check (vision, tools,
   // thinking) falls back to it via findPick().
@@ -85,6 +86,7 @@ const state = {
   wireDragDrop();
   wireSidebar();
   wireFreezeWatchdog();
+  wireGlobalShortcuts();
   wireDebugOverlay();
   wireComposer();
   wireAttachments();
@@ -124,22 +126,70 @@ function saveToStorage() {
           content: m.content,
           modality: m.modality,
           toolEvents: m.toolEvents,
+          videoState: m.videoState?.stage === 'done' ? { stage: 'done' } : undefined,
           attachments: (m.attachments || []).map(a => ({ kind: a.kind, name: a.name, pages: a.pages, ext: a.ext }))
         }))
       };
     }
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(slim));
-  } catch (e) { console.warn('save failed', e); }
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(slim));
+    } catch {
+      // Frame thumbnails are by far the largest thing stored. They can be lost
+      // without losing the conversation, so give them up before failing.
+      for (const c of Object.values(slim.chats)) {
+        if (c.videoAnalysis?.frames) {
+          c.videoAnalysis = { ...c.videoAnalysis, frames: c.videoAnalysis.frames.map(({ thumbDataUrl, ...f }) => f) };
+        }
+      }
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(slim));
+    }
+  } catch (e) {
+    console.warn('save failed', e);
+    warnStorageFailure('Your latest chats could not be saved because storage is full. Delete some old chats to fix this.');
+  }
+}
+
+// Shown once per session. Without it, a full store silently loses everything
+// from that point on when the app restarts.
+let storageWarningShown = false;
+function warnStorageFailure(message) {
+  if (storageWarningShown) return;
+  storageWarningShown = true;
+  try { showToast(message, 'err'); } catch {}
+}
+
+// A store that can't be read would otherwise be overwritten by the next save.
+function keepUnreadableStore(key, raw) {
+  try { localStorage.setItem(`${key}.unreadable.${Date.now()}`, raw); } catch {}
+  warnStorageFailure('Saved data could not be read. A copy was kept, and Sanctum started fresh.');
 }
 
 function loadFromStorage() {
+  let raw = null;
   try {
-    const raw = localStorage.getItem(STORAGE_KEY);
+    raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) return;
     const data = JSON.parse(raw);
     state.chats = data.chats || {};
     state.order = data.order || [];
     state.activeId = data.activeId || null;
+
+    // Nothing is running at boot, so a tool saved as running was interrupted.
+    for (const c of Object.values(state.chats)) {
+      for (const m of c?.messages || []) {
+        for (const ev of m.toolEvents || []) {
+          if (ev.status === 'running') { ev.status = 'done'; ev.resultSummary = ev.resultSummary || 'interrupted'; }
+        }
+      }
+    }
+
+    // Migration: a chat on a retired cloud model moves to its replacement. Left
+    // alone, findPick misses it, the chat is treated as local, and Send stops
+    // at the install check with no explanation.
+    const renamed = state.catalog?.renamed_models || {};
+    for (const c of Object.values(state.chats)) {
+      if (c && renamed[c.model]) c.model = renamed[c.model];
+    }
 
     // Migration: chats whose model is now a hidden router (vision auto-router)
     // OR an old image/video-gen modality (since removed) → reset to a
@@ -159,24 +209,49 @@ function loadFromStorage() {
         const pick = allPicks().find(p =>
           (p.tag || p.model_id || p.id || p.file) === c.model || p.id === c.model
         );
+        // Only reset a chat's model when it's genuinely un-runnable now:
+        //   - the model has no value at all (corrupt/legacy chat), OR
+        //   - it resolves to a hidden vision auto-router (never user-pickable), OR
+        //   - its modality is image/video, both since removed.
+        // Do NOT reset just because the model isn't a catalog pick: models the
+        // user pulled manually (e.g. huihui_ai/qwen3-abliterated:14b) are valid
+        // and installed but aren't in models.json, and the install list isn't
+        // even loaded yet at this point in boot. The old `!pick` check wiped
+        // those to the fallback on EVERY relaunch — a chat wouldn't keep its
+        // model. If a model really is gone, the send-time install gate handles
+        // it far better than silently rewriting the user's choice.
+        const isHiddenRouter  = pick && pick.multimodal;
         const removedModality = c.modality === 'image' || c.modality === 'video';
-        if ((!pick || pick.multimodal || removedModality) && fallback) {
+        if ((!c.model || isHiddenRouter || removedModality) && fallback) {
           c.model = fallback;
           c.modality = 'chat';
         }
       }
     }
-  } catch (e) { console.warn('load failed', e); }
+  } catch (e) {
+    console.warn('load failed', e);
+    if (raw) keepUnreadableStore(STORAGE_KEY, raw);
+  }
 }
 
 function loadSettings() {
+  let raw = null;
   try {
-    const raw = localStorage.getItem(SETTINGS_KEY);
+    raw = localStorage.getItem(SETTINGS_KEY);
     if (raw) state.settings = { ...state.settings, ...JSON.parse(raw) };
-  } catch {}
+    const renamed = state.catalog?.renamed_models || {};
+    if (renamed[state.settings.lastModel]) state.settings.lastModel = renamed[state.settings.lastModel];
+  } catch (e) {
+    console.warn('settings load failed', e);
+    if (raw) keepUnreadableStore(SETTINGS_KEY, raw);
+  }
 }
 function saveSettings() {
-  try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(state.settings)); } catch {}
+  try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(state.settings)); }
+  catch (e) {
+    console.warn('settings save failed', e);
+    warnStorageFailure('Your settings could not be saved because storage is full. Delete some old chats to fix this.');
+  }
 }
 
 // ============== CHATS ==============
@@ -272,6 +347,7 @@ function setActive(id) {
 }
 
 function deleteChat(id) {
+  if (state.runningChats.has(id)) stopChat(id);
   delete state.chats[id];
   state.order = state.order.filter(x => x !== id);
   if (state.activeId === id) {
@@ -302,22 +378,37 @@ function autoTitle(chat, firstUserText) {
   chat.title = t || 'New chat';
 }
 
-// Fire-and-forget background call that asks a small/fast installed model to
-// generate a clean 3-6 word title for the chat. Runs after the first user
-// message and overwrites the truncated autoTitle. Skips when:
+// First messages of local chats, waiting for their reply to finish so the title
+// can be written without competing with it.
+const titlesAfterReply = new Map();
+
+// Fire-and-forget background call that writes a clean 3-6 word title and
+// overwrites the truncated autoTitle. Skips when:
 //   - the user has manually renamed (titleManual flag set by the pen editor)
 //   - no Ollama model is installed
 //   - the call errors (silent failure — autoTitle stays)
-async function generateChatTitle(c, userMessage) {
+//
+// loadedModel is the local model that just answered. Using it, at the same
+// context size, keeps it in memory. Asking a different model would make Ollama
+// unload the one in use, and the next message would wait for a full reload.
+async function generateChatTitle(c, userMessage, loadedModel = null) {
   if (c.titleManual) return;
-  // Prefer the smallest tool-capable models for snappy title gen, regardless
-  // of which model is handling the actual conversation.
-  const candidates = ['llama3.2:3b', 'qwen2.5:7b', 'hermes3:8b', c.model];
-  let titleModel = null;
-  for (const m of candidates) {
-    if (m && state.installed.has(m)) { titleModel = m; break; }
+  let titleModel = loadedModel;
+  if (!titleModel) {
+    // A cloud chat has no local model to reuse, so use the smallest one.
+    const candidates = ['llama3.2:3b', 'qwen2.5:7b', 'hermes3:8b', c.model];
+    titleModel = candidates.find(m => m && state.installed.has(m)) || null;
   }
   if (!titleModel) return;
+
+  const titleOptions = {
+    num_ctx: loadedModel ? (c.contextWindow || contextWindowFor(loadedModel)) : 2048,
+    temperature: 0.3,
+    num_predict: 32
+  };
+  // Without this a thinking model can spend its whole allowance reasoning and
+  // never write the title.
+  if (modelSupportsThinking(titleModel)) titleOptions.think = false;
 
   const prompt = `Generate a very short chat title (3 to 6 words max) summarising this user message. Plain words only — NO quotes, NO period, NO markdown, NO emoji, NO prefix like "Title:". Just the title.
 
@@ -331,7 +422,7 @@ Title:`;
     await window.api.ollama.chat({
       model: titleModel,
       messages: [{ role: 'user', content: prompt }],
-      options: { num_ctx: 2048, temperature: 0.3 }
+      options: titleOptions
     }, (chunk) => {
       if (chunk.message?.content) title += chunk.message.content;
     });
@@ -433,8 +524,10 @@ function wireFreezeWatchdog() {
     // Mark every running chat as stopped — the streams are already dead.
     for (const [chatId] of state.runningChats) {
       const c = state.chats[chatId];
-      const last = c?.messages?.[c.messages.length - 1];
-      if (last && last.role === 'assistant') {
+      // The watchdog only aborts local streams. A cloud reply is still arriving.
+      if (!c || pickProvider(findPick(c.model)) !== 'ollama') continue;
+      const last = latestAssistant(c);
+      if (last) {
         last.thinking = false;
         // Explain the mismatch with real numbers where we can.
         const meta = (state.downloadCatalog?.models || []).find(m => m.tag === model);
@@ -456,6 +549,137 @@ function wireFreezeWatchdog() {
   });
 }
 
+// ============== FORCE UNLOAD + SHORTCUT ==============
+// A rebindable action that evicts the loaded model from memory on demand. The
+// user's concern is VRAM/RAM: Ollama pins weights for keep_alive (~5 min) after
+// the last message, so "I'm done, give me my memory back" needs an explicit
+// button. Default binding is Ctrl+Shift+X on every platform (plain Control, not
+// Cmd, on Mac — as requested).
+const DEFAULT_UNLOAD_SHORTCUT = { ctrl: true, shift: true, alt: false, meta: false, key: 'X' };
+
+function getUnloadShortcut() {
+  const s = state.settings.unloadShortcut;
+  if (s && typeof s.key === 'string' && s.key) return s;
+  return { ...DEFAULT_UNLOAD_SHORTCUT };
+}
+
+// Human-readable combo, e.g. "Ctrl + Shift + X". Uses the platform's own words
+// so it reads native on each OS.
+function formatShortcut(combo) {
+  const isMac = window.api?.platform === 'darwin';
+  const parts = [];
+  if (combo.ctrl)  parts.push('Ctrl');
+  if (combo.alt)   parts.push(isMac ? 'Option' : 'Alt');
+  if (combo.shift) parts.push('Shift');
+  if (combo.meta)  parts.push(isMac ? 'Cmd' : 'Win');
+  let key = combo.key || '';
+  if (key.length === 1) key = key.toUpperCase();
+  else if (key === ' ') key = 'Space';
+  parts.push(key);
+  return parts;
+}
+
+// Render the combo as keycap chips into a button.
+function renderShortcutChips(btn, combo) {
+  if (!btn) return;
+  const parts = formatShortcut(combo);
+  btn.innerHTML = parts
+    .map((p, i) => `${i ? '<span class="kbd-plus">+</span>' : ''}<kbd>${escapeHtml(p)}</kbd>`)
+    .join('');
+}
+
+// Does this keydown match the bound combo? Ignore lone modifier presses so the
+// listener never fires on a bare Ctrl/Shift.
+// A plain key can't be a shortcut, or it would fire on every use while typing.
+function shortcutHasModifier(combo) {
+  return !!(combo?.ctrl || combo?.alt || combo?.meta) || /^F\d+$/i.test(combo?.key || '');
+}
+
+function shortcutMatches(e, combo) {
+  const k = e.key;
+  if (k === 'Control' || k === 'Shift' || k === 'Alt' || k === 'Meta') return false;
+  if (!shortcutHasModifier(combo)) return false;
+  if (!!combo.ctrl  !== e.ctrlKey)  return false;
+  if (!!combo.shift !== e.shiftKey) return false;
+  if (!!combo.alt   !== e.altKey)   return false;
+  if (!!combo.meta  !== e.metaKey)  return false;
+  const want = (combo.key || '').toLowerCase();
+  return k.toLowerCase() === want;
+}
+
+// The action itself. Safe to call from the button or the shortcut; guarded so a
+// double-tap can't fire two overlapping unloads.
+let unloadInFlight = false;
+async function forceUnloadModels(statusEl) {
+  if (unloadInFlight) return;
+  if (!window.api?.ollama?.unloadAll) return;
+  unloadInFlight = true;
+  const setStatus = (msg, tone) => {
+    if (!statusEl) return;
+    statusEl.textContent = msg;
+    statusEl.dataset.tone = tone || '';
+  };
+  setStatus('Unloading…', '');
+  try {
+    const { unloaded = [], failed = [], freedBytes = 0, error } = await window.api.ollama.unloadAll() || {};
+    if (error || failed.length) {
+      const message = error ? `${error}. A model may still be loaded.` : `Couldn't unload ${failed.join(', ')}`;
+      setStatus(message, 'err');
+      showToast(message, 'err');
+    } else if (unloaded.length) {
+      const gb = freedBytes ? `${(freedBytes / 1024 ** 3).toFixed(1)} GB · ` : '';
+      const names = unloaded.join(', ');
+      setStatus(`Unloaded ${names}`, 'ok');
+      showToast(`Freed ${gb}${names}`, 'ok');
+    } else {
+      setStatus('No model was loaded', 'dim');
+      showToast('No model was loaded', 'dim');
+    }
+    if (statusEl) setTimeout(() => { statusEl.textContent = ''; statusEl.dataset.tone = ''; }, 4000);
+  } catch (e) {
+    setStatus("Couldn't reach Ollama", 'err');
+    showToast("Couldn't reach Ollama to unload", 'err');
+  } finally {
+    unloadInFlight = false;
+  }
+}
+
+// Lightweight transient toast — the shortcut can fire with Settings closed and
+// no active chat, so feedback can't live in the chat log or the settings panel.
+function showToast(msg, tone = '') {
+  let host = $('#toast-host');
+  if (!host) {
+    host = document.createElement('div');
+    host.id = 'toast-host';
+    document.body.appendChild(host);
+  }
+  const el = document.createElement('div');
+  el.className = 'toast';
+  if (tone) el.dataset.tone = tone;
+  el.textContent = msg;
+  host.appendChild(el);
+  requestAnimationFrame(() => el.classList.add('in'));
+  const kill = () => {
+    el.classList.remove('in');
+    setTimeout(() => el.remove(), 220);
+  };
+  setTimeout(kill, 3200);
+  el.addEventListener('click', kill);
+}
+
+// App-wide listener for the bound unload shortcut. Suspended while the user is
+// recapturing a new binding (capture takes the next keystroke instead).
+let capturingShortcut = false;
+function wireGlobalShortcuts() {
+  document.addEventListener('keydown', (e) => {
+    if (capturingShortcut) return;
+    if (shortcutMatches(e, getUnloadShortcut())) {
+      e.preventDefault();
+      forceUnloadModels($('#setting-unload-status'));
+    }
+  });
+}
+
 // ============== HARDWARE FIT ENGINE ==============
 // Turns "20GB model, 12GB card, 64GB RAM" into an honest verdict. Ollama does
 // partial offload, so a model larger than VRAM still runs — CPU-bound. The
@@ -470,15 +694,110 @@ const RUNTIME_OVERHEAD_GB = 0.6;
 const WEIGHT_SLACK = 1.08; // quantised weights land slightly above download size
 const CTX_TIERS = [2048, 4096, 8192, 16384, 32768, 65536, 131072];
 
-function modelFootprintGB(model, ctxTokens = 0) {
-  const weights = model.sizeGB * WEIGHT_SLACK;
-  const kv = ctxTokens ? (model.kvKbPerTok * ctxTokens) / (1024 * 1024) : 0;
+// ---- Live model_info (GGUF metadata via Ollama /api/show) ----
+// The catalog sizes every model as if it were dense, which is wrong for MoE:
+// Qwen3-30B-A3B has 30B weights but only 3B active per token, so it runs on a
+// 12GB card even though the disk size says "too big". We read the real GGUF
+// metadata for INSTALLED models and size them honestly. Cache: tag -> info |
+// 'loading' | 'error'. Populated lazily; a load flips the entry and re-renders.
+state.modelInfo = state.modelInfo || {};
+
+function parseParamCount(s) {          // "30.5B" -> 30.5e9, "7B" -> 7e9
+  if (!s) return 0;
+  const m = /([\d.]+)\s*([BMK])?/i.exec(String(s));
+  if (!m) return 0;
+  const mult = { B: 1e9, M: 1e6, K: 1e3 }[(m[2] || 'B').toUpperCase()] || 1e9;
+  return parseFloat(m[1]) * mult;
+}
+
+// Normalize an /api/show response into just the fields the fit math needs.
+// Keys are arch-prefixed ("qwen3moe.block_count"), so we match by suffix.
+function normalizeModelInfo(show) {
+  const mi = show?.model_info || {};
+  const get = (suffix) => {
+    const k = Object.keys(mi).find(key => key.endsWith(suffix));
+    return k != null ? mi[k] : undefined;
+  };
+  const expertCount = get('.expert_count') || 0;
+  const expertUsed  = get('.expert_used_count') || 0;
+  const blockCount  = get('.block_count') || 0;
+  const headCountKv = get('.attention.head_count_kv') || 0;
+  const keyLength   = get('.attention.key_length') || 0;
+  const embed       = get('.embedding_length') || 0;
+  const expertFF    = get('.expert_feed_forward_length') || 0;
+  const capabilities = Array.isArray(show?.capabilities) ? show.capabilities : null;
+  const contextLength = get('.context_length') || 0;
+  const isMoE = expertCount > 1 && expertUsed > 0;
+  const totalParams = parseParamCount(show?.details?.parameter_size);
+
+  // Active fraction: of all the weights, how many are touched per token. For a
+  // dense model that's everything (1). For MoE it's the non-expert weights plus
+  // the used slice of the experts. We get expert params from the dims and take
+  // non-expert as (total − experts), which correctly absorbs attention +
+  // embeddings without needing per-tensor sizes.
+  let activeFraction = 1;
+  if (isMoE && totalParams && blockCount && embed && expertFF) {
+    const expertsParam = blockCount * expertCount * 3 * embed * expertFF; // gate+up+down
+    const nonExpert = Math.max(0, totalParams - expertsParam);
+    const activeParam = nonExpert + (expertUsed / expertCount) * expertsParam;
+    activeFraction = Math.min(1, activeParam / totalParams);
+  } else if (isMoE) {
+    activeFraction = 0.35;   // dims missing — conservative fallback
+  }
+  return { isMoE, expertCount, expertUsed, blockCount, headCountKv, keyLength, contextLength, totalParams, activeFraction, capabilities };
+}
+
+// KV-cache cost per token, in bytes. 2× for K and V; q8_0 cache is ~1 byte per
+// element. NOTE: this assumes OLLAMA_KV_CACHE_TYPE=q8_0 (which needs
+// OLLAMA_FLASH_ATTENTION=1). Without it Ollama uses fp16 and the real cost is
+// double — the 30% headroom kept in recommendedCtx cushions that gap.
+function kvBytesPerToken(info, bytesPerElem = 1) {
+  if (!info?.blockCount || !info?.headCountKv || !info?.keyLength) return 0;
+  return 2 * info.blockCount * info.headCountKv * info.keyLength * bytesPerElem;
+}
+
+function infoFor(tag) {
+  const v = state.modelInfo[tag];
+  return (v && v !== 'loading' && v !== 'error') ? v : null;
+}
+
+const modelInfoFailedAt = {};
+
+// Fetch + cache model_info for an installed model, then fire onReady once (so
+// the caller can re-render with real numbers). No-op if already loaded/loading.
+async function ensureModelInfo(tag, onReady) {
+  if (!tag) return;
+  const cached = state.modelInfo[tag];
+  // A failure is usually Ollama being busy loading something, so it gets another
+  // try after a minute. Retrying sooner would loop, since callers re-render.
+  const mayRetry = cached === 'error' && Date.now() - (modelInfoFailedAt[tag] || 0) > 60000;
+  if (cached && !mayRetry) return;
+  state.modelInfo[tag] = 'loading';
+  try {
+    const show = await window.api.ollama?.show(tag);
+    state.modelInfo[tag] = show?.model_info ? normalizeModelInfo(show) : 'error';
+  } catch { state.modelInfo[tag] = 'error'; }
+  if (state.modelInfo[tag] === 'error') modelInfoFailedAt[tag] = Date.now();
+  if (onReady) onReady();
+}
+
+function modelFootprintGB(model, ctxTokens = 0, info = null) {
+  // MoE: only the active slice of the weights drives speed/VRAM; the rest of the
+  // experts offload to system RAM.
+  const activeFrac = info?.isMoE ? info.activeFraction : 1;
+  const weights = model.sizeGB * WEIGHT_SLACK * activeFrac;
+  let kv = 0;
+  if (ctxTokens) {
+    const bpt = info ? kvBytesPerToken(info) : 0;
+    kv = bpt ? (bpt * ctxTokens) / (1024 ** 3)
+             : (model.kvKbPerTok * ctxTokens) / (1024 * 1024);
+  }
   return weights + kv + RUNTIME_OVERHEAD_GB;
 }
 
 // Verdict at a small baseline context (4K) — the question is "can I run this
 // at all", not "can I run it at 128K".
-function fitFor(model, hw) {
+function fitFor(model, hw, info = null) {
   // Some flagships ship on Ollama with no local weights at all — they're
   // proxied to Ollama's servers via a `:cloud` tag. Hardware is irrelevant
   // for those, so they get their own verdict rather than being mislabelled
@@ -491,7 +810,31 @@ function fitFor(model, hw) {
     };
   }
   if (!hw) return { verdict: 'unknown', label: 'Checking…', detail: '' };
-  const need = modelFootprintGB(model, 4096);
+
+  // MoE: the full weights only need to fit system RAM (unused experts sit
+  // there); what has to fit VRAM for speed is the active slice + KV. So a 30B
+  // MoE that's "too big" as a dense model actually runs fine — experts stream
+  // from RAM. Message says so instead of "runs slowly".
+  if (info?.isMoE) {
+    const total = model.sizeGB * WEIGHT_SLACK + RUNTIME_OVERHEAD_GB;   // must fit RAM to load
+    const active = modelFootprintGB(model, 4096, info);                 // active+KV → VRAM = speed
+    if (total > hw.maxBudgetGB) {
+      return {
+        verdict: 'unrunnable',
+        label: 'Too large',
+        detail: `Needs about ${total.toFixed(1)}GB to load; you have ~${hw.maxBudgetGB}GB usable.`
+      };
+    }
+    const speedy = active <= hw.fastBudgetGB;
+    const where = hw.budgetSource === 'vram' ? 'VRAM' : 'fast memory';
+    return {
+      verdict: 'moe',
+      label: speedy ? 'Runs well · MoE' : 'Runs · MoE',
+      detail: `${info.expertUsed} of ${info.expertCount} experts active — ~${active.toFixed(1)}GB stays in ${where}, the rest offload to system RAM. Expect ${speedy ? 'good' : 'moderate'} speeds.`
+    };
+  }
+
+  const need = modelFootprintGB(model, 4096, info);
   if (need <= hw.fastBudgetGB) {
     return {
       verdict: 'good',
@@ -519,16 +862,28 @@ function fitFor(model, hw) {
 
 // Largest context tier that still leaves headroom on this machine. Uses the
 // fast budget when the model fits on the GPU, otherwise the system budget.
-function recommendedCtx(model, hw) {
+// Prefers real KV geometry from model_info over the catalog's fp16 estimate.
+function recommendedCtx(model, hw, info = null) {
   if (!hw || model.cloudOnly) return null;
-  const base = modelFootprintGB(model, 0);
+  const base = modelFootprintGB(model, 0, info);
   const budget = base <= hw.fastBudgetGB ? hw.fastBudgetGB : hw.maxBudgetGB;
-  const headroom = budget - base;
+  let headroom = budget - base;
+  // An MoE model's unused experts still have to sit in system RAM, so context
+  // has to fit around the full weights as well as the active slice.
+  if (info?.isMoE) {
+    const fullWeights = model.sizeGB * WEIGHT_SLACK + RUNTIME_OVERHEAD_GB;
+    headroom = Math.min(headroom, hw.maxBudgetGB - fullWeights);
+  }
   if (headroom <= 0) return null;
+  const bpt = info ? kvBytesPerToken(info) : 0;
+  // With no real figure for context memory, every tier would look free and the
+  // largest would win. 8K is safe for anything that loaded at all.
+  if (!bpt && !model.kvKbPerTok) return 8192;
+  const ctxMax = info?.contextLength || model.ctxMax || 0;
   let best = null;
   for (const t of CTX_TIERS) {
-    if (t > (model.ctxMax || 0)) break;
-    const kvGB = (model.kvKbPerTok * t) / (1024 * 1024);
+    if (t > ctxMax) break;
+    const kvGB = bpt ? (bpt * t) / (1024 ** 3) : (model.kvKbPerTok * t) / (1024 * 1024);
     if (kvGB <= headroom * 0.7) best = t;   // keep 30% back for compute buffers
   }
   return best;
@@ -614,8 +969,10 @@ function isMultimodal(modelId) {
 // models.json to opt out.
 function modelSupportsTools(modelId) {
   const pick = findPick(modelId);
-  if (!pick) return false;
-  return pick.tools_capable !== false;
+  if (pick) return pick.tools_capable !== false;
+  // A manually pulled model isn't in the catalog, so ask what Ollama reports.
+  const capabilities = infoFor(modelId)?.capabilities;
+  return capabilities ? capabilities.includes('tools') : true;
 }
 
 // Whether the model has a "thinking" mode — Ollama models with a native
@@ -623,7 +980,8 @@ function modelSupportsTools(modelId) {
 // pick opts in via `thinking_capable: true`.
 function modelSupportsThinking(modelId) {
   const pick = findPick(modelId);
-  return !!pick?.thinking_capable;
+  if (pick) return !!pick.thinking_capable;
+  return !!infoFor(modelId)?.capabilities?.includes('thinking');
 }
 
 // Picks a vision router matched to the active text-only chat model:
@@ -654,6 +1012,35 @@ function prettyModelName(tag) {
 }
 
 const VISION_ROUTE_PROMPT = 'Describe this image in detail for someone who cannot see it. Include any visible text verbatim (do OCR). Mention spatial layout, colors, notable objects, expressions, and anything else needed to answer detailed questions about it. Be thorough but objective — no speculation.';
+
+// One complete reply as text, from whichever provider the model belongs to.
+// Stop can abort it, and a provider error becomes a thrown error instead of an
+// empty result.
+async function collectChat(c, { model, messages, options, images }) {
+  const pick = findPick(model);
+  const provider = pickProvider(pick);
+  const isCloud = provider !== 'ollama';
+  const payload = isCloud
+    ? { provider, apiKey: state.settings.apiKeys?.[provider] || '', model: pick?.model_id || model, messages, images, options: { thinking_enabled: false } }
+    : { model, messages, images, options };
+  let text = '';
+  let failure = null;
+  await (isCloud ? window.api.cloud.chat : window.api.ollama.chat)(payload, (chunk) => {
+    const run = c ? state.runningChats.get(c.id) : null;
+    if (run && chunk._channelId) {
+      run.channelId = chunk._channelId;
+      if (run.abortRequested && !run._lateAbortSent) {
+        run._lateAbortSent = true;
+        if (isCloud) window.api.cloud.chatAbort(chunk._channelId);
+        else window.api.ollama.chatAbort(chunk._channelId);
+      }
+    }
+    if (chunk.error) failure = chunk.error;
+    if (chunk.message?.content) text += chunk.message.content;
+  });
+  if (failure) throw new Error(failure);
+  return text;
+}
 
 async function runVisionCaption(model, base64) {
   let acc = '';
@@ -823,7 +1210,7 @@ async function deduplicateFrames(frames, onProgress) {
 // (first + middle) in a single multi-image call. Forces the model to identify
 // a subject consistent with BOTH frames — one weird transitional shot can't
 // mislead the identification. Returns a short single-sentence identification.
-async function identifyVideoContent(frames, visionModel) {
+async function identifyVideoContent(frames, visionModel, c) {
   if (!frames?.length) return '';
   // Two frames: one from the early third (skip title cards / fade-ins) and
   // one from the middle. If only one frame exists, fall back to it alone.
@@ -840,30 +1227,29 @@ async function identifyVideoContent(frames, visionModel) {
     const multiHint = images.length > 1
       ? '\n\nYou are seeing TWO frames from the same video. Your identification must be consistent with both — pick a subject that explains both frames. If they disagree (e.g. one is a title card, one is gameplay), prioritise the more content-rich frame.'
       : '';
-    let acc = '';
-    await window.api.ollama.chat({
+    const acc = await collectChat(c, {
       model: visionModel,
       messages: [{ role: 'user', content: VIDEO_IDENTIFY_PROMPT + multiHint }],
       images
-    }, (chunk) => { if (chunk.message?.content) acc += chunk.message.content; });
+    });
     return acc.trim().split('\n')[0].slice(0, 240);
   } catch { return ''; }
 }
 
 // Caption each unique frame via the installed vision model.
-async function captionFrames(frames, visionModel, onProgress) {
+async function captionFrames(frames, visionModel, onProgress, c) {
   for (let i = 0; i < frames.length; i++) {
+    if (c && state.runningChats.get(c.id)?.abortRequested) return frames;
     const f = frames[i];
     onProgress?.({ stage: 'caption', done: i, total: frames.length });
     try {
       const r = await window.api.video.readFrame(f.path);
       if (r.error) { f.caption = '(frame unreadable)'; continue; }
-      let acc = '';
-      await window.api.ollama.chat({
+      const acc = await collectChat(c, {
         model: visionModel,
         messages: [{ role: 'user', content: VIDEO_FRAME_CAPTION_PROMPT }],
         images: [r.base64]
-      }, (chunk) => { if (chunk.message?.content) acc += chunk.message.content; });
+      });
       f.caption = acc.trim() || '(no caption)';
     } catch (err) {
       f.caption = '(caption failed: ' + err.message + ')';
@@ -1012,9 +1398,21 @@ async function runVideoAnalysis(c, videoAtt, assistantMsg) {
   // 5a) Hard-identification pass — one explicit "what is this?" call against
   // a single representative frame. The synthesis later uses this as truth so
   // it doesn't have to pattern-match across vague per-frame captions.
+  // Stop reaches these stages through the same channel as a normal reply, but
+  // they run one after another, so each has to check before the next one starts.
+  const stopIfRequested = () => {
+    if (!state.runningChats.get(c.id)?.abortRequested) return false;
+    assistantMsg.videoState = { stage: 'aborted' };
+    assistantMsg.content = '_Stopped._';
+    assistantMsg.thinking = false;
+    renderActiveChat();
+    return true;
+  };
+  if (stopIfRequested()) return;
   assistantMsg.videoState.stage = 'identifying';
   renderActiveChat();
-  const videoIdentity = await identifyVideoContent(uniqueFrames, visionModel);
+  const videoIdentity = await identifyVideoContent(uniqueFrames, visionModel, c);
+  if (stopIfRequested()) return;
 
   // 5b) Caption each unique frame (parallel with transcription would be nice
   // but local Ollama is single-threaded enough that the gain is marginal —
@@ -1028,7 +1426,8 @@ async function runVideoAnalysis(c, videoAtt, assistantMsg) {
       assistantMsg.videoState.captionDone = p.done;
       renderActiveChat();
     }
-  });
+  }, c);
+  if (stopIfRequested()) return;
 
   // 6) Transcribe audio (if extracted)
   let transcript = null;
@@ -1058,6 +1457,7 @@ async function runVideoAnalysis(c, videoAtt, assistantMsg) {
   }
 
   // 7) Synthesize the high-level summary via the chat model
+  if (stopIfRequested()) return;
   assistantMsg.videoState.stage = 'synthesizing';
   renderActiveChat();
   const hasSpeech = !!(transcript?.text && transcript.text.trim().length > 4);
@@ -1073,14 +1473,18 @@ async function runVideoAnalysis(c, videoAtt, assistantMsg) {
   };
   const synthSystem = VIDEO_SYNTHESIS_PROMPT_TEMPLATE(synthMeta);
   let summary = '';
-  await window.api.ollama.chat({
-    model: c.model,
-    messages: [
-      { role: 'system', content: synthSystem },
-      { role: 'user',   content: 'Please produce the summary now.' }
-    ],
-    options: { num_ctx: 8192 }
-  }, (chunk) => { if (chunk.message?.content) summary += chunk.message.content; });
+  let summaryError = null;
+  try {
+    summary = await collectChat(c, {
+      model: c.model,
+      messages: [
+        { role: 'system', content: synthSystem },
+        { role: 'user',   content: 'Please produce the summary now.' }
+      ],
+      options: { num_ctx: 8192 }
+    });
+  } catch (e) { summaryError = e.message; }
+  if (stopIfRequested()) return;
 
   // 8) Persist everything on the chat so follow-up Q&A can use it.
   c.videoAnalysis = {
@@ -1100,7 +1504,9 @@ async function runVideoAnalysis(c, videoAtt, assistantMsg) {
     language: transcript?.language || null,
     identity: videoIdentity
   };
-  assistantMsg.content = summary.trim() || '_(no summary returned by model)_';
+  assistantMsg.content = summaryError
+    ? `**Couldn't write the video summary.** ${summaryError}`
+    : (summary.trim() || '_(no summary returned by model)_');
   assistantMsg.thinking = false;
   assistantMsg.videoState = { stage: 'done' };
   saveToStorage();
@@ -1529,7 +1935,7 @@ function renderChatList() {
     for (const c of chats) {
       const item = document.createElement('button');
       item.className = 'chat-item' + (c.id === state.activeId ? ' active' : '');
-      const modalityBadge = c.modality ? `<span class="chat-modality">${shortModality(c.modality)}</span>` : '';
+      const modalityBadge = (c.modality && c.modality !== 'chat' && c.modality !== 'vision') ? `<span class="chat-modality">${shortModality(c.modality)}</span>` : '';
       item.innerHTML = `
         <span class="chat-title">${escapeHtml(c.title || 'New chat')}</span>
         ${modalityBadge}
@@ -1631,21 +2037,22 @@ function renderHwBar() {
 
 // The signature element: a memory bar showing this model's footprint against
 // the machine's real budget. Makes "will it fit" a thing you see, not read.
-function fitMeter(model, hw) {
+function fitMeter(model, hw, info = null) {
   if (!hw || model.cloudOnly) return '';
-  const need = modelFootprintGB(model, 4096);
+  const need = modelFootprintGB(model, 4096, info);
   const scale = Math.max(hw.fastBudgetGB, Math.min(need, hw.maxBudgetGB));
   const pct = Math.min(100, (need / scale) * 100);
   const gpuMark = hw.budgetSource === 'vram' && hw.fastBudgetGB < scale
     ? `<span class="fm-mark" style="left:${(hw.fastBudgetGB / scale) * 100}%" title="${hw.vramGB} GB VRAM"></span>` : '';
-  const f = fitFor(model, hw);
+  const f = fitFor(model, hw, info);
+  const legend = info?.isMoE ? `${need.toFixed(1)} GB active` : `${need.toFixed(1)} GB needed`;
   return `
     <div class="fit-meter ${f.verdict}">
       <div class="fm-track">
         <div class="fm-fill" style="width:${pct}%"></div>
         ${gpuMark}
       </div>
-      <div class="fm-legend">${need.toFixed(1)} GB needed</div>
+      <div class="fm-legend">${legend}</div>
     </div>
   `;
 }
@@ -1688,7 +2095,7 @@ function renderDownloadTab() {
     if (q && !(`${m.name} ${m.tag} ${m.blurb}`.toLowerCase().includes(q))) return false;
     // AND every active filter. 'runnable' is a fit check; the rest are tags.
     for (const f of active) {
-      if (f === 'runnable') { if (hw && fitFor(m, hw).verdict === 'unrunnable') return false; }
+      if (f === 'runnable') { if (hw && fitFor(m, hw, infoFor(m.tag)).verdict === 'unrunnable') return false; }
       else if (!(m.tags || []).includes(f)) return false;
     }
     return true;
@@ -1696,11 +2103,20 @@ function renderDownloadTab() {
 
   // Runnable first, then biggest-usable first — the models worth their
   // download time float to the top on this specific machine.
-  const rank = { good: 0, tight: 1, unknown: 2, unrunnable: 3, cloud: 4 };
+  const rank = { good: 0, moe: 1, tight: 2, unknown: 3, unrunnable: 4, cloud: 5 };
   models.sort((a, b) => {
-    const d = rank[fitFor(a, hw).verdict] - rank[fitFor(b, hw).verdict];
+    const d = rank[fitFor(a, hw, infoFor(a.tag)).verdict] - rank[fitFor(b, hw, infoFor(b.tag)).verdict];
     return d !== 0 ? d : b.sizeGB - a.sizeGB;
   });
+
+  // Pull real GGUF metadata for installed models so MoE sizing is honest. A
+  // load flips the cache entry and re-renders this tab once with the corrected
+  // numbers; ensureModelInfo marks 'loading' immediately so this can't loop.
+  for (const m of models) {
+    if (state.installed.has(m.tag) && !state.modelInfo[m.tag]) {
+      ensureModelInfo(m.tag, () => { if (!$('#dl-wrap')?.hidden) renderDownloadTab(); });
+    }
+  }
 
   const countEl = $('#dl-search-count');
   if (countEl) {
@@ -1714,8 +2130,9 @@ function renderDownloadTab() {
   }
 
   list.innerHTML = models.map(m => {
-    const f = fitFor(m, hw);
-    const ctx = recommendedCtx(m, hw);
+    const info = infoFor(m.tag);
+    const f = fitFor(m, hw, info);
+    const ctx = recommendedCtx(m, hw, info);
     const installed = state.installed.has(m.tag);
     const pulling = state.pulling.has(m.tag);
     const tagChips = (m.tags || []).map(t => `<span class="dl-tag t-${t}">${escapeHtml(t)}</span>`).join('');
@@ -1773,7 +2190,7 @@ function renderDownloadTab() {
           <p class="dl-blurb">${escapeHtml(m.blurb)}</p>
         </div>
         <div class="dl-side">
-          ${fitMeter(m, hw)}
+          ${fitMeter(m, hw, info)}
           <p class="dl-fitnote">${escapeHtml(f.detail)}</p>
           ${ctx ? `<div class="dl-ctx"><span class="dl-ctx-label">Suggested context</span><span class="dl-ctx-val">${fmtCtx(ctx)}</span></div>`
                 : `<div class="dl-ctx dim"><span class="dl-ctx-label">Suggested context</span><span class="dl-ctx-val">—</span></div>`}
@@ -1959,6 +2376,60 @@ function wireSettings() {
     });
   }
 
+  // Model memory: force-unload button + rebindable shortcut.
+  state.settings.unloadShortcut = getUnloadShortcut();
+  const unloadBtn    = $('#setting-unload-now');
+  const unloadStatus = $('#setting-unload-status');
+  const hotkeyBtn    = $('#setting-unload-hotkey');
+  const hotkeyReset  = $('#setting-unload-hotkey-reset');
+
+  if (unloadBtn) {
+    unloadBtn.addEventListener('click', () => forceUnloadModels(unloadStatus));
+  }
+
+  if (hotkeyBtn) {
+    renderShortcutChips(hotkeyBtn, state.settings.unloadShortcut);
+
+    const endCapture = (combo) => {
+      capturingShortcut = false;
+      hotkeyBtn.classList.remove('capturing');
+      if (combo) {
+        state.settings.unloadShortcut = combo;
+        saveSettings();
+      }
+      renderShortcutChips(hotkeyBtn, state.settings.unloadShortcut);
+      document.removeEventListener('keydown', onCapture, true);
+    };
+    const onCapture = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (e.key === 'Escape') return endCapture(null);   // cancel, keep old binding
+      if (['Control', 'Shift', 'Alt', 'Meta'].includes(e.key)) return; // wait for a real key
+      const combo = { ctrl: e.ctrlKey, shift: e.shiftKey, alt: e.altKey, meta: e.metaKey, key: e.key };
+      if (!shortcutHasModifier(combo)) {
+        hotkeyBtn.innerHTML = '<span class="kbd-hint">Add Ctrl or Alt</span>';
+        return;
+      }
+      endCapture(combo);
+    };
+    hotkeyBtn.addEventListener('click', () => {
+      if (capturingShortcut) return;
+      capturingShortcut = true;
+      hotkeyBtn.classList.add('capturing');
+      hotkeyBtn.innerHTML = '<span class="kbd-hint">Press keys…</span>';
+      document.addEventListener('keydown', onCapture, true); // capture-phase: beat the global listener
+    });
+    hotkeyBtn.addEventListener('blur', () => { if (capturingShortcut) endCapture(null); });
+  }
+
+  if (hotkeyReset) {
+    hotkeyReset.addEventListener('click', () => {
+      state.settings.unloadShortcut = { ...DEFAULT_UNLOAD_SHORTCUT };
+      saveSettings();
+      renderShortcutChips(hotkeyBtn, state.settings.unloadShortcut);
+    });
+  }
+
   close.addEventListener('click', () => closeSettings());
   overlay.addEventListener('click', (e) => { if (e.target === overlay) closeSettings(); });
   document.addEventListener('keydown', (e) => {
@@ -2069,9 +2540,16 @@ function renderCtxSettings() {
   list.innerHTML = '';
   for (const tag of installed) {
     const meta = dl.find(m => m.tag === tag) || allPicks().find(p => p.tag === tag);
+    const info = infoFor(tag);
+    if (!state.modelInfo[tag]) ensureModelInfo(tag, () => renderCtxSettings());
     const name = meta?.name || tag;
-    const ctxMax = meta?.ctxMax || meta?.context || 131072;
-    const suggested = (meta && meta.kvKbPerTok && hw) ? recommendedCtx(meta, hw) : null;
+    // Size for the fit math: catalog value if we have it, else ~0.6 GB per
+    // billion params (Q4_K_M) from the live metadata — lets manually-pulled
+    // models get a real suggestion too.
+    const sizeGB = meta?.sizeGB || (info?.totalParams ? (info.totalParams / 1e9) * 0.6 : 0);
+    const ctxMax = info?.contextLength || meta?.ctxMax || meta?.context || 131072;
+    const fitModel = { sizeGB, kvKbPerTok: meta?.kvKbPerTok || 0, ctxMax, cloudOnly: false };
+    const suggested = (hw && sizeGB && (info || meta?.kvKbPerTok)) ? recommendedCtx(fitModel, hw, info) : null;
     const current = state.settings.contextWindows[tag];
 
     const row = document.createElement('div');
@@ -2107,13 +2585,29 @@ function renderCtxSettings() {
 
 // Resolve the context window for a model at send time. Explicit user choice >
 // hardware-aware suggestion > conservative 8K default.
+// A suggestion is remembered for the session. It can change once model info
+// arrives, and a different num_ctx makes Ollama reload the model.
+const suggestedContext = {};
+
 function contextWindowFor(tag) {
   const pinned = state.settings.contextWindows?.[tag];
   if (pinned) return pinned;
+  if (suggestedContext[tag]) return suggestedContext[tag];
+  const suggestion = computeContextSuggestion(tag);
+  if (state.hardware && infoFor(tag)) suggestedContext[tag] = suggestion;
+  return suggestion;
+}
+
+function computeContextSuggestion(tag) {
+  const info = infoFor(tag);   // may be null at send time; catalog covers known models
   const meta = (state.downloadCatalog?.models || []).find(m => m.tag === tag);
-  if (meta && state.hardware) {
-    const rec = recommendedCtx(meta, state.hardware);
-    if (rec) return rec;
+  if (state.hardware && (meta || info)) {
+    const sizeGB = meta?.sizeGB || (info?.totalParams ? (info.totalParams / 1e9) * 0.6 : 0);
+    if (sizeGB) {
+      const fitModel = { sizeGB, kvKbPerTok: meta?.kvKbPerTok || 0, ctxMax: info?.contextLength || meta?.ctxMax || 0, cloudOnly: false };
+      const rec = recommendedCtx(fitModel, state.hardware, info);
+      if (rec) return rec;
+    }
   }
   return 8192;
 }
@@ -2974,7 +3468,7 @@ function renderEmptyState() {
   wrap.innerHTML = `
     <div class="empty-orb"></div>
     <h2>What would you like to do?</h2>
-    <p>Pick a category below, or change the model from the top right. Everything runs locally.</p>
+    <p>Pick a category below, or change the model from the top right.</p>
     <div class="empty-chips"></div>
   `;
   const chipsEl = wrap.querySelector('.empty-chips');
@@ -2994,10 +3488,8 @@ function renderEmptyState() {
     chip.className = 'chip';
     chip.textContent = cat.label;
     chip.addEventListener('click', () => {
-      const firstPick = cat.picks[0];
-      const id = firstPick.tag || firstPick.file;
       const ch = currentChat();
-      ch.model = id;
+      ch.model = modelForCategory(cat, ch);
       ch.modality = key;
       saveToStorage();
       renderActiveChat();
@@ -3036,13 +3528,33 @@ function renderAgenticEmptyState(c) {
   return wrap;
 }
 
+// Picks a model for a category chip without surprising the user: the current one
+// if it belongs, then one that's ready, then one this machine can run. Jumping to
+// the catalog's first pick could load a model far too big for the hardware.
+function modelForCategory(cat, chat) {
+  const idOf = (p) => p.tag || p.model_id || p.id || p.file;
+  const usable = cat.picks.filter(p => !p.multimodal);
+  if (usable.some(p => idOf(p) === chat?.model || p.id === chat?.model)) return chat.model;
+  const ready = usable.find(p => pickReady(p));
+  if (ready) return idOf(ready);
+  const fits = usable.find((p) => {
+    const meta = (state.downloadCatalog?.models || []).find(m => m.tag === p.tag);
+    if (!meta || !state.hardware) return false;
+    const verdict = fitFor(meta, state.hardware).verdict;
+    return verdict === 'good' || verdict === 'moe';
+  });
+  return idOf(fits || usable[usable.length - 1] || cat.picks[0]);
+}
+
 async function pickProjectFolder() {
   const r = await window.api.files.pickFolder();
   if (!r) return;
   const c = currentChat();
   if (!c) return;
+  // Changing folders ends the agent's access to the old one.
+  const previous = c.projectFolder;
+  c.pathAllowlist = (c.pathAllowlist || []).filter(p => p !== previous);
   c.projectFolder = r.path;
-  c.pathAllowlist = c.pathAllowlist || [];
   if (!c.pathAllowlist.includes(r.path)) c.pathAllowlist.push(r.path);
   // Adopt the folder name as the chat title when the user hasn't named the chat yet.
   if (!c.title) {
@@ -3056,6 +3568,7 @@ async function pickProjectFolder() {
 
 function renderMessage(m) {
   const el = document.createElement('div');
+  el.__msg = m;
   el.className = `msg ${m.role}` + (m.queued ? ' queued' : '');
 
   if (m.queued) {
@@ -3133,8 +3646,14 @@ function renderMessage(m) {
   // bouncing bubbles so we don't misrepresent what the model is doing.
   if (m.thinking && !m.content && !(m.toolEvents && m.toolEvents.length) && !m.videoState) {
     const t = document.createElement('div');
-    t.className = 'msg-thinking' + (m.thinkingMode ? ' with-label' : ' dots-only');
-    if (m.thinkingMode) {
+    t.className = 'msg-thinking' + ((m.thinkingMode || m.startup) ? ' with-label' : ' dots-only');
+    if (m.startup) {
+      t.innerHTML = `
+        <span class="msg-status-text">${escapeHtml(m.startup.text)}</span>
+        <span class="msg-thinking-dots"><span></span><span></span><span></span></span>
+        <span class="msg-status-time"></span>
+      `;
+    } else if (m.thinkingMode) {
       t.innerHTML = `
         <span class="msg-thinking-label">
           <svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M12 2 14.39 8.26 21 9.27 16 14.14 17.18 21.02 12 17.77 6.82 21.02 8 14.14 3 9.27 9.61 8.26z"/></svg>
@@ -3148,7 +3667,99 @@ function renderMessage(m) {
     el.appendChild(t);
   }
 
+  if (m.silentSince) {
+    const quiet = document.createElement('div');
+    quiet.className = 'msg-silent';
+    quiet.innerHTML = `
+      <span class="msg-thinking-dots"><span></span></span>
+      <span>Still working. Long steps, like writing a file, don't show progress until they finish.</span>
+      <span class="msg-silent-time">${Math.round((Date.now() - m.silentSince) / 1000)}s</span>
+    `;
+    el.appendChild(quiet);
+  }
+
   return el;
+}
+
+function sameOllamaModel(a, b) {
+  const norm = (n) => {
+    const lower = String(n || '').toLowerCase();
+    return lower.includes(':') ? lower : `${lower}:latest`;
+  };
+  return norm(a) === norm(b);
+}
+
+// Ollama sends nothing until the first token, and a large model can take minutes
+// to get there. This says what is happening during that silence, with a running
+// time, so a slow start doesn't look like a hang. Returns the function that ends it.
+function trackModelStartup(c, msg, model) {
+  const startedAt = Date.now();
+  const name = findPick(model)?.name || model;
+  msg.startup = { text: `Waiting for ${name}` };
+
+  const paint = () => {
+    if (!msg.startup || currentChat()?.id !== c.id) return;
+    const row = findMessageEl(msg)?.querySelector(':scope > .msg-thinking');
+    if (!row) return;
+    const text = row.querySelector('.msg-status-text');
+    const time = row.querySelector('.msg-status-time');
+    if (text) text.textContent = msg.startup.text;
+    const secs = Math.round((Date.now() - startedAt) / 1000);
+    if (time) time.textContent = secs >= 3 ? `${secs}s` : '';
+  };
+
+  let checking = false;
+  const check = async () => {
+    if (checking) return;
+    checking = true;
+    let loaded = null;
+    try { loaded = await window.api.ollama.ps(); } catch {}
+    checking = false;
+    if (!msg.startup || !Array.isArray(loaded)) return;
+    msg.startup.text = loaded.some(n => sameOllamaModel(n, model))
+      ? 'Reading your message'
+      : `Loading ${name}`;
+    paint();
+  };
+
+  if (currentChat()?.id === c.id) patchLastMessage(msg);
+  check();
+  const painter = setInterval(paint, 1000);
+  const poller = setInterval(check, 2000);
+  return () => {
+    clearInterval(painter);
+    clearInterval(poller);
+    delete msg.startup;
+  };
+}
+
+const SILENCE_NOTICE_MS = 8000;
+
+// Ollama holds back a tool call until it's complete, so a model writing a whole
+// file generates at full speed while nothing arrives. Without this, that looks
+// like a frozen counter. Returns the function to call on each chunk, plus a stop.
+function trackStreamSilence(c, msg, onSilenceStart) {
+  let lastChunkAt = Date.now();
+  const elapsed = () => `${Math.round((Date.now() - msg.silentSince) / 1000)}s`;
+  const clear = () => {
+    if (!msg.silentSince) return;
+    delete msg.silentSince;
+    findMessageEl(msg)?.querySelector(':scope > .msg-silent')?.remove();
+  };
+  const timer = setInterval(() => {
+    if (!msg.silentSince) {
+      if (msg.startup || Date.now() - lastChunkAt < SILENCE_NOTICE_MS) return;
+      msg.silentSince = lastChunkAt;
+      onSilenceStart(lastChunkAt);
+      if (currentChat()?.id === c.id) patchLastMessage(msg);
+    }
+    const time = findMessageEl(msg)?.querySelector('.msg-silent-time');
+    if (time) time.textContent = elapsed();
+  }, 1000);
+  return {
+    sawChunk() { lastChunkAt = Date.now(); clear(); },
+    stop() { clearInterval(timer); clear(); }
+  };
 }
 
 // Friendly display labels for each tool — match the Claude Code aesthetic
@@ -3267,7 +3878,7 @@ function renderShellToolEvent(ev) {
   // Use the shell the main process actually resolved — Git Bash if available
   // on Windows, else cmd.exe; /bin/sh on macOS/Linux. preload exposes this
   // synchronously so the label is right from the first render.
-  const shellName = window.api?.shell?.name || (window.api?.platform === 'win32' ? 'Cmd' : 'Bash');
+  const shellName = (state.shellInfo || window.api?.shellInfo)?.name || (window.api?.platform === 'win32' ? 'Cmd' : 'Bash');
   const label = isAsync ? `${shellName} · async` : shellName;
   const cmd = ev.input || ev.argSummary || '';
   const truncatedCmd = cmd.length > 200 ? cmd.slice(0, 200) + '…' : cmd;
@@ -3862,11 +4473,11 @@ function renderAttachments() {
     } else if (a.kind === 'file') {
       // Generic file — unknown / binary. Show the extension + size so the
       // user knows what they've attached even though we can't parse it.
-      const label = (a.ext || 'file').toUpperCase();
+      const label = escapeHtml((a.ext || 'file').toUpperCase());
       chip.innerHTML = `<span class="att-icon">📦</span><span class="name">${escapeHtml(a.name)}</span><span class="meta">${label} · ${humanSize(a.size)}</span><span class="x" data-i="${i}">×</span>`;
     } else {
       // text
-      const label = (a.ext || 'txt').toUpperCase();
+      const label = escapeHtml((a.ext || 'txt').toUpperCase());
       chip.innerHTML = `<span class="att-icon">📄</span><span class="name">${escapeHtml(a.name)}</span><span class="meta">${label} · ${humanSize(a.size)}</span><span class="x" data-i="${i}">×</span>`;
     }
     chip.querySelector('.x').addEventListener('click', (e) => {
@@ -4022,6 +4633,30 @@ function queueMessage(c, text) {
 // When a run finishes, pull the next queued user message (if any) and process
 // it. Each call processes one message and recurses naturally via the next
 // `runOllamaChat` completing.
+function latestAssistant(c) {
+  for (let i = (c?.messages?.length || 0) - 1; i >= 0; i--) {
+    if (c.messages[i].role === 'assistant') return c.messages[i];
+  }
+  return null;
+}
+
+// Messages queued behind a reply that failed would otherwise wait unseen and send
+// themselves after some later reply. They go back to the composer instead.
+function restoreQueuedMessages(c) {
+  const queued = c.messages.filter(m => m.role === 'user' && m.queued);
+  if (!queued.length) return;
+  c.messages = c.messages.filter(m => !m.queued);
+  const input = $('#composer-input');
+  if (currentChat()?.id === c.id && input && !input.value.trim()) {
+    input.value = queued.map(m => m.content).join('\n\n');
+    showToast('The reply stopped, so your queued message was not sent. It is back in the message box.');
+  } else {
+    showToast('The reply stopped, so a queued message was not sent.');
+  }
+  saveToStorage();
+  renderActiveChat();
+}
+
 async function processNextQueued(c) {
   const idx = c.messages.findIndex(m => m.role === 'user' && m.queued);
   if (idx < 0) return;
@@ -4099,11 +4734,15 @@ async function dispatchSend() {
   renderActiveChat();
   renderChatList();
 
-  // First user message in this chat? Kick off background AI title generation
-  // (no await — runs in parallel with the actual response).
+  // First user message in this chat? Write a proper title in the background. A
+  // cloud reply doesn't use local memory, so that can start now. A local reply
+  // goes first: Ollama runs one model at a time here, and a title request sent
+  // alongside it holds up the reply until the title is done.
   const userTurns = c.messages.filter(m => m.role === 'user').length;
   if (userTurns === 1 && !c.titleManual) {
-    generateChatTitle(c, text);
+    const replyIsLocal = pickProvider(findPick(c.model)) === 'ollama';
+    if (replyIsLocal) titlesAfterReply.set(c.id, text);
+    else generateChatTitle(c, text);
   }
 
   // If the user attached a video in ANY chat (general, agentic, etc.) we
@@ -4126,6 +4765,7 @@ async function dispatchSend() {
         state.runningChats.delete(c.id);
         updateSendButton();
       }
+      if (titlesAfterReply.delete(c.id)) generateChatTitle(c, text);
     } else {
       await runOllamaChat(c, attachments);
     }
@@ -4190,8 +4830,8 @@ async function runOllamaChat(c, attachments) {
     await _runOllamaChatInner(c, attachments);
   } catch (e) {
     console.error('runOllamaChat fatal:', e);
-    const lastMsg = c.messages[c.messages.length - 1];
-    if (lastMsg && lastMsg.role === 'assistant') {
+    const lastMsg = latestAssistant(c);
+    if (lastMsg) {
       lastMsg.thinking = false;
       if (!lastMsg.content) {
         lastMsg.content = `**Chat crashed.** ${e?.message || e}\n\n_If this keeps happening, please file an issue with the chat-debug.log from Sanctum's user-data folder._`;
@@ -4201,6 +4841,7 @@ async function runOllamaChat(c, attachments) {
   } finally {
     state.runningChats.delete(c.id);
     try { updateSendButton(); } catch {}
+    try { restoreQueuedMessages(c); } catch {}
   }
 }
 
@@ -4222,14 +4863,24 @@ async function _runOllamaChatInner(c, attachments) {
     // to the exact count from Ollama.
     tokenStats: { prompt: 0, completion: 0, _exactCompletion: 0, live: true }
   };
-  c.messages.push(assistantMsg);
+  // The reply goes straight after the message it answers, ahead of anything still
+  // queued, so the next turn's history stays in order.
+  const firstQueued = c.messages.findIndex(m => m.role === 'user' && m.queued);
+  if (firstQueued >= 0) c.messages.splice(firstQueued, 0, assistantMsg);
+  else c.messages.push(assistantMsg);
   // Mark this chat as running so the send button flips to a stop button.
   state.runningChats.set(c.id, { channelId: null, abortRequested: false });
   updateSendButton();
   renderActiveChat();
 
-  // Build conversation history from prior messages (excluding the placeholder we just pushed)
-  const history = c.messages.slice(0, -1).map(m => ({ role: m.role, content: m.content || '' }));
+  // Model info decides the tools offered and the context size, so it has to be in
+  // before either is worked out. Otherwise both can change on the next message.
+  if (pickProvider(findPick(c.model)) === 'ollama') await ensureModelInfo(c.model);
+
+  // Build conversation history from the messages before this reply.
+  const history = c.messages
+    .slice(0, c.messages.indexOf(assistantMsg))
+    .map(m => ({ role: m.role, content: m.content || '' }));
 
   // System messages, ordered so the final history is:
   //   [global instructions] [project folder context] [mode prompt] [messages…]
@@ -4355,6 +5006,16 @@ ollama pull qwen2.5vl:7b
   const tools = buildTools(c.modality, c.webEnabled === true, c.model, c);
   const useTools = !!tools;
 
+  if (c.modality === 'agent' && !tools) {
+    assistantMsg.content = `**This model can't use tools, so it can't work as an agent.** Pick a model with tool support from the model picker, then send your message again.`;
+    assistantMsg.thinking = false;
+    touchChat(c.id);
+    saveToStorage();
+    renderActiveChat();
+    renderChatList();
+    return;
+  }
+
   // Search-and-inject fallback: models that can't emit tool calls still get
   // web search — Sanctum runs the search itself and appends the results to the
   // user's message as context. This is why web search works on EVERY model,
@@ -4376,6 +5037,7 @@ ollama pull qwen2.5vl:7b
   let round = 0;
   let aborted = false;
   let lastContent = '';
+  let finishedNormally = false;
 
   while (round < MAX_ROUNDS && !aborted) {
     round++;
@@ -4399,6 +5061,7 @@ ollama pull qwen2.5vl:7b
           model: pick?.model_id || effectiveModel,
           messages: history,
           tools: tools || undefined,
+          images: (round === 1 && imgs.length) ? imgs : undefined,
           // Forwarded to streamAnthropic / streamGoogle which translate it to
           // the provider-native thinking parameter. Only meaningful when the
           // pick is thinking_capable; ignored otherwise.
@@ -4413,7 +5076,18 @@ ollama pull qwen2.5vl:7b
       //   4. a conservative 8K
       // Oversizing here is what makes big models OOM — the KV cache for 32K on
       // a 30B model is several GB on its own.
-      payload.options = { num_ctx: c.contextWindow || contextWindowFor(effectiveModel) };
+      payload.options = {
+        num_ctx: c.contextWindow || contextWindowFor(effectiveModel),
+        // Loop insurance. Local models — abliterated ones especially — can fall
+        // into repetition death-spirals on long code, emitting the same fragment
+        // thousands of times until they poison the whole chat. A mild
+        // repeat_penalty makes that far less likely, and num_predict caps a
+        // runaway so it can't burn tens of thousands of tokens. Generous enough
+        // (16K) never to truncate a legitimately long script; the stream-side
+        // loop guard in main.js is what actually catches a spiral early.
+        repeat_penalty: 1.1,
+        num_predict: 16384
+      };
       // Native Ollama thinking switch — only for models that actually have a
       // thinking mode, or Ollama rejects the request.
       if (modelSupportsThinking(effectiveModel)) {
@@ -4424,6 +5098,7 @@ ollama pull qwen2.5vl:7b
     }
 
     let acc = '';
+    let roundText = '';   // acc resets when a stream ends; this keeps the round's text
     let collectedToolCalls = [];
     // The in-flight "Thinking…" row, if this round has one. Closed out by
     // endThinking() when reasoning finishes, which stamps the elapsed time so
@@ -4440,11 +5115,16 @@ ollama pull qwen2.5vl:7b
     // at display:"omitted" streams empty thinking, so its count stays 0.
     const addThinkingText = (txt) => {
       if (!thinkEvent || !txt) return;
+      if (thinkEvent.status !== 'running') {
+        thinkEvent.status = 'running';
+        patchLastMessage(assistantMsg);
+      }
       thinkEvent.chars = (thinkEvent.chars || 0) + txt.length;
       thinkEvent.tokens = Math.max(1, Math.round(thinkEvent.chars / 4));
       // Patch the count in place — Ollama streams reasoning token-by-token, so
       // a full re-render per chunk would flicker. Fall back to a full render
       // only if the running row isn't mounted yet.
+      if (currentChat()?.id !== c.id) return;
       const row = $('#thread')?.querySelector('.think-row.running');
       const span = row?.querySelector('.think-tokens');
       if (span) span.textContent = `${thinkEvent.tokens.toLocaleString()} tokens`;
@@ -4463,8 +5143,23 @@ ollama pull qwen2.5vl:7b
       patchLastMessageContent(assistantMsg);
       break;
     }
+    const stopStartup = (!isCloud && round === 1)
+      ? trackModelStartup(c, assistantMsg, effectiveModel)
+      : () => {};
+    // The time spent silent is no longer thinking, so that row stops at the last
+    // thing it actually saw. It reopens if reasoning continues.
+    const silence = trackStreamSilence(c, assistantMsg, (since) => {
+      if (thinkEvent?.status === 'running') {
+        thinkEvent.status = 'done';
+        thinkEvent.ms = since - thinkEvent.startedAt;
+      }
+    });
     try {
       await chatFn(payload, (chunk) => {
+      if (chunk.message || chunk.thinking || chunk.error || chunk.aborted || chunk.done) {
+        stopStartup();
+        silence.sawChunk();
+      }
       // First chunk: record the channelId so a click on Stop can abort this
       // stream. If Stop was clicked BEFORE the first chunk arrived (which is
       // common on slow models with long first-token latency), abortRequested
@@ -4517,6 +5212,7 @@ ollama pull qwen2.5vl:7b
       if (chunk.message?.content) {
         if (assistantMsg.thinking) assistantMsg.thinking = false;
         acc += chunk.message.content;
+        roundText += chunk.message.content;
         assistantMsg.content = acc;
         // Live token estimate during streaming. Ollama doesn't expose per-chunk
         // counts so we approximate completion tokens as chars/4 (a common
@@ -4573,6 +5269,17 @@ ollama pull qwen2.5vl:7b
           _exactCompletion: exactCompletion,
           live: false
         };
+        if (chunk.done_reason === 'length') {
+          // Same stop reason, different fix. A full context window also loses any
+          // tool call still being written, since Ollama only sends finished ones.
+          const numCtx = payload.options?.num_ctx || 0;
+          const used = (chunk.prompt_eval_count || 0) + (chunk.eval_count || 0);
+          const note = (numCtx && used >= numCtx - 1)
+            ? `_[The model's context window (${fmtCtx(numCtx)}) filled up, so it stopped. Anything it was still writing, including a file or command, was lost. Raise the window in Settings → Context Windows, or start a new chat.]_`
+            : '_[Stopped at the token limit, so this reply may be incomplete. Ask the model to continue.]_';
+          assistantMsg.content = `${assistantMsg.content ? assistantMsg.content + '\n\n' : ''}${note}`;
+          patchLastMessageContent(assistantMsg);
+        }
         // Reset acc for the next tool round (live estimate restarts at 0).
         acc = '';
         patchLastMessage(assistantMsg);
@@ -4593,18 +5300,20 @@ ollama pull qwen2.5vl:7b
       patchLastMessageContent(assistantMsg);
     }
 
+    stopStartup();
+    silence.stop();
     // Stream over — if the model was still "thinking" (aborted mid-reason, or
     // a provider that never sent an end signal), close the row out so it can
     // never be left spinning forever.
     endThinking();
 
     if (aborted) break;
-    lastContent = acc;
+    if (roundText) lastContent = roundText;
 
-    if (!collectedToolCalls.length) break;
+    if (!collectedToolCalls.length) { finishedNormally = true; break; }
 
     // Record assistant turn in history (for tool feedback loop)
-    history.push({ role: 'assistant', content: acc, tool_calls: collectedToolCalls });
+    history.push({ role: 'assistant', content: roundText, tool_calls: collectedToolCalls });
 
     // Execute each tool, append results
     for (const call of collectedToolCalls) {
@@ -4630,7 +5339,7 @@ ollama pull qwen2.5vl:7b
       assistantMsg.toolEvents.push(ev);
       patchLastMessage(assistantMsg);
 
-      const { result, summary, ok } = await executeTool(name, args);
+      const { result, summary, ok } = await executeTool(name, args, c, tools);
       ev.status = ok ? 'done' : 'error';
       ev.resultSummary = summary;
       // Stash shell output (stdout/stderr) on the event so the OUT box can
@@ -4666,6 +5375,9 @@ ollama pull qwen2.5vl:7b
 
   // If the loop ended without a content turn after tools, restore the last text we got
   if (!assistantMsg.content && lastContent) assistantMsg.content = lastContent;
+  if (!finishedNormally && !aborted) {
+    assistantMsg.content = `${assistantMsg.content ? assistantMsg.content + '\n\n' : ''}_[Stopped after ${MAX_ROUNDS} tool steps, the limit for this chat. Send a message to let it continue, or raise the limit in the chat's options.]_`;
+  }
 
   // Stream ended (success / error / user abort) — clear the running flag and
   // flip the send button back to its arrow.
@@ -4677,6 +5389,14 @@ ollama pull qwen2.5vl:7b
   saveToStorage();
   renderChatList();
   renderActiveChat();
+
+  // A failed or stopped reply keeps the truncated title, so a title request
+  // can't reload a model that just ran out of memory.
+  const pendingTitle = titlesAfterReply.get(c.id);
+  titlesAfterReply.delete(c.id);
+  if (pendingTitle && !aborted && assistantMsg.content) {
+    generateChatTitle(c, pendingTitle, effectiveModel);
+  }
 
   // If the user queued more messages while this one was generating, pick up
   // the next one automatically.
@@ -4695,8 +5415,8 @@ function stopChat(chatId) {
   // again. We drop the thinking dots on the in-flight assistant message and
   // mark it as stopped if no content arrived yet.
   const c = state.chats[chatId];
-  const lastMsg = c?.messages?.[c.messages.length - 1];
-  if (lastMsg && lastMsg.role === 'assistant' && lastMsg.thinking) {
+  const lastMsg = latestAssistant(c);
+  if (lastMsg && lastMsg.thinking) {
     lastMsg.thinking = false;
     if (!lastMsg.content && !(lastMsg.toolEvents && lastMsg.toolEvents.length)) {
       lastMsg.content = '_Stopped._';
@@ -4795,10 +5515,16 @@ function projectFolderPrompt(c) {
   if (!c.projectFolder) return null;
   const isWindows = /^[A-Za-z]:[\\/]/.test(c.projectFolder);
   const sep = isWindows ? '\\\\' : '/';
-  const platform = isWindows ? 'Windows (cmd.exe)' : 'POSIX (/bin/sh)';
-  const shellExamples = isWindows
-    ? '`dir`, `del /q /f`, `rmdir /s /q`, `move`, `copy`, `type`. Paths use backslash separators (e.g. `src\\\\index.js`).'
-    : '`ls`, `rm -rf`, `mv`, `cp`, `cat`. Paths use forward slashes.';
+  // On Windows, commands run in Git Bash when it's installed. Telling the agent
+  // it's on cmd.exe there made its del and dir commands fail.
+  const usesBash = !isWindows || /bash/i.test((state.shellInfo || window.api?.shellInfo)?.name || '');
+  const platform = !isWindows ? 'POSIX (/bin/sh)' : (usesBash ? 'Windows, running Git Bash' : 'Windows (cmd.exe)');
+  const shellExamples = usesBash
+    ? `\`ls\`, \`rm -rf\`, \`mv\`, \`cp\`, \`cat\`. Paths use forward slashes${isWindows ? ' (write C:\\\\foo as C:/foo)' : ''}.`
+    : '`dir`, `del /q /f`, `rmdir /s /q`, `move`, `copy`, `type`. Paths use backslash separators (e.g. `src\\\\index.js`).';
+  const shellWarning = usesBash
+    ? 'Do not use cmd.exe commands such as `del` or `dir /b`. They do not work in this shell.'
+    : 'Do not use POSIX commands such as `rm` or `ls`. They do not exist in this shell.';
 
   return `PROJECT FOLDER: ${c.projectFolder}
 
@@ -4813,7 +5539,7 @@ SHELL:
 - Platform: ${platform}.
 - Use ${shellExamples}
 - Always pass \`cwd\` set to "${c.projectFolder}" when calling run_command, unless the user explicitly asks you to run somewhere else.
-- Do not mix shells. \`rm\` does not exist on Windows; \`del\` does not exist on POSIX.
+- ${shellWarning}
 
 When the user says "the project folder" or "this folder", they mean: ${c.projectFolder}`;
 }
@@ -4870,7 +5596,7 @@ function buildTools(modality, webEnabled, modelId, chat) {
     // Tools exposed by user-configured MCP servers (Blender, Playwright, etc.)
     // appear here too. The cache is refreshed from main on every status/tools
     // event, so a newly-started server's tools show up on the next turn.
-    if (Array.isArray(state.mcpTools) && state.mcpTools.length) {
+    if (!readOnly && Array.isArray(state.mcpTools) && state.mcpTools.length) {
       tools.push(...state.mcpTools);
     }
   }
@@ -4908,11 +5634,11 @@ function summarizeArgs(name, args) {
   try { return JSON.stringify(args).slice(0, 80); } catch { return ''; }
 }
 
-async function executeTool(name, args) {
-  const _impl = executeToolImpl;
-  const c = currentChat();
+// c is the chat that asked for the tool, which may not be the one on screen. Its
+// safety settings, folder, and allowlist are the ones that apply.
+async function executeTool(name, args, c, offeredTools) {
   const startedAt = new Date().toISOString();
-  const res = await _impl(name, args);
+  const res = await executeToolImpl(name, args, c, offeredTools);
   try {
     await window.api.audit.log({
       ts: startedAt,
@@ -4928,9 +5654,12 @@ async function executeTool(name, args) {
   return res;
 }
 
-async function executeToolImpl(name, args) {
-  const c = currentChat();
-  const alwaysGated = ['write_file', 'apply_patch', 'run_command', 'run_command_async', 'mcp_add_server', 'mcp_remove_server'].includes(name);
+async function executeToolImpl(name, args, c, offeredTools) {
+  if (!AgentRules.wasOffered(name, offeredTools)) {
+    await window.api.audit.log({ ts: new Date().toISOString(), chat: c?.id, model: c?.model, tool: name, args, status: 'blocked-not-offered', ok: false });
+    return { result: { error: `${name} is not available in this chat. Use only the tools you were given.` }, summary: 'not available', ok: false };
+  }
+  const alwaysGated = AgentRules.alwaysNeedsApproval(name);
   const forceApproval = c?.approvalMode === true;
   // YOLO mode — skip the approval modal even for destructive tools. The user
   // opted in with the No-Approval toggle; respect it. Read-only enforcement
@@ -4941,12 +5670,9 @@ async function executeToolImpl(name, args) {
   // run_command pre-approval: if the command starts with anything on the
   // pre-approved command allowlist, skip the modal entirely.
   let skipApproval = false;
-  if (name === 'run_command' && c?.commandAllowlist?.length) {
-    const cmd = toStringArg(args?.command).trim();
-    if (c.commandAllowlist.some(a => a && cmd.startsWith(a.trim()))) {
-      skipApproval = true;
-      approvalDecision = 'pre-approved';
-    }
+  if (name === 'run_command' && AgentRules.commandIsPreapproved(toStringArg(args?.command), c?.commandAllowlist)) {
+    skipApproval = true;
+    approvalDecision = 'pre-approved';
   }
 
   // Plan Mode: write-class tools are blocked at the executor until the user
@@ -4955,8 +5681,7 @@ async function executeToolImpl(name, args) {
   // exit_plan_mode itself is handled below — it's the formal gate that lets
   // the chat leave Plan Mode.
   if (c?.planMode && name !== 'exit_plan_mode') {
-    const planBlocked = ['write_file', 'apply_patch', 'run_command', 'run_command_async', 'task_kill', 'mcp_add_server', 'mcp_remove_server'];
-    if (planBlocked.includes(name)) {
+    if (AgentRules.blockedInPlanMode(name)) {
       await window.api.audit.log({ ts: new Date().toISOString(), chat: c.id, model: c.model, tool: name, args, status: 'blocked-planmode', ok: false });
       return { result: { error: 'Plan Mode is on — write tools are blocked. Call exit_plan_mode(plan) to surface your plan to the user for approval; on approve the chat flips to Approval Mode and you can execute.' }, summary: 'plan-mode', ok: false };
     }
@@ -4992,7 +5717,7 @@ async function executeToolImpl(name, args) {
   }
 
   // Read-only enforcement (defence in depth — buildTools already strips these).
-  if (c?.readOnly && (name === 'write_file' || name === 'apply_patch' || name === 'run_command')) {
+  if (c?.readOnly && AgentRules.blockedInReadOnly(name)) {
     await window.api.audit.log({ ts: new Date().toISOString(), chat: c.id, model: c.model, tool: name, args, status: 'blocked-readonly', ok: false });
     return { result: { error: 'this chat is in Read-Only mode — write/patch/shell are disabled' }, summary: 'read-only', ok: false };
   }
@@ -5005,12 +5730,15 @@ async function executeToolImpl(name, args) {
   if (skipAllApprovals) {
     approvalDecision = 'no-approval-mode';
   } else if (!skipApproval && (alwaysGated || forceApproval) && name !== 'calc') {
-    const ok = await requestApproval(name, args);
+    const ok = await requestApproval(name, args, c);
     approvalDecision = ok ? 'approved' : 'denied';
     if (!ok) {
       await window.api.audit.log({ ts: new Date().toISOString(), chat: c?.id, model: c?.model, tool: name, args, status: 'denied', ok: false });
       return { result: { error: 'denied by user' }, summary: 'denied', ok: false };
     }
+    // The chat may have been stopped or deleted while the pop-up was open.
+    if (c && !state.chats[c.id]) return { result: { error: 'this chat was deleted' }, summary: 'stopped', ok: false };
+    if (c && state.runningChats.get(c.id)?.abortRequested) return { result: { error: 'stopped by user' }, summary: 'stopped', ok: false };
   } else if (!skipApproval) {
     approvalDecision = 'auto-allow';
   }
@@ -5042,23 +5770,23 @@ async function executeToolImpl(name, args) {
     }
     const allow = c?.pathAllowlist || [];
     if (name === 'read_file') {
-      const res = await runWithPathExpansion(name, args, allow, (a) => window.api.fs.readFile(args.path || '', a));
+      const res = await runWithPathExpansion(name, args, allow, (a) => window.api.fs.readFile(args.path || '', a), c);
       if (res.error) return { result: { error: res.error }, summary: 'failed', ok: false };
       return { result: { path: res.path, content: res.content }, summary: `${(res.size / 1024).toFixed(1)} KB`, ok: true };
     }
     if (name === 'list_dir') {
-      const res = await runWithPathExpansion(name, args, allow, (a) => window.api.fs.listDir(args.path || '', a));
+      const res = await runWithPathExpansion(name, args, allow, (a) => window.api.fs.listDir(args.path || '', a), c);
       if (res.error) return { result: { error: res.error }, summary: 'failed', ok: false };
       const n = (res.entries || []).length;
       return { result: { path: res.path, entries: res.entries }, summary: `${n} item${n === 1 ? '' : 's'}`, ok: true };
     }
     if (name === 'write_file') {
-      const res = await runWithPathExpansion(name, args, allow, (a) => window.api.fs.writeFile(args.path || '', args.content || '', a));
+      const res = await runWithPathExpansion(name, args, allow, (a) => window.api.fs.writeFile(args.path || '', args.content || '', a), c);
       if (res.error) return { result: { error: res.error }, summary: 'failed', ok: false };
       return { result: { path: res.path, bytes: res.bytes }, summary: `${res.bytes} B written`, ok: true };
     }
     if (name === 'apply_patch') {
-      const res = await runWithPathExpansion(name, args, allow, (a) => window.api.fs.applyPatch(args.path || '', args.find || '', args.replace ?? '', a));
+      const res = await runWithPathExpansion(name, args, allow, (a) => window.api.fs.applyPatch(args.path || '', args.find || '', args.replace ?? '', a), c);
       if (res.error) return { result: { error: res.error }, summary: 'failed', ok: false };
       return { result: { path: res.path, before_lines: res.before_lines, after_lines: res.after_lines }, summary: 'patched', ok: true };
     }
@@ -5175,15 +5903,24 @@ async function executeToolImpl(name, args) {
   }
 }
 
+// Only one pop-up can be open. With two agents running, a second request used to
+// overwrite the first, and one click answered both, including a command that was
+// no longer on screen. Requests now wait their turn.
+let modalQueue = Promise.resolve();
+function queueModal(show) {
+  const next = modalQueue.then(show, show);
+  modalQueue = next.catch(() => {});
+  return next;
+}
+
 // ============== PATH EXPANSION MODAL ==============
 // When a file tool tries to access something outside the chat's pathAllowlist,
 // instead of dead-ending the agent, ask the user whether to grant access:
 // once, for-the-whole-folder, or deny. Returns one of 'once' | 'folder' | 'deny'.
-function requestPathExpansion(toolName, requestedPath) {
-  return new Promise((resolve) => {
+function requestPathExpansion(toolName, requestedPath, c) {
+  return queueModal(() => new Promise((resolve) => {
     const overlay = $('#path-expand-overlay');
     if (!overlay) return resolve('deny');
-    const c = currentChat();
     $('#pe-tool-name').textContent = toolName;
     $('#pe-requested-path').textContent = requestedPath || '(unknown)';
     $('#pe-current-folder').textContent = c?.projectFolder || '(none — no project folder set)';
@@ -5213,14 +5950,14 @@ function requestPathExpansion(toolName, requestedPath) {
     overlay.addEventListener('click', onBackdrop);
     document.addEventListener('keydown', onKey);
     $('#pe-deny').focus();
-  });
+  }));
 }
 
 // Wraps a file-tool IPC call. If the first try fails because the path is
 // outside the allowlist, prompts the user (path-expansion modal). If they
 // approve, retries with an expanded allowlist; if they choose "Allow this
 // folder", persists the expansion to the chat's pathAllowlist.
-async function runWithPathExpansion(toolName, args, allow, runFn) {
+async function runWithPathExpansion(toolName, args, allow, runFn, c) {
   let currentAllow = (allow || []).slice();
   let res = await runFn(currentAllow);
   if (!res || !res.error) return res;
@@ -5231,7 +5968,7 @@ async function runWithPathExpansion(toolName, args, allow, runFn) {
   const requestedPath = (m && m[1]) || toStringArg(args?.path) || toStringArg(args?.cwd) || '';
   if (!requestedPath) return res;
 
-  const decision = await requestPathExpansion(toolName, requestedPath);
+  const decision = await requestPathExpansion(toolName, requestedPath, c);
   if (decision === 'deny') return res;
 
   let toAdd;
@@ -5246,7 +5983,6 @@ async function runWithPathExpansion(toolName, args, allow, runFn) {
   currentAllow.push(toAdd);
 
   if (decision === 'folder') {
-    const c = currentChat();
     if (c) {
       c.pathAllowlist = c.pathAllowlist || [];
       if (!c.pathAllowlist.includes(toAdd)) c.pathAllowlist.push(toAdd);
@@ -5261,7 +5997,7 @@ async function runWithPathExpansion(toolName, args, allow, runFn) {
 // true on Approve, false on Reject / Escape / overlay click. The plan text is
 // rendered as markdown so numbered lists and inline code look right.
 function requestPlanApproval(planText) {
-  return new Promise((resolve) => {
+  return queueModal(() => new Promise((resolve) => {
     const overlay  = $('#plan-approval-overlay');
     const bodyEl   = $('#plan-approval-body');
     const approve  = $('#plan-approval-approve');
@@ -5292,12 +6028,14 @@ function requestPlanApproval(planText) {
     document.addEventListener('keydown', onKey);
     overlay.addEventListener('click', onOverlay);
     deny.focus();
-  });
+  }));
 }
 
 // ============== APPROVAL MODAL ==============
-function requestApproval(toolName, args) {
-  return new Promise((resolve) => {
+function requestApproval(toolName, args, c) {
+  return queueModal(() => new Promise((resolve) => {
+    // Stopped or deleted while waiting its turn: nothing left to ask about.
+    if (c && (!state.chats[c.id] || state.runningChats.get(c.id)?.abortRequested)) return resolve(false);
     const overlay  = $('#approval-overlay');
     const nameEl   = $('#approval-name');
     const descEl   = $('#approval-desc');
@@ -5317,7 +6055,10 @@ function requestApproval(toolName, args) {
     const preset = presets[toolName] || { label: toolName, desc: 'The model wants to perform an action.' };
 
     nameEl.textContent = preset.label;
-    descEl.textContent = preset.desc;
+    // With agents running in several chats, say which one is asking.
+    descEl.textContent = (c && c.id !== state.activeId)
+      ? `From the chat "${c.title || 'New chat'}". ${preset.desc}`
+      : preset.desc;
     bodyEl.innerHTML = renderApprovalBody(toolName, args);
     overlay.hidden = false;
 
@@ -5342,7 +6083,7 @@ function requestApproval(toolName, args) {
     document.addEventListener('keydown', onKey);
     overlay.addEventListener('click', onOverlay);
     deny.focus();
-  });
+  }));
 }
 
 function renderApprovalBody(toolName, args) {
@@ -5414,13 +6155,25 @@ function renderApprovalBody(toolName, args) {
   return `<pre class="approval-code">${escapeHtml(JSON.stringify(args, null, 2))}</pre>`;
 }
 
+// The element for this exact message in the visible thread, or null if another
+// chat is on screen. Streams keep running in chats you've left, and writing to
+// "the last bubble" put their text into whichever chat was showing.
+function findMessageEl(msg) {
+  const list = $('#thread');
+  if (!list) return null;
+  for (let el = list.lastElementChild; el; el = el.previousElementSibling) {
+    if (el.__msg === msg) return el;
+  }
+  return null;
+}
+
 function patchLastMessage(msg) {
   // Full re-render — call this when message structure changes (tool events
   // added, media attached, pending state toggled).  For streaming text use
   // patchLastMessageContent instead, which avoids the full DOM swap that
   // makes streamed tokens flicker.
   const list = $('#thread');
-  const lastEl = list.lastElementChild;
+  const lastEl = findMessageEl(msg);
   if (!lastEl) return;
   const fresh = renderMessage(msg);
   list.replaceChild(fresh, lastEl);
@@ -5435,7 +6188,7 @@ function patchLastMessage(msg) {
 
 function patchLastMessageContent(msg) {
   const list = $('#thread');
-  const lastEl = list.lastElementChild;
+  const lastEl = findMessageEl(msg);
   if (!lastEl) return;
 
   // Verify the existing element is the right message; if not, full render.
@@ -5692,6 +6445,8 @@ function openEditModal({ code, lang, filename, originalCode }) {
       footInfo.classList.add('is-error');
       return;
     }
+    // The next save has to find what's in the message now.
+    originalCode = newCode;
     setDirty(false);
     // Tick the dot green briefly to confirm save.
     modal.classList.add('just-saved');
@@ -5819,7 +6574,7 @@ function openOutputModal({ code, lang, filename }) {
           </div>
         </div>
         <div class="output-preview-body">
-          <iframe class="output-iframe" sandbox="allow-scripts allow-forms allow-modals allow-popups allow-same-origin" srcdoc="${escapeHtml(code)}"></iframe>
+          <iframe class="output-iframe" sandbox="allow-scripts allow-forms allow-modals allow-popups"></iframe>
         </div>
       </div>
     `;
@@ -5851,6 +6606,7 @@ function openOutputModal({ code, lang, filename }) {
   }
 
   document.body.appendChild(overlay);
+  if (isHtml) showPreview(overlay.querySelector('.output-iframe'), code);
 
   const close = () => {
     overlay.classList.add('is-closing');
@@ -5867,7 +6623,7 @@ function openOutputModal({ code, lang, filename }) {
     if (action === 'close') close();
     if (action === 'reload' && isHtml) {
       const iframe = overlay.querySelector('.output-iframe');
-      if (iframe) iframe.srcdoc = code;
+      if (iframe) showPreview(iframe, code);
     }
     if (!isHtml) {
       if (action === 'clear') {
@@ -6049,6 +6805,13 @@ function renderMathLite(text) {
   return text;
 }
 
+// Previews are model-written code. Without allow-same-origin the frame can't reach
+// this page or window.api, and main serves it under its own script policy.
+async function showPreview(iframe, code) {
+  try { iframe.src = await window.api.preview.create(code); }
+  catch (e) { console.error('preview failed', e); }
+}
+
 function renderMarkdown(text) {
   if (!text) return '';
   let src = String(text);
@@ -6060,6 +6823,9 @@ function renderMarkdown(text) {
   // thinking aloud at them.
   src = src.replace(/<think>[\s\S]*?<\/think>/gi, '');
   src = src.replace(/^[\s\S]*?<\/think>/i, (m) => m.includes('<think>') ? m : '');
+
+  // NUL marks code-block placeholders below, so a NUL from the model could forge one.
+  src = src.replace(/\x00/g, '');
 
   // 1. Pull out fenced code blocks first.
   const codeBlocks = [];
@@ -6094,7 +6860,7 @@ function renderMarkdown(text) {
   src = src.replace(/(^|[^\w])_([^_\n]+?)_(?=[^\w]|$)/g, '$1<em>$2</em>');
   src = src.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (m, txt, url) => {
     if (!/^https?:\/\//.test(url)) return m;
-    return `<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">${txt}</a>`;
+    return `<a href="${url.replace(/"/g, '&quot;')}" target="_blank" rel="noopener noreferrer">${txt}</a>`;
   });
 
   // 5. Block-level: process line by line. Flat lists (no nesting) — keeps the
