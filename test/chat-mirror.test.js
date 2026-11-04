@@ -413,3 +413,98 @@ test('applyOps takes only known fields of known types, as the other end could be
   assert.ok(!('silentSince' in copy.messages[2]));
   assert.deepEqual(copy.messages[0], { role: 'user', content: 'x' });
 });
+
+// ---- Closed sets: these reach class names, and a paired home could send anything ----
+
+const fs = require('node:fs');
+const path = require('node:path');
+const { cleanHome, FIELDS } = require('../lib/chat-mirror.js');
+
+const HOSTILE = '<img src=x onerror=alert(1)>';
+
+test('fields that reach markup or a class name take only the values the app uses', () => {
+  const chat = baseChat();
+  chat.modality = HOSTILE;
+  Object.assign(chat.messages[1], { role: 'modal-overlay', modality: HOSTILE });
+  chat.messages[1].toolEvents[0].status = 'modal-overlay';
+  chat.messages[2].videoState = { stage: 'modal-overlay', filename: 'v.mp4' };
+  const snap = snapshotChat(chat);
+  assert.ok(!('modality' in snap));
+  assert.ok(!('role' in snap.messages[1]));
+  assert.ok(!('modality' in snap.messages[1]));
+  assert.ok(!('status' in snap.messages[1].toolEvents[0]));
+  assert.ok(!('videoState' in snap.messages[2]), 'a card with no known stage draws nothing');
+});
+
+test('applyOps holds the closed sets too', () => {
+  const copy = wire(snapshotChat(baseChat()));
+  applyOps(copy, [
+    { type: 'meta', set: { modality: HOSTILE } },
+    { type: 'msg-update', index: 1, set: { role: 'modal-overlay' }, events: { from: 0, items: [{ name: 'calc', status: HOSTILE }] } },
+    { type: 'msg-add', index: 0, message: { role: HOSTILE, content: 'x', videoState: { stage: HOSTILE } } }
+  ]);
+  assert.equal(copy.modality, 'agent');
+  assert.equal(copy.messages[2].role, 'assistant');
+  assert.deepEqual(copy.messages[2].toolEvents, [{ name: 'calc' }]);
+  assert.deepEqual(copy.messages[0], { content: 'x' });
+});
+
+// A value the app starts using and the mirror doesn't know would quietly vanish on a laptop.
+test('every status, stage, role and modality the renderer sets is in the closed sets', () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'renderer.js'), 'utf8');
+  const found = (pattern) => [...source.matchAll(pattern)].map((m) => m[1]);
+  const stages = [
+    ...found(/videoState(?:\.stage)? = \{?\s*(?:stage: )?'([a-z-]+)'/g),
+    ...found(/videoState\.stage = '([a-z-]+)'/g),
+    ...found(/videoState: \{ stage: '([a-z-]+)'/g),
+    ...found(/videoState = \{\s*stage: '([a-z-]+)'/g),
+    ...found(/v\.stage === '([a-z-]+)'/g)
+  ];
+  assert.ok(stages.length > 12, `found ${stages.length} stages`);
+  for (const stage of stages) assert.ok(FIELDS.videoState.stage.has(stage), `stage ${stage}`);
+
+  const statuses = [...found(/\bstatus: '([a-z-]+)'/g), ...found(/\b(?:ev|thinkEvent)\.status = '([a-z-]+)'/g)];
+  const toolStatuses = statuses.filter((s) => !s.startsWith('blocked') && !s.startsWith('plan') && s !== 'denied');
+  assert.ok(toolStatuses.length > 4);
+  for (const status of toolStatuses) assert.ok(FIELDS.toolEvent.status.has(status), `status ${status}`);
+
+  for (const role of found(/messages\.push\(\{ role: '([a-z]+)'/g)) assert.ok(FIELDS.message.role.has(role), `role ${role}`);
+  for (const role of ['user', 'assistant', 'system']) assert.ok(FIELDS.message.role.has(role));
+
+  const catalog = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'models.json'), 'utf8'));
+  for (const key of Object.keys(catalog.categories)) assert.ok(FIELDS.chat.modality.has(key), `modality ${key}`);
+  for (const key of ['chat', 'vision', 'image', 'video', 'code', 'agent', 'video-analysis']) assert.ok(FIELDS.chat.modality.has(key), `modality ${key}`);
+});
+
+// ---- cleanHome ----
+
+test('cleanHome keeps what a real home PC sends', () => {
+  const home = {
+    name: 'Study PC',
+    os: 'win32',
+    shell: { name: 'Bash' },
+    installedModels: ['qwen3:8b', 'llama3.2:3b'],
+    cloudReady: { anthropic: true, google: false },
+    hardware: { cpuModel: 'Ryzen', gpuName: 'RTX', vramGB: 12, totalRamGB: 32, fastBudgetGB: 12, maxBudgetGB: 22.4, budgetSource: 'vram' }
+  };
+  assert.deepEqual(cleanHome(wire(home)), home);
+  assert.deepEqual(cleanHome({ ...home, hardware: null }), { ...home, hardware: null });
+});
+
+test('cleanHome takes nothing else, in any shape', () => {
+  const blank = { name: '', os: null, shell: { name: '' }, installedModels: [], cloudReady: {}, hardware: null };
+  for (const junk of [null, undefined, 5, 'x', [], {}]) assert.deepEqual(cleanHome(junk), blank);
+  const home = cleanHome(JSON.parse(`{
+    "__proto__": { "polluted": 1 },
+    "name": 5, "os": "${'evil'}", "shell": { "name": ["x"], "path": "secret-path" }, "extra": "secret",
+    "installedModels": ["ok", 5, { "a": 1 }, null],
+    "cloudReady": { "anthropic": "sk-secret", "google": true, "__proto__": true },
+    "hardware": { "cpuModel": 7, "vramGB": "12", "budgetSource": "<b>", "secret": "x" }
+  }`));
+  assert.deepEqual(home, {
+    name: '', os: null, shell: { name: '' }, installedModels: ['ok'],
+    cloudReady: { google: true }, hardware: {}
+  });
+  assert.equal({}.polluted, undefined);
+  assert.ok(!JSON.stringify(home).includes('secret'));
+});

@@ -6,7 +6,7 @@ const os = require('os');
 const { exec, spawn } = require('child_process');
 const { McpManager } = require('./lib/mcp-manager');
 const { isWithinRoots, applyExactPatch, globToRegex, walkFiles } = require('./lib/fs-rules');
-const { safeFetchText } = require('./lib/url-rules');
+const { safeFetchText, isAppPage } = require('./lib/url-rules');
 const { grepInWorker } = require('./lib/grep-runner');
 const { detectRepetitionLoop, splitOutputLines, quoteWindowsArg, encodePowerShell } = require('./lib/text-rules');
 const { killTree } = require('./lib/kill-tree');
@@ -417,10 +417,19 @@ function createWindow() {
     openOutside(url);
     return { action: 'deny' };
   });
+  // CSP has no rule against <meta http-equiv="refresh">, so this is what stops one, along with
+  // anything else that tries to put another page in a window holding window.api.
+  const appPage = path.join(__dirname, 'index.html');
   contents.on('will-navigate', (e, url) => {
-    if (url.startsWith('file:')) return;
+    if (isAppPage(url, appPage)) return;
     e.preventDefault();
     openOutside(url);
+  });
+  // The only frames this page has are previews, on their own scheme.
+  contents.on('will-frame-navigate', (details) => {
+    if (details.isMainFrame) return;
+    if (/^aio-preview:/i.test(details.url) || details.url === 'about:blank' || details.url === 'about:srcdoc') return;
+    details.preventDefault();
   });
 
   // A reload or a closed window takes the Stop button with it, so nothing could

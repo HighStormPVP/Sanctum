@@ -3570,3 +3570,8 @@ textarea:focus-visible, input:focus-visible { outline: none; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }
 }
+
+/* A remote chat whose home PC is offline: nothing in it is really happening any more. */
+#thread[data-remote-offline] *,
+#thread[data-remote-offline] *::before,
+#thread[data-remote-offline] *::after { animation: none !important; }

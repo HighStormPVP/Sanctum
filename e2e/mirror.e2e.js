@@ -9,7 +9,9 @@ const fs = require('node:fs');
 const http = require('node:http');
 const os = require('node:os');
 const path = require('node:path');
-const { startPair, launchDevice, waitFor, sleep, PIN } = require('./harness.js');
+const { pathToFileURL } = require('node:url');
+const { startPair, startFakeOllama, launchDevice, waitFor, sleep, PIN } = require('./harness.js');
+const { FIELDS } = require('../lib/chat-mirror.js');
 
 const MODEL = 'fake:latest';
 const TITLE = 'Mirrored Title Here';
@@ -502,6 +504,79 @@ test('mirroring chats', async (t) => {
     await chatDataMatches(pair, chatId);
   });
 
+  await t.test('markup in a frame stays text, and the window stays on the app', async () => {
+    const evil = path.join(folder, 'evil.html');
+    fs.writeFileSync(evil, '<!doctype html><title>EVIL</title><script>document.title = "EVIL RAN"</script>');
+    const evilUrl = pathToFileURL(evil).href;
+    const appUrl = laptop.page.url();
+    assert.match(appUrl, /index\.html$/);
+    const stillTheApp = async () => {
+      assert.equal(laptop.page.url(), appUrl);
+      assert.ok(!(await laptop.page.title()).includes('EVIL'));
+    };
+
+    const hostile = async (modality, chat) => {
+      assert.equal(await home.remote('send', pair.laptopId, {
+        type: 'mirror-snapshot', seq: 1000000, now: Date.now(), home: {}, chats: [{ id: chat, title: 'Sent over the wire', modality, updatedAt: Date.now(), messages: [] }]
+      }), true);
+      await waitFor('the frame to arrive', () => hasChat(laptop, remoteId(pair, chat)), 5000);
+    };
+    await hostile('<img id="fuzz-x" src="x" onerror="window.__fuzz=1"><style id="fuzz-x">*{display:none}</style><div id="fuzz-x" style="position:fixed;inset:0">FAKE</div>', 'markup');
+    assert.equal(await laptop.page.evaluate(() => document.querySelectorAll('[id="fuzz-x"]').length), 0);
+    assert.equal(await laptop.page.evaluate(() => window.__fuzz), undefined);
+    await hostile(`<meta http-equiv="refresh" content="0;url=${evilUrl}">`, 'refresh');
+    await sleep(1500);
+    await stillTheApp();
+    assert.equal(await laptop.page.evaluate(() => document.querySelectorAll('meta[http-equiv="refresh"]').length), 0);
+
+    // Even if markup did get in some other way, the window can't go anywhere else.
+    await laptop.page.evaluate((url) => {
+      const meta = document.createElement('meta');
+      meta.httpEquiv = 'refresh';
+      meta.content = `0;url=${url}`;
+      document.head.appendChild(meta);
+    }, evilUrl);
+    await sleep(1500);
+    await stillTheApp();
+    await laptop.page.evaluate((url) => {
+      location.href = url;
+    }, evilUrl);
+    await sleep(800);
+    await stillTheApp();
+    // An iframe can't get there either.
+    await laptop.page.evaluate((url) => {
+      const frame = document.createElement('iframe');
+      frame.id = 'nav-test';
+      frame.src = url;
+      document.body.appendChild(frame);
+    }, evilUrl);
+    await sleep(800);
+    assert.deepEqual(laptop.page.frames().map((f) => f.url()).filter((url) => url.includes('evil.html')), [], 'no frame shows it');
+    await laptop.page.evaluate(() => document.getElementById('nav-test').remove());
+
+    // A preview still works, on its own scheme.
+    await laptop.page.evaluate(async () => {
+      const frame = document.createElement('iframe');
+      frame.id = 'preview-test';
+      frame.setAttribute('sandbox', 'allow-scripts allow-forms allow-modals allow-popups');
+      document.body.appendChild(frame);
+      await showPreview(frame, '<!doctype html><h1 id="ok">preview works</h1>');
+    });
+    const preview = await waitFor('the preview to load', () => laptop.page.frames().find((f) => f.url().startsWith('aio-preview:')), 5000);
+    await waitFor('the preview to draw', () => preview.evaluate(() => document.querySelector('#ok')?.textContent === 'preview works'), 5000);
+    await laptop.page.evaluate(() => document.getElementById('preview-test').remove());
+
+    // A reload still works, and the real stream repairs everything the frames above did.
+    await laptop.page.reload();
+    await laptop.page.waitForLoadState('domcontentloaded');
+    assert.equal(laptop.page.url(), appUrl);
+    await started(laptop);
+    await laptop.record();
+    await waitFor('the real chat to come back', () => hasChat(laptop, remoteId(pair, chatId)), 5000);
+    await openChat(laptop, remoteId(pair, chatId));
+    await threadsMatch(pair, 'after the hostile frames', MARKER);
+  });
+
   await t.test('turning sharing off removes the chat within a second, and on brings it back', async () => {
     const rid = remoteId(pair, chatId);
     const startedAt = Date.now();
@@ -575,6 +650,60 @@ test('mirroring chats', async (t) => {
     reply.finish();
     await stopButtonsAre(pair, false, 'after the reply');
     await threadsMatch(pair, 'the end of the reply', 'After the drop.');
+    await chatDataMatches(pair, chatId);
+  });
+
+  await t.test('going offline stops the clocks and the dots, and leaves the content as it was', async () => {
+    const dropThenCheck = async (selector) => {
+      const running = await waitFor(`${selector} to be counting`, async () => {
+        const text = await secondsOn(laptop, selector);
+        return text ? text : false;
+      }, 15000);
+      assert.match(running, /^\d+s$/);
+      assert.deepEqual(await laptop.remote('setAddress', 'ws://127.0.0.1:9/nowhere-at-all'), { ok: true });
+      await waitFor('the laptop to show offline', async () => (await offlineMark(laptop)) === '1', 10000);
+
+      const frozen = await secondsOn(laptop, selector);
+      const before = await threadOf(laptop);
+      await sleep(2600);
+      assert.equal(await secondsOn(laptop, selector), frozen, 'the timer has stopped');
+      assert.equal(await threadOf(laptop), before, 'the content is exactly as it was');
+      assert.deepEqual(
+        await laptop.page.evaluate(() => [...document.querySelectorAll('#thread .msg-thinking-dots span, #thread .think-dots span')].map((e) => getComputedStyle(e).animationName).filter((n) => n !== 'none')),
+        [],
+        'no dots are moving'
+      );
+
+      // Drawing the message again, say by coming back to the chat, doesn't start it again.
+      await laptop.page.evaluate(() => renderActiveChat());
+      assert.equal(await secondsOn(laptop, selector), frozen, 'still stopped after a redraw');
+
+      assert.deepEqual(await laptop.remote('setAddress', pair.relay.address), { ok: true });
+      await waitFor('the laptop to reconnect', async () => (await offlineMark(laptop)) === null && (await laptop.entry()).connected === true, 30000);
+      await waitFor('the timer to go again', async () => {
+        const text = await secondsOn(laptop, selector);
+        return text && text !== frozen;
+      }, 8000);
+      assert.notEqual(
+        await laptop.page.evaluate(() => getComputedStyle(document.querySelector('#thread .msg-thinking-dots span')).animationName),
+        'none',
+        'and the dots'
+      );
+    };
+
+    await submit(home, 'Counting while the laptop goes away');
+    const reply = await ollama.next();
+    await dropThenCheck('.msg-status-time');
+    await threadsMatch(pair, 'back after the startup row', 'msg-status-text');
+    reply.think('Thinking, and then saying nothing for a long time. ');
+    await waitFor('the silence notice', () => home.page.evaluate(() => Boolean(document.querySelector('#thread .msg-silent'))), 12000);
+    await threadsMatch(pair, 'the silence notice again', 'msg-silent');
+    await dropThenCheck('.msg-silent-time');
+    await threadsMatch(pair, 'back after the silence', 'msg-silent');
+    reply.say('Done now.');
+    reply.finish();
+    await stopButtonsAre(pair, false, 'after the frozen reply');
+    await threadsMatch(pair, 'the end of the frozen reply', 'Done now.');
     await chatDataMatches(pair, chatId);
   });
 
@@ -726,4 +855,354 @@ test('mirroring chats', async (t) => {
     assert.deepEqual(filesContaining(files, MARKER), []);
     assert.deepEqual(filesContaining(files, TITLE), []);
   });
+});
+
+// ---- A paired home can send anything ----
+
+const PAYLOADS = (evilUrl) => [
+  '<img id="fuzz-x" src="x" onerror="window.__fuzz=1">',
+  '<style id="fuzz-x">*{display:none}</style>',
+  '<div id="fuzz-x" class="modal-overlay" style="position:fixed;inset:0">FAKE PIN SCREEN</div>',
+  `<meta id="fuzz-x" http-equiv="refresh" content="0;url=${evilUrl}">`,
+  '<base id="fuzz-x" href="https://evil.example/">',
+  '<form id="fuzz-x" action="https://evil.example/"><input name="pin"></form>',
+  '<iframe id="fuzz-x" srcdoc="&lt;script&gt;parent.__fuzz=1&lt;/script&gt;"></iframe>',
+  '"><svg id="fuzz-x" onload="window.__fuzz=1">',
+  "' onmouseover='window.__fuzz=1' x='",
+  'modal-overlay',
+  'msg-body x" style="position:fixed',
+  '__proto__',
+  'constructor',
+  'javascript:window.__fuzz=1',
+  '[x](javascript:window.__fuzz=1) [y](https://a.example/"onclick="window.__fuzz=1) ![z](x)',
+  '```<img id="fuzz-x">\n<img id="fuzz-x" src=x onerror="window.__fuzz=1">\n```',
+  '`<img id="fuzz-x">` \\(<img id="fuzz-x">\\) $$<img id="fuzz-x">$$ \\[<b id="fuzz-x">\\]',
+  '\u0000CB0\u0000 \u0000IC0\u0000',
+  '1. <img id="fuzz-x">\n- <img id="fuzz-x">\n# <img id="fuzz-x">\n> <img id="fuzz-x">\n| <a id="fuzz-x"> | b |',
+  '<think>x</think><img id="fuzz-x"><think>'
+];
+
+const MARKDOWN = '# Head\n\n## Two\n\n**b** *i* `c` [l](https://a.example/x)\n\n- one\n- two\n\n1. first\n\n> quote\n\n---\n\n\\(x^2\\) $$y_1$$\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n```python\n# file.py\nprint(1)\n```\n\n```html\n<b>x</b>\n```';
+
+// Something of everything the thread can draw, so that each string field reaches its real
+// sink. Which renderer a tool event gets depends on its name, and which card a video gets
+// depends on its stage, hence the many of each.
+function richChat() {
+  const event = (name, status, extra = {}) => ({ name, status, argSummary: 'args', resultSummary: 'summary', input: 'in', output: 'out', exitCode: 1, ...extra });
+  const video = (stage, extra = {}) => ({
+    role: 'assistant', content: '', modality: 'chat',
+    videoState: {
+      stage, filename: 'v.mp4', dep: 'ffmpeg', log: 'log text', ok: true, durationSec: 4.5, framesDone: 1, expectedFrames: 9,
+      hashDone: 1, totalFrames: 9, uniqueFrames: 9, captionDone: 1,
+      deps: { ffmpeg: { found: true, version: '6.1' }, whisper: { found: false, version: '1.0' } },
+      ...extra
+    }
+  });
+  return {
+    id: 'rich', title: 'Rich', model: 'some:model', modality: 'code', createdAt: 5, updatedAt: Date.now(),
+    webEnabled: true, thinkingEnabled: true, planMode: true, approvalMode: false, noApproval: false, readOnly: false, noFetch: false,
+    projectFolder: 'C:\\work\\folder',
+    messages: [
+      { role: 'user', content: 'plain', modality: 'chat', attachments: [{ kind: 'image', name: 'a.png', pages: 2, ext: 'png' }, { kind: 'video', name: 'v.mp4', ext: 'mp4' }, { kind: 'pdf', name: 'a.pdf', pages: 3 }] },
+      { role: 'user', content: 'waiting', queued: true, attachments: [] },
+      { role: 'system', content: 'a system line' },
+      { role: 'assistant', content: MARKDOWN, modality: 'chat', routedTo: 'other:model', tokenStats: { prompt: 1, completion: 2, _exactCompletion: 2, live: true } },
+      { role: 'assistant', content: '', thinking: true, thinkingMode: true },
+      { role: 'assistant', content: '', thinking: true, startup: { text: 'Loading', startedAt: 1000 } },
+      { role: 'assistant', content: '', thinking: true },
+      { role: 'assistant', content: 'quiet', silentSince: 1000 },
+      {
+        role: 'assistant', content: 'after the tools', toolEvents: [
+          { name: '__think', status: 'running', startedAt: 1000, chars: 40, tokens: 10 },
+          { name: '__think', status: 'done', startedAt: 1000, ms: 2000, chars: 40, tokens: 10 },
+          event('web_search', 'running'), event('web_search', 'done'), event('web_search', 'error'),
+          event('run_command', 'running'), event('run_command', 'done'), event('run_command', 'error'),
+          event('run_command_async', 'done'), event('calc', 'running'), event('calc', 'done'), event('calc', 'error'),
+          event('some_mcp_tool', 'done')
+        ]
+      },
+      ...['starting', 'checking-deps', 'deps-missing', 'installing', 'install-done', 'probing', 'extracting', 'extracting-audio', 'dedup',
+        'identifying', 'captioning', 'transcribing', 'synthesizing', 'aborted', 'done'].map((stage) => video(stage))
+    ]
+  };
+}
+
+const emptyAgentChat = () => ({ id: 'agent', title: 'Agent', model: 'some:model', modality: 'agent', updatedAt: Date.now(), projectFolder: 'C:\\work\\folder', messages: [] });
+
+const homeDetails = () => ({
+  name: 'Home', os: 'win32', shell: { name: 'Bash' }, installedModels: ['some:model'], cloudReady: { anthropic: true },
+  hardware: { cpuModel: 'cpu', gpuName: 'gpu', vramGB: 1, totalRamGB: 2, fastBudgetGB: 1, maxBudgetGB: 2, budgetSource: 'vram' }
+});
+
+// Every path in a value, as [path, leaf].
+function leaves(value, at = []) {
+  if (Array.isArray(value)) return value.flatMap((v, i) => leaves(v, [...at, i]));
+  if (value && typeof value === 'object') return Object.entries(value).flatMap(([k, v]) => leaves(v, [...at, k]));
+  return [[at, value]];
+}
+
+function nodes(value, at = []) {
+  const here = at.length ? [at] : [];
+  if (Array.isArray(value)) return [...here, ...value.flatMap((v, i) => nodes(v, [...at, i]))];
+  if (value && typeof value === 'object') return [...here, ...Object.entries(value).flatMap(([k, v]) => nodes(v, [...at, k]))];
+  return here;
+}
+
+function withValue(root, at, value) {
+  const copy = JSON.parse(JSON.stringify(root));
+  let target = copy;
+  for (const key of at.slice(0, -1)) target = target[key];
+  target[at[at.length - 1]] = value;
+  return copy;
+}
+
+test('a paired home can send anything: only the expected rendering comes of it', async (t) => {
+  const ollama = await startFakeOllama();
+  const device = await launchDevice('fuzz', { ollamaUrl: ollama.url });
+  const folder = fs.mkdtempSync(path.join(os.tmpdir(), 'sanctum-e2e-fuzz-'));
+  t.after(async () => {
+    await device.stop();
+    await ollama.stop();
+    fs.rmSync(folder, { recursive: true, force: true });
+  });
+  const { page } = device;
+  await waitFor('boot', () => page.evaluate(() => state.order.length > 0 && Boolean(state.catalog)));
+  const evil = path.join(folder, 'evil.html');
+  fs.writeFileSync(evil, '<!doctype html><title>EVIL</title>');
+  const appUrl = page.url();
+  const payloads = PAYLOADS(pathToFileURL(evil).href);
+
+  // A field added to the mirror has to be added here too, or this test stops covering it.
+  const rich = richChat();
+  const seen = (name, list) => new Set(list.flatMap((o) => Object.keys(o ?? {})));
+  const check = (name, have) => {
+    for (const key of Object.keys(FIELDS[name])) assert.ok(have.has(key), `the fuzz has no ${name}.${key}`);
+  };
+  check('chat', new Set(Object.keys(rich)));
+  check('message', seen('', rich.messages));
+  check('startup', seen('', rich.messages.map((m) => m.startup)));
+  check('tokenStats', seen('', rich.messages.map((m) => m.tokenStats)));
+  check('attachment', seen('', rich.messages.flatMap((m) => m.attachments ?? [])));
+  check('toolEvent', seen('', rich.messages.flatMap((m) => m.toolEvents ?? [])));
+  check('videoState', seen('', rich.messages.map((m) => m.videoState)));
+  check('videoDep', seen('', rich.messages.flatMap((m) => Object.values(m.videoState?.deps ?? {}))));
+  assert.deepEqual(new Set(FIELDS.message.role), new Set(rich.messages.map((m) => m.role)));
+
+  // Sets up a home in the renderer and collects what benign chats draw, which is the
+  // definition of expected: nothing else may ever appear.
+  const baseline = await page.evaluate(([chats, details]) => {
+    const HOME = 'fuzz-home';
+    window.__fuzzWarnings = [];
+    const warn = console.warn;
+    console.warn = (...args) => { window.__fuzzWarnings.push(args.map(String).join(' ')); warn(...args); };
+    window.addEventListener('error', (e) => window.__fuzzWarnings.push(String(e.message)));
+    window.__fuzz = undefined;
+    window.__seq = 0;
+    window.__mirrorStatus = { devices: [{ id: HOME, role: 'home', connected: true }], locked: false, idleLocked: false };
+    mirrorOnStatus(window.__mirrorStatus);
+    window.__sendSnapshot = (list, home) => mirrorOnFrame(HOME, { type: 'mirror-snapshot', seq: ++window.__seq, now: Date.now(), home, chats: list });
+    window.__sendOps = (chatId, ops) => mirrorOnFrame(HOME, { type: 'mirror-ops', seq: ++window.__seq, chatId, ops });
+    window.__areas = () => ['#thread', '#chat-list'].flatMap((sel) => [...document.querySelector(sel).querySelectorAll('*')]);
+
+    const tags = new Set();
+    const classes = new Set();
+    const attrs = new Set();
+    const ids = new Set();
+    const collect = () => {
+      for (const el of window.__areas()) {
+        tags.add(el.tagName);
+        for (const token of el.classList) classes.add(token);
+        for (const attr of el.attributes) attrs.add(attr.name);
+        if (el.id) ids.add(el.id);
+      }
+    };
+    const key = (id) => remoteChatKey(HOME, id);
+    // Dropping a hostile value can leave any of these: every empty state the app has.
+    const empties = [
+      { id: 'empty-home', modality: 'chat', messages: [] },
+      { id: 'empty-agent', modality: 'agent', messages: [] },
+      { id: 'empty-no-modality', messages: [] }
+    ];
+    window.__sendSnapshot([...chats, ...empties], details);
+    const view = (id, space) => {
+      state.space = space;
+      setActive(key(id));
+      collect();
+    };
+    for (const c of chats) view(c.id, chatSpace(state.chats[key(c.id)]));
+    view('empty-home', 'home');
+    view('empty-home', 'code');
+    view('empty-agent', 'code');
+    view('empty-no-modality', 'home');
+    window.__sendSnapshot(chats, details);
+    setActive(key(chats[0].id));
+    state.space = chatSpace(state.chats[key(chats[0].id)]);
+    renderChatList();
+    const headCount = document.head.childElementCount;
+    const bodyCount = document.body.childElementCount;
+    window.__violations = [];
+    window.__check = (where) => {
+      const bad = [];
+      if (document.querySelector('[id="fuzz-x"]')) bad.push('an element with the payload id');
+      for (const el of window.__areas()) if (el.id && !ids.has(el.id)) bad.push(`id ${el.id}`);
+      if (window.__fuzz !== undefined) bad.push('script ran');
+      if (document.head.childElementCount !== headCount) bad.push('head changed');
+      if (document.body.childElementCount !== bodyCount) bad.push('body changed');
+      for (const el of window.__areas()) {
+        if (!tags.has(el.tagName)) bad.push(`tag ${el.tagName}`);
+        for (const token of el.classList) if (!classes.has(token)) bad.push(`class ${token}`);
+        for (const attr of el.attributes) {
+          if (!attrs.has(attr.name) || attr.name.startsWith('on')) bad.push(`attribute ${attr.name}`);
+          if (attr.name === 'style' && !/^width:\s*\d{1,3}%;?$/.test(attr.value)) bad.push(`style ${attr.value}`);
+          if (attr.name === 'href' && !/^https?:\/\//.test(attr.value)) bad.push(`href ${attr.value}`);
+        }
+        if (getComputedStyle(el).position === 'fixed') bad.push(`fixed ${el.tagName}.${el.className}`);
+      }
+      if (window.__fuzzWarnings.length) bad.push(...window.__fuzzWarnings.splice(0));
+      if (bad.length && window.__violations.length < 30) window.__violations.push({ where, bad: [...new Set(bad)].slice(0, 5) });
+    };
+    window.__check('the benign chats');
+    return { tags: tags.size, classes: classes.size, violations: window.__violations };
+  }, [[rich, emptyAgentChat()], homeDetails()]);
+  assert.deepEqual(baseline.violations, []);
+  assert.ok(baseline.tags > 12 && baseline.classes > 40, `the baseline drew ${baseline.tags} tags and ${baseline.classes} classes`);
+
+  // One field at a time keeps the rest of the message as it is, so the field reaches its sink.
+  const stringPaths = (root) => leaves(root).filter(([, v]) => typeof v === 'string').map(([at]) => at);
+  const homeBase = homeDetails();
+  const cases = [];
+  for (const payload of payloads) {
+    for (const at of stringPaths(rich)) cases.push({ chats: [withValue(rich, at, payload), emptyAgentChat()], home: homeBase, open: at[0] === 'id' ? null : 'rich', where: `rich.${at.join('.')}`, payload });
+    const agent = emptyAgentChat();
+    for (const at of stringPaths(agent)) cases.push({ chats: [rich, withValue(agent, at, payload)], home: homeBase, open: at[0] === 'id' ? null : 'agent', where: `agent.${at.join('.')}`, payload });
+    for (const at of stringPaths(homeBase)) cases.push({ chats: [rich, agent], home: withValue(homeBase, at, payload), open: 'rich', where: `home.${at.join('.')}`, payload });
+    // Everything at once, with the names as they'd be sent and every dispatch changed.
+    const all = stringPaths(rich).reduce((c, at) => withValue(c, at, payload), rich);
+    cases.push({ chats: [all], home: homeBase, open: all.id, where: 'every field at once', payload });
+  }
+  // Snapshots, each diffed against the last and painted, then redrawn from scratch.
+  const run = (batch) => page.evaluate((list) => {
+    for (const { chats, home, open, where, payload } of list) {
+      const label = `${where} = ${JSON.stringify(payload).slice(0, 60)}`;
+      window.__sendSnapshot(chats, home);
+      const key = open && remoteChatKey('fuzz-home', open);
+      if (key && state.chats[key]) {
+        state.space = chatSpace(state.chats[key]);
+        if (state.activeId !== key) setActive(key);
+      }
+      window.__check(`${label}, painted`);
+      renderActiveChat();
+      renderChatList();
+      window.__check(`${label}, redrawn`);
+    }
+    return window.__violations;
+  }, batch);
+  let violations = [];
+  for (let i = 0; i < cases.length && !violations.length; i += 40) violations = await run(cases.slice(i, i + 40));
+  assert.deepEqual(violations, []);
+  t.diagnostic(`${cases.length} hostile snapshots, ${payloads.length} payloads`);
+
+  // The same through ops, which is the path a frame takes once a chat is there.
+  const opsResult = await page.evaluate(([messages, chat, list]) => {
+    window.__sendSnapshot([chat], {});
+    const key = remoteChatKey('fuzz-home', chat.id);
+    state.space = chatSpace(state.chats[key]);
+    setActive(key);
+    const count = state.chats[key].messages.length;
+    const set = (root, at, value) => {
+      const copy = JSON.parse(JSON.stringify(root));
+      let target = copy;
+      for (const k of at.slice(0, -1)) target = target[k];
+      target[at[at.length - 1]] = value;
+      return copy;
+    };
+    const paths = (value, at = []) => (Array.isArray(value) ? value.flatMap((v, i) => paths(v, [...at, i]))
+      : value && typeof value === 'object' ? Object.entries(value).flatMap(([k, v]) => paths(v, [...at, k]))
+        : typeof value === 'string' ? [at] : []);
+    let total = 0;
+    for (const payload of list) {
+      for (const message of messages) {
+        for (const at of paths(message)) {
+          total += 1;
+          const hostile = set(message, at, payload);
+          window.__sendOps(chat.id, [{ type: 'msg-add', index: count, message: hostile }]);
+          window.__check(`msg-add ${at.join('.')}`);
+          window.__sendOps(chat.id, [{ type: 'msg-update', index: count, set: hostile, events: { from: 0, items: hostile.toolEvents ?? [] } }]);
+          window.__check(`msg-update ${at.join('.')}`);
+          window.__sendOps(chat.id, [{ type: 'msg-remove', index: count }]);
+        }
+      }
+      for (const field of ['title', 'model', 'modality', 'projectFolder']) {
+        window.__sendOps(chat.id, [{ type: 'meta', set: { [field]: payload } }]);
+        window.__check(`meta ${field}`);
+      }
+      window.__sendOps(chat.id, [{ type: 'meta', set: { title: 'Rich', model: 'some:model', modality: 'code', projectFolder: 'x' } }]);
+      window.__sendOps(chat.id, [{ type: 'msg-append', index: 0, baseLength: state.chats[key].messages[0].content.length, text: payload }]);
+      window.__check('msg-append');
+      window.__sendOps(chat.id, [{ type: 'msg-update', index: 0, set: { content: 'plain' } }]);
+    }
+    return { total, violations: window.__violations };
+  }, [rich.messages.filter((m) => !m.videoState || m.videoState.stage === 'deps-missing' || m.videoState.stage === 'installing'), { ...rich, messages: rich.messages.slice(0, 3) }, payloads]);
+  assert.deepEqual(opsResult.violations, []);
+  t.diagnostic(`${opsResult.total} hostile ops`);
+
+  // Wrong shapes: nothing throws, nothing is drawn wrongly, and the good chat next to the bad
+  // one still arrives.
+  const junk = [null, 5, -1, 1e308, true, [], {}, [[]], { a: 1 }, '', 'x'.repeat(5000)];
+  const shapes = [];
+  for (const at of nodes(rich)) for (const value of junk) shapes.push({ at, value });
+  const shapeResult = await page.evaluate(async ([chat, list, details]) => {
+    const set = (root, at, value) => {
+      const copy = JSON.parse(JSON.stringify(root));
+      let target = copy;
+      for (const k of at.slice(0, -1)) target = target[k];
+      target[at[at.length - 1]] = value;
+      return copy;
+    };
+    const good = { id: 'good', title: 'Good', modality: 'chat', updatedAt: 1, messages: [{ role: 'user', content: 'still here' }] };
+    let missed = 0;
+    let index = 0;
+    for (const { at, value } of list) {
+      window.__sendSnapshot([set(chat, at, value), good], details);
+      const key = remoteChatKey('fuzz-home', chat.id);
+      if (state.chats[key] && state.activeId !== key) setActive(key);
+      if (!state.chats[remoteChatKey('fuzz-home', 'good')]) missed += 1;
+      window.__check(`shape ${at.join('.')} = ${JSON.stringify(value).slice(0, 30)}`);
+      index += 1;
+      if (index % 200 === 0) await new Promise((r) => setTimeout(r));
+    }
+    return { missed, violations: window.__violations };
+  }, [rich, shapes, homeBase]);
+  assert.deepEqual(shapeResult.violations, []);
+  assert.equal(shapeResult.missed, 0);
+  t.diagnostic(`${shapes.length} malformed snapshots`);
+
+  // The frame itself, and the bad card the review found.
+  const frameResult = await page.evaluate(([chat]) => {
+    const before = window.__seq;
+    const key = remoteChatKey('fuzz-home', chat.id);
+    const expected = mirror.homes.get('fuzz-home').expected;
+    for (const seq of [undefined, null, 'x', 1.5, -1, 0, NaN, Infinity, {}, [], 1e300]) {
+      mirrorOnFrame('fuzz-home', { type: 'mirror-snapshot', seq, now: 0, home: {}, chats: [] });
+      mirrorOnFrame('fuzz-home', { type: 'mirror-ops', seq, chatId: chat.id, ops: [] });
+    }
+    const untouched = mirror.homes.get('fuzz-home').expected === expected && Boolean(state.chats[key]);
+    for (const home of [null, 5, 'x', [], { shell: 5 }, { shell: { name: {} } }]) window.__sendSnapshot([chat], home);
+    window.__check('frames with a bad home');
+    const info = mirror.homes.get('fuzz-home').info;
+    window.__sendSnapshot([{ id: 'nodeps', modality: 'chat', messages: [{ role: 'assistant', content: '', videoState: { stage: 'deps-missing' } }] }, chat], {});
+    const noDepsThere = Boolean(state.chats[key]) && Boolean(state.chats[remoteChatKey('fuzz-home', 'nodeps')]);
+    setActive(remoteChatKey('fuzz-home', 'nodeps'));
+    window.__check('deps-missing with no deps');
+    return { before, untouched, infoIsClean: typeof info?.shell?.name === 'string', noDepsThere, violations: window.__violations };
+  }, [rich]);
+  assert.deepEqual(frameResult.violations, []);
+  assert.equal(frameResult.untouched, true, 'a frame with a bad seq changes nothing');
+  assert.equal(frameResult.infoIsClean, true);
+  assert.equal(frameResult.noDepsThere, true);
+
+  await sleep(1500);
+  assert.equal(page.url(), appUrl, 'the window never left');
+  assert.ok(!(await page.title()).includes('EVIL'));
+  assert.equal(await page.evaluate(() => window.__fuzz), undefined);
 });

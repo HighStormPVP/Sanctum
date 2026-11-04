@@ -160,3 +160,33 @@ test('PowerShell scripts are encoded the way -EncodedCommand expects', () => {
   const encoded = encodePowerShell('Write-Output "a|b"');
   assert.strictEqual(Buffer.from(encoded, 'base64').toString('utf16le'), 'Write-Output "a|b"');
 });
+
+// ---- The main window only ever shows the app's own page ----
+
+const { isAppPage } = lib('url-rules.js');
+const { pathToFileURL } = require('url');
+
+test('isAppPage takes only the exact file, however its URL is spelled', () => {
+  const index = path.join(os.tmpdir(), 'Sanctum Test', 'index.html');
+  const url = pathToFileURL(index).href;
+  assert.strictEqual(isAppPage(url, index), true);
+  assert.strictEqual(isAppPage(`${url}#frag`, index), true);
+  assert.strictEqual(isAppPage(pathToFileURL(path.join(os.tmpdir(), 'Sanctum Test', 'other', '..', 'index.html')).href, index), true);
+
+  const others = [
+    pathToFileURL(path.join(os.tmpdir(), 'Sanctum Test', 'evil.html')).href,
+    pathToFileURL(path.join(os.tmpdir(), 'index.html')).href,
+    pathToFileURL(`${index}.html`).href,
+    `${url}?next=1`,
+    url.replace('file:///', 'file://evil.example/'),
+    url.replace('index.html', 'index%2Ehtml%5C..%5Cevil.html'),
+    url.replace('file:', 'https:'),
+    'aio-preview://abc/',
+    'about:blank',
+    'javascript:alert(1)',
+    'not a url',
+    '',
+    undefined
+  ];
+  for (const other of others) assert.strictEqual(isAppPage(other, index), false, String(other));
+});

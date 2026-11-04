@@ -1528,6 +1528,12 @@ async function runVideoAnalysis(c, videoAtt, assistantMsg) {
 
 // Render the in-bubble progress / dep-install / state UI for a video
 // analysis message. Re-rendered on every saveToStorage during the pipeline.
+// A progress bar's width, whatever the two numbers are. On a laptop they came from a frame.
+function videoProgressPct(done, total) {
+  const pct = Math.round((done / total) * 100);
+  return Number.isFinite(pct) ? Math.max(0, Math.min(100, pct)) : 0;
+}
+
 function renderVideoStateCard(m) {
   const v = m.videoState || {};
   const wrap = document.createElement('div');
@@ -1538,7 +1544,7 @@ function renderVideoStateCard(m) {
     return wrap;
   }
   if (v.stage === 'deps-missing') {
-    const d = v.deps;
+    const d = v.deps || {};
     const dep = (name, label, blurb, found) => `
       <div class="video-dep ${found ? 'ok' : 'missing'}">
         <div class="video-dep-head">
@@ -1547,15 +1553,15 @@ function renderVideoStateCard(m) {
         </div>
         <p>${blurb}</p>
         ${found
-          ? `<span class="video-dep-version">${escapeHtml(d[name].version || '')}</span>`
+          ? `<span class="video-dep-version">${escapeHtml(d[name]?.version || '')}</span>`
           : `<button type="button" class="video-dep-install" data-vid-action="install-dep" data-dep="${name}">Install</button>`}
       </div>`;
     wrap.innerHTML = `
       <h3 class="video-state-title">Video Analysis needs two tools</h3>
       <p class="video-state-sub">First-time setup. After this is done, you can analyse any video.</p>
       <div class="video-dep-grid">
-        ${dep('ffmpeg', 'ffmpeg', 'Used to extract frames and audio from the video. ~50 MB, installed via winget.', d.ffmpeg.found)}
-        ${dep('whisper', 'OpenAI Whisper', 'Local speech-to-text. Runs in Python; ~140 MB for the tiny model. Installed via pip.', d.whisper.found)}
+        ${dep('ffmpeg', 'ffmpeg', 'Used to extract frames and audio from the video. ~50 MB, installed via winget.', d.ffmpeg?.found)}
+        ${dep('whisper', 'OpenAI Whisper', 'Local speech-to-text. Runs in Python; ~140 MB for the tiny model. Installed via pip.', d.whisper?.found)}
       </div>`;
     return wrap;
   }
@@ -1576,7 +1582,7 @@ function renderVideoStateCard(m) {
     return wrap;
   }
   if (v.stage === 'extracting' || v.stage === 'extracting-audio') {
-    const pct = v.expectedFrames ? Math.min(100, Math.round((v.framesDone / v.expectedFrames) * 100)) : 0;
+    const pct = videoProgressPct(v.framesDone, v.expectedFrames);
     wrap.innerHTML = `
       <div class="video-state-row"><span class="video-spinner"></span> ${v.stage === 'extracting-audio' ? 'Extracting audio' : 'Extracting frames'} · <strong>${v.framesDone || 0}</strong> / ${v.expectedFrames || '?'}</div>
       <div class="video-progress"><div class="video-progress-bar" style="width:${pct}%"></div></div>
@@ -1584,7 +1590,7 @@ function renderVideoStateCard(m) {
     return wrap;
   }
   if (v.stage === 'dedup') {
-    const pct = v.totalFrames ? Math.round((v.hashDone / v.totalFrames) * 100) : 0;
+    const pct = videoProgressPct(v.hashDone, v.totalFrames);
     wrap.innerHTML = `
       <div class="video-state-row"><span class="video-spinner"></span> Deduplicating frames · <strong>${v.hashDone}</strong> / ${v.totalFrames}</div>
       <div class="video-progress"><div class="video-progress-bar" style="width:${pct}%"></div></div>`;
@@ -1596,7 +1602,7 @@ function renderVideoStateCard(m) {
     return wrap;
   }
   if (v.stage === 'captioning') {
-    const pct = v.uniqueFrames ? Math.round((v.captionDone / v.uniqueFrames) * 100) : 0;
+    const pct = videoProgressPct(v.captionDone, v.uniqueFrames);
     wrap.innerHTML = `
       <div class="video-state-row"><span class="video-spinner"></span> Describing <strong>${v.uniqueFrames}</strong> unique frames · ${v.captionDone}/${v.uniqueFrames}</div>
       <div class="video-progress"><div class="video-progress-bar" style="width:${pct}%"></div></div>
@@ -1949,7 +1955,7 @@ function renderChatList() {
     for (const c of chats) {
       const item = document.createElement('button');
       item.className = 'chat-item' + (c.id === state.activeId ? ' active' : '');
-      const modalityBadge = (c.modality && c.modality !== 'chat' && c.modality !== 'vision') ? `<span class="chat-modality">${shortModality(c.modality)}</span>` : '';
+      const modalityBadge = (c.modality && c.modality !== 'chat' && c.modality !== 'vision') ? `<span class="chat-modality">${escapeHtml(shortModality(c.modality))}</span>` : '';
       item.innerHTML = `
         <span class="chat-title">${escapeHtml(c.title || 'New chat')}</span>
         ${modalityBadge}
@@ -3601,7 +3607,7 @@ async function pickProjectFolder() {
 function renderMessage(m) {
   const el = document.createElement('div');
   el.__msg = m;
-  el.className = `msg ${m.role}` + (m.queued ? ' queued' : '');
+  el.className = 'msg' + (m.role ? ` ${m.role}` : '') + (m.queued ? ' queued' : '');
 
   if (m.queued) {
     const badge = document.createElement('span');
@@ -3715,9 +3721,13 @@ function renderMessage(m) {
 
 // Now, on the clock of the machine this chat is running on. On a laptop that's the home PC's
 // clock, which needn't agree with this one, and it's what these messages' times came from.
+// With the home PC offline, its clock stops at the last moment anyone heard from it: a timer
+// counting up from there would be claiming something is still running.
 function chatClockNow() {
   const c = currentChat();
-  return Date.now() + (c?.remote ? mirror.homes.get(c.remote.deviceId)?.clockOffset || 0 : 0);
+  const home = c?.remote ? mirror.homes.get(c.remote.deviceId) : null;
+  if (!home) return Date.now();
+  return (home.connected ? Date.now() : home.offlineAt ?? Date.now()) + home.clockOffset;
 }
 
 function startupTimeLabel(m) {
@@ -3899,7 +3909,8 @@ function renderThinkEvent(ev) {
 function renderCompactToolEvent(ev) {
   const el = document.createElement('div');
   el.className = `tool-event te-row ${ev.status || 'done'}`;
-  const label = TOOL_LABELS[ev.name] || ev.name;
+  // Own properties only: a name like "constructor" isn't a label.
+  const label = Object.hasOwn(TOOL_LABELS, ev.name ?? '') ? TOOL_LABELS[ev.name] : ev.name;
   const argSummary = ev.argSummary || '';
   let statusText;
   if (ev.status === 'running') statusText = 'running';
@@ -6320,7 +6331,7 @@ const mirror = {
   timer: null,
   hardwareAsked: false,
   // Watching.
-  homes: new Map(),          // deviceId -> { connected, expected, awaitingSnapshot, info, clockOffset }
+  homes: new Map(),          // deviceId -> { connected, offlineAt, expected, awaitingSnapshot, info, clockOffset }
   hidden: false,             // locked, so remote chats are off the screen
   resumeId: null             // the remote chat that was open when that happened
 };
@@ -6362,6 +6373,7 @@ function mirrorOnFrame(deviceId, frame) {
   }
   // Only a device this one treats as its home PC gets to put chats here.
   if (role !== 'home') return;
+  if (!Number.isSafeInteger(frame.seq) || frame.seq < 1) return;
   const home = mirrorHome(deviceId);
   if (frame.type === 'mirror-snapshot') {
     applyMirrorSnapshot(deviceId, home, frame);
@@ -6534,7 +6546,7 @@ function remoteChatsOf(deviceId) {
 function mirrorHome(deviceId) {
   let home = mirror.homes.get(deviceId);
   if (!home) {
-    home = { connected: false, expected: null, awaitingSnapshot: true, info: null, clockOffset: 0 };
+    home = { connected: false, offlineAt: null, expected: null, awaitingSnapshot: true, info: null, clockOffset: 0 };
     mirror.homes.set(deviceId, home);
   }
   return home;
@@ -6552,12 +6564,14 @@ function homeDeviceStatus(device) {
   if (device.connected === home.connected) return;
   home.connected = device.connected;
   home.awaitingSnapshot = true;
+  home.offlineAt = device.connected ? null : Date.now();
   if (device.connected) {
     setTimeout(() => {
       if (home.connected && home.awaitingSnapshot) requestMirrorSnapshot(device.id, home);
     }, MIRROR_SNAPSHOT_GRACE_MS);
   } else {
-    // Nothing can say a reply has ended now, and Stop can't reach it.
+    // Nothing can say a reply has ended now, and Stop can't reach it. What's on screen stays
+    // exactly as it was until a snapshot says otherwise, but it stops moving: see style.css.
     for (const c of remoteChatsOf(device.id)) state.runningChats.delete(c.id);
     updateSendButton();
   }
@@ -6587,19 +6601,20 @@ function applyMirrorOps(deviceId, home, chatId, ops) {
   }
   const c = existing || addRemoteChat(deviceId, chatId);
   const { resync } = ChatMirror.applyOps(c, ops);
-  if (resync) {
-    requestMirrorSnapshot(deviceId, home);
-    if (currentChat() === c) renderActiveChat();
-    return;
+  if (resync) requestMirrorSnapshot(deviceId, home);
+  try {
+    if (!resync) paintRemoteOps(c, ops);
+    else if (currentChat() === c) renderActiveChat();
+  } catch (e) {
+    console.warn('a remote chat could not be drawn', e);
   }
-  paintRemoteOps(c, ops);
 }
 
 // Goes through the same diff as streaming, so a snapshot that changes nothing paints nothing,
 // and messages keep their objects, and with them their place on screen.
 function applyMirrorSnapshot(deviceId, home, frame) {
   if (!Array.isArray(frame.chats)) return;
-  home.info = frame.home && typeof frame.home === 'object' ? frame.home : null;
+  home.info = ChatMirror.cleanHome(frame.home);
   home.clockOffset = Number.isFinite(frame.now) ? frame.now - Date.now() : 0;
   home.expected = frame.seq + 1;
   home.awaitingSnapshot = false;
@@ -6607,13 +6622,18 @@ function applyMirrorSnapshot(deviceId, home, frame) {
   const incoming = new Set();
   for (const raw of frame.chats) {
     if (!raw || typeof raw.id !== 'string') continue;
-    const next = ChatMirror.snapshotChat(raw);
-    const key = remoteChatKey(deviceId, next.id);
+    const key = remoteChatKey(deviceId, raw.id);
     incoming.add(key);
-    const c = state.chats[key] || addRemoteChat(deviceId, next.id);
-    const ops = ChatMirror.diffChat(ChatMirror.snapshotChat(c), next);
-    ChatMirror.applyOps(c, ops);
-    paintRemoteOps(c, ops);
+    // One chat that can't be applied or drawn mustn't stop the ones after it.
+    try {
+      const next = ChatMirror.snapshotChat(raw);
+      const c = state.chats[key] || addRemoteChat(deviceId, raw.id);
+      const ops = ChatMirror.diffChat(ChatMirror.snapshotChat(c), next);
+      ChatMirror.applyOps(c, ops);
+      paintRemoteOps(c, ops);
+    } catch (e) {
+      console.warn('a remote chat could not be applied', e);
+    }
   }
   for (const c of remoteChatsOf(deviceId)) {
     if (!incoming.has(c.id)) dropRemoteChat(c.id);
@@ -6696,7 +6716,8 @@ function paintRemoteOffline() {
 
 // The home PC paints these from timers of its own, which don't run here.
 function paintRemoteClocks() {
-  if (!currentChat()?.remote) return;
+  const c = currentChat();
+  if (!c?.remote || !mirror.homes.get(c.remote.deviceId)?.connected) return;
   for (const el of $$('#thread .msg-status-time')) {
     const m = el.closest('.msg')?.__msg;
     if (m?.startup) el.textContent = startupTimeLabel(m);
