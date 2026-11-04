@@ -743,7 +743,7 @@ test('acting from a laptop', async (t) => {
     assert.equal(await home.page.evaluate(() => mirror.undelivered.size), 0);
   });
 
-  await t.test('words held for a laptop are capped at 2 MiB, oldest first, and the record never has them', async () => {
+  await t.test('words held for a laptop are capped at 32 MiB, oldest first, and the record never has them', async () => {
     const auditFile = await home.page.evaluate(() => window.api.audit.path());
     const laptopId = (await home.entry()).id;
     const before = fs.existsSync(auditFile) ? fs.readFileSync(auditFile, 'utf8').length : 0;
@@ -757,7 +757,7 @@ test('acting from a laptop', async (t) => {
       const texts = [...mirror.undelivered.get(nobody).values()].map((f) => f.text.slice(0, mark.length + 1));
       mirror.undelivered.delete(nobody);
       return texts;
-    }, [MARK, 900 * 1024]);
+    }, [MARK, 13 * 1024 * 1024]);
     assert.deepEqual(held, [`${MARK}1`, `${MARK}2`], 'the oldest went, and two fit');
     await waitFor('the record of it', () => fs.readFileSync(auditFile, 'utf8').slice(before).includes('queued-words-dropped'), 3000);
     assert.ok(!fs.readFileSync(auditFile, 'utf8').includes(MARK));
@@ -1462,10 +1462,14 @@ test('over a slow link, a snapshot past the link limit arrives whole, in one tra
     await waitFor('home to see the laptop go', async () => (await home.entry(laptopId)).connected === false, 60000);
     await waitFor('the laptop to see it', async () => (await laptop.entry()).connected === false, 15000);
   };
-  const forgetFrames = () => laptop.page.evaluate(() => {
-    window.__mirrorFrames.length = 0;
-    window.__statuses.length = 0;
-  });
+  const forgetFrames = async () => {
+    for (const device of [home, laptop]) {
+      await device.page.evaluate(() => {
+        window.__mirrorFrames.length = 0;
+        window.__statuses.length = 0;
+      });
+    }
+  };
   const comeBack = async () => {
     await forgetFrames();
     assert.deepEqual(await laptop.remote('setAddress', proxy.address), { ok: true });
@@ -1480,7 +1484,9 @@ test('over a slow link, a snapshot past the link limit arrives whole, in one tra
     return ids;
   }, [count, mib, tag, MODEL]);
   const removeChats = (ids) => home.page.evaluate((list) => { for (const c of list) deleteChat(c); markMirrorDirty(); }, ids);
-  const sessionDropped = () => laptop.page.evaluate(() => {
+  // Up and then down, seen from either end. Home sees it first, since that's where the link's
+  // buffer overflows.
+  const sawItEnd = (device) => device.page.evaluate(() => {
     let up = false;
     for (const s of window.__statuses) {
       const entry = s.devices?.[0];
@@ -1489,6 +1495,7 @@ test('over a slow link, a snapshot past the link limit arrives whole, in one tra
     }
     return false;
   });
+  const sessionDropped = async () => (await sawItEnd(home)) || (await sawItEnd(laptop));
   const transferOnHome = () => home.page.evaluate((id) => {
     const p = mirror.laptops.get(id)?.paced;
     return p ? { transfer: p.transfer, next: p.next, acked: p.acked, inFlight: p.inFlightBytes, restart: !!p.restart, held: p.held.length, overflowed: !!p.overflowed } : null;
@@ -1527,7 +1534,9 @@ test('over a slow link, a snapshot past the link limit arrives whole, in one tra
 
     // The chat in the last part is unshared before that part has gone.
     await sleep(500);
-    assert.equal(await sessionDropped(), false, 'the session is still up');
+    assert.equal((await home.entry(laptopId)).connected, true, 'the session is still up, seen from home');
+    assert.equal(await sessionDropped(), false, 'and it has been all along');
+    assert.equal((await partFrames()).filter((f) => f.part === 1).length, 1, 'that request started nothing');
     const last = await home.page.evaluate(() => [...mirror.sent.keys()].at(-1));
     assert.ok(ids.includes(last));
     assert.ok(!(await partFrames()).some((f) => f.ids.includes(last)));
@@ -1539,16 +1548,20 @@ test('over a slow link, a snapshot past the link limit arrives whole, in one tra
       for (const c of rest) if (!(await holds(c, 13))) return false;
       return (await transferOnHome()) === null;
     });
+    kept = rest;
     assert.ok(most > 0 && most <= 32 * MIB_BYTES, `in flight reached ${most / MIB_BYTES} MiB`);
 
     const frames = await partFrames();
-    assert.equal(frames.filter((f) => f.part === 1).length, 1, 'one transfer');
-    assert.deepEqual(frames.map((f) => f.part), frames.map((_, i) => i + 1));
+    // The unshare restarted it, as any change to what's shared does. That's all that did.
+    assert.equal(frames.filter((f) => f.part === 1).length, 2, 'two transfers, the second for the unshare');
+    for (const transfer of new Set(frames.map((f) => f.transfer))) {
+      const parts = frames.filter((f) => f.transfer === transfer).map((f) => f.part);
+      assert.deepEqual(parts, parts.map((_, i) => i + 1), 'in order');
+    }
     assert.ok(!frames.slice(seenAtUnshare).some((f) => f.ids.includes(last)), "the unshared chat wasn't sent");
     assert.equal(await hasChat(laptop, rid(last)), false);
     assert.ok(frames.at(-1).now > frames[0].now + 2000, 'each part has its own clock reading');
     assert.equal(await sessionDropped(), false);
-    kept = rest;
   });
 
   await t.test('a restart during a transfer waits for what is outstanding, and held frames have a byte cap', async () => {
@@ -1556,8 +1569,6 @@ test('over a slow link, a snapshot past the link limit arrives whole, in one tra
     assert.equal(ids.length, 5);
     await sleep(1200);
     await forgetFrames();
-    // Transfer numbers start again with each connection, so earlier acks would be counted here.
-    await home.page.evaluate(() => { window.__mirrorFrames.length = 0; });
     assert.equal(await laptop.remote('send', homeId, { type: 'mirror-resync-request' }), true);
     await waitFor('the first part', async () => (await partFrames()).length >= 1, 60000);
     const firstTransfer = (await partFrames())[0].transfer;
@@ -1609,25 +1620,67 @@ test('over a slow link, a snapshot past the link limit arrives whole, in one tra
     await waitFor('the extra message to go', () => laptop.page.evaluate(([key]) => state.chats[key].messages.length === 1, [rid(ids[0])]), 15000);
   });
 
-  await t.test('a chat unshared during a transfer leaves the laptop before it ends, behind only what was in flight', async () => {
+  await t.test('sharing changes during a transfer: nothing of an unshared chat arrives, nothing comes back, and threads match', async () => {
     const ids = kept;
     await sleep(1200);
     await forgetFrames();
     assert.equal(await laptop.remote('send', homeId, { type: 'mirror-resync-request' }), true);
     await waitFor('the first part', async () => (await partFrames()).length >= 1, 60000);
-    const seen = (await partFrames())[0].ids.find((c) => ids.includes(c));
-    assert.ok(seen);
-    await home.page.evaluate((c) => { state.chats[c].remoteControl = false; markMirrorDirty(); }, seen);
-    // A link is ordered, so this can't overtake parts already in it. It doesn't wait for the rest.
-    await waitFor('it to leave', async () => !(await hasChat(laptop, rid(seen))), 45000);
-    assert.ok((await transferOnHome()) !== null, 'and the transfer is still going');
-    const rest = ids.filter((c) => c !== seen);
-    await untilWhole('after the unshare', async () => {
+    assert.ok((await transferOnHome()) !== null);
+
+    // One whose part has landed goes first. One that's written to and renamed, then unshared.
+    // One that's unshared and shared again. And one that's new.
+    const landed = (await partFrames())[0].ids.find((c) => ids.includes(c));
+    const order = await home.page.evaluate(() => [...mirror.sent.keys()]);
+    const notYet = order.filter((c) => ids.includes(c) && c !== landed);
+    const written = notYet.at(-1);
+    const reshared = notYet.at(-2);
+    const WORDS = 'WORDS-OF-A-CHAT-ABOUT-TO-BE-UNSHARED';
+    const TITLE = 'TITLE-OF-A-CHAT-ABOUT-TO-BE-UNSHARED';
+    await home.page.evaluate(([c, words, title]) => {
+      state.chats[c].messages.push({ role: 'user', content: words, attachments: [] });
+      state.chats[c].title = title;
+      markMirrorDirty(c);
+    }, [written, WORDS, TITLE]);
+    await sleep(300);
+    await home.page.evaluate((list) => {
+      for (const c of list) state.chats[c].remoteControl = false;
+      markMirrorDirty();
+    }, [landed, written, reshared]);
+    await sleep(500);
+    await home.page.evaluate((c) => {
+      state.chats[c].remoteControl = true;
+      markMirrorDirty();
+    }, reshared);
+    const [added] = await addChats(1, 2, 'Added');
+    await home.page.evaluate((c) => {
+      state.chats[c].messages.push({ role: 'user', content: 'The second message', attachments: [] });
+      markMirrorDirty(c);
+    }, added);
+
+    // A link is ordered, so a removal can't overtake parts already in it. It doesn't wait for the rest.
+    await waitFor('the removal', async () => !(await hasChat(laptop, rid(landed))), 45000);
+    const stillGoing = await transferOnHome();
+    assert.ok(stillGoing !== null, 'and the transfer is still going');
+
+    const rest = ids.filter((c) => c !== landed && c !== written);
+    await untilWhole('after the changes', async () => {
       for (const c of rest) if (!(await holds(c, 13))) return false;
+      if (!(await hasChat(laptop, rid(added)))) return false;
       return (await transferOnHome()) === null;
     });
-    assert.equal(await hasChat(laptop, rid(seen)), false, 'and stays gone');
-    await removeChats(rest);
+    await sleep(3000);
+    assert.equal(await hasChat(laptop, rid(landed)), false, 'gone, and stays gone');
+    assert.equal(await hasChat(laptop, rid(written)), false, 'never came back, under any name');
+    const leaked = await laptop.page.evaluate(([words, title]) => window.__mirrorFrames.filter((f) => {
+      if (f.type === 'mirror-ops') return JSON.stringify(f.ops).includes(words) || JSON.stringify(f.ops).includes(title);
+      return f.type === 'mirror-snapshot' && f.chats.some((c) => c.title === title);
+    }).map((f) => f.type), [WORDS, TITLE]);
+    assert.deepEqual(leaked, [], 'and nothing of it reached the laptop');
+    const threadOn = (device, key) => device.page.evaluate((k) => JSON.stringify(state.chats[k].messages.map((m) => [m.role, m.content.length])), key);
+    assert.equal(await threadOn(laptop, rid(reshared)), await threadOn(home, reshared), 'the reshared thread matches');
+    assert.equal(await threadOn(laptop, rid(added)), await threadOn(home, added), 'the new one arrived complete');
+    await removeChats([...rest, added, landed, written]);
     await waitFor('them to go', async () => !(await hasChat(laptop, rid(rest[0]))), 5000);
   });
 

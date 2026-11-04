@@ -6476,7 +6476,7 @@ const REMOTE_ERROR_MAX = 300;
 // How long an action that timed out still counts, if its answer turns up after all.
 const REMOTE_LATE_ANSWER_MS = 10 * 60 * 1000;
 const REMOTE_RETURNED_SEEN_MAX = 1000;
-const REMOTE_UNDELIVERED_MAX_BYTES = 2 * 1024 * 1024;
+const REMOTE_UNDELIVERED_MAX_BYTES = 32 * 1024 * 1024;
 
 // ---- At home ----
 
@@ -6686,36 +6686,57 @@ function deliverReturnedWords(deviceId, words) {
   if (!mirror.undelivered.has(deviceId)) mirror.undelivered.set(deviceId, new Map());
   const held = mirror.undelivered.get(deviceId);
   held.set(frame.id, frame);
-  trimReturnedWords(deviceId, held);
-  // During a transfer they wait for its end, unless they were too large to keep: this is their
-  // one chance then, and a message fits the link beside one window.
-  if (!mirror.laptops.get(deviceId)?.paced || !held.has(frame.id)) window.api.remote.send(deviceId, frame).catch(() => {});
+  trimReturnedWords(deviceId, held, frame.id);
+  sendReturnedWords(deviceId);
 }
 
-// Oldest first, with a line in the audit log that says so and doesn't say what they were.
-function trimReturnedWords(deviceId, held) {
+// Oldest first, with a line in the audit log that says so and doesn't say what they were. Never
+// the newest, which may not have been sent even once.
+function trimReturnedWords(deviceId, held, newestId) {
   const sizes = new Map([...held].map(([id, frame]) => [id, new Blob([frame.text]).size]));
   let total = [...sizes.values()].reduce((sum, bytes) => sum + bytes, 0);
   for (const [id, bytes] of sizes) {
-    if (total <= REMOTE_UNDELIVERED_MAX_BYTES) break;
+    if (total <= REMOTE_UNDELIVERED_MAX_BYTES || id === newestId) break;
     held.delete(id);
     total -= bytes;
+    const laptop = mirror.laptops.get(deviceId);
+    if (laptop?.wordsInFlight.has(id)) forgetWordInFlight(laptop, id);
     window.api.audit.log({ ts: new Date().toISOString(), source: 'remote-action', device: deviceId, kind: 'queued-words-dropped', ok: false }).catch(() => {});
   }
-  if (!held.size) mirror.undelivered.delete(deviceId);
 }
 
-// Called once a snapshot is fully acknowledged, so the link is empty, and there's at most 2 MiB.
-function flushReturnedWords(deviceId) {
-  for (const frame of mirror.undelivered.get(deviceId)?.values() || []) {
-    window.api.remote.send(deviceId, frame).catch(() => {});
+// A word can be as large as a message, so it shares the window with parts from when it's sent
+// until the laptop has it. It waits until it fits, and one thing can always go when nothing else
+// is on its way. It waits for a snapshot to finish too, so the chat it belongs to is there for it.
+function sendReturnedWords(deviceId) {
+  const laptop = mirror.laptops.get(deviceId);
+  if (!laptop || laptop.paced || mirror.needsSnapshot.has(deviceId)) return;
+  for (const [id, frame] of mirror.undelivered.get(deviceId) || []) {
+    if (laptop.wordsInFlight.has(id)) continue;
+    const bytes = new Blob([frame.text]).size;
+    if (laptop.wordBytes > 0 && laptop.wordBytes + bytes > MIRROR_PART_WINDOW_BYTES) return;
+    laptop.wordsInFlight.set(id, bytes);
+    laptop.wordBytes += bytes;
+    const notSent = () => forgetWordInFlight(laptop, id);
+    window.api.remote.send(deviceId, frame).then((sent) => { if (!sent) notSent(); }, notSent);
   }
+}
+
+function forgetWordInFlight(laptop, id) {
+  laptop.wordBytes -= laptop.wordsInFlight.get(id) || 0;
+  laptop.wordsInFlight.delete(id);
 }
 
 function applyQueuedReturnedAck(deviceId, frame) {
   const held = mirror.undelivered.get(deviceId);
   if (!held?.delete(frame.id)) return;
   if (!held.size) mirror.undelivered.delete(deviceId);
+  const laptop = mirror.laptops.get(deviceId);
+  if (!laptop) return;
+  forgetWordInFlight(laptop, frame.id);
+  // The window just opened for whatever was waiting on this.
+  if (laptop.paced) sendNextParts(deviceId, laptop);
+  else sendReturnedWords(deviceId);
 }
 
 // ---- On the laptop ----
@@ -7014,6 +7035,7 @@ const mirror = {
   tooLarge: new Set(),       // chatIds of chats no frame can hold
   chatBytes: new Map(),      // chatId -> size of its snapshot, as last measured
   tooLargeChanged: false,    // one of the tooLarge chats has changed since it was measured
+  transfers: 0,              // snapshot transfers so far, which is how each is numbered
   measuredAt: 0,
   undelivered: new Map(),    // deviceId -> Map of id -> queued-returned frames not yet acknowledged
   dirtyAll: false,
@@ -7021,6 +7043,7 @@ const mirror = {
   timer: null,
   hardwareAsked: false,
   // Watching.
+  statusSeen: false,         // this page has heard from the connection manager
   homes: new Map(),          // deviceId -> { connected, offlineAt, expected, awaitingSnapshot, info, clockOffset }
   hidden: false,             // locked, so remote chats are off the screen
   resumeId: null,            // the remote chat that was open when that happened
@@ -7052,9 +7075,11 @@ function mirrorOnStatus(status) {
   if (status.keysReset) state.remoteKeysReset = true;
   state.remoteStatus = status;
   const devices = status.devices || [];
+  const firstStatus = !mirror.statusSeen;
+  mirror.statusSeen = true;
   for (const device of devices) {
     if (device.role === 'laptop') laptopDeviceStatus(device);
-    else if (device.role === 'home') homeDeviceStatus(device);
+    else if (device.role === 'home') homeDeviceStatus(device, firstStatus);
   }
   for (const id of mirror.homes.keys()) {
     if (!devices.some(d => d.id === id && d.role === 'home')) forgetHome(id);
@@ -7075,7 +7100,7 @@ function mirrorOnFrame(deviceId, frame) {
   if (!frame || typeof frame.type !== 'string') return;
   const role = state.remoteStatus?.devices?.find(d => d.id === deviceId)?.role;
   if (frame.type === 'mirror-resync-request') {
-    if (role === 'laptop') resyncRequested(deviceId);
+    if (role === 'laptop') resyncRequested(deviceId, frame.reload === true);
     return;
   }
   if (frame.type === 'mirror-part-ack') {
@@ -7094,6 +7119,7 @@ function mirrorOnFrame(deviceId, frame) {
   // Only a device this one treats as its home PC gets to put chats here.
   if (role !== 'home') return;
   if (frame.type === 'action-result') { finishAction(deviceId, frame); return; }
+  if (frame.type === 'mirror-part-fence') { acknowledgePart(deviceId, frame); return; }
   if (frame.type === 'queued-returned') { applyQueuedReturned(deviceId, frame); return; }
   if (frame.type === 'mirror-too-large') {
     if (frame.reason === 'stalled') {
@@ -7114,10 +7140,12 @@ function mirrorOnFrame(deviceId, frame) {
   }
   if (frame.type !== 'mirror-ops' && frame.type !== 'mirror-remove' && frame.type !== 'mirror-run') return;
   if (home.awaitingSnapshot) {
-    // A chat that has gone leaves now, not when a long snapshot has finished.
-    if (frame.type === 'mirror-remove' && home.nextPart && frame.seq === home.expected && typeof frame.chatId === 'string') {
+    // A chat that has gone leaves now, not when a long snapshot has finished. And it stays gone:
+    // parts from this transfer can still come, but only a new one can bring it back.
+    if (frame.type === 'mirror-remove' && typeof frame.chatId === 'string') {
       const key = remoteChatKey(deviceId, frame.chatId);
-      home.expected = frame.seq + 1;
+      if (frame.seq === home.expected) home.expected = frame.seq + 1;
+      home.removedInTransfer.set(frame.chatId, home.transfer);
       home.incoming?.delete(key);
       dropRemoteChat(key);
     }
@@ -7129,6 +7157,7 @@ function mirrorOnFrame(deviceId, frame) {
   }
   home.expected = frame.seq + 1;
   if (typeof frame.chatId !== 'string') return;
+  if (home.removedInTransfer.has(frame.chatId)) return;
   const key = remoteChatKey(deviceId, frame.chatId);
   if (frame.type === 'mirror-remove') dropRemoteChat(key);
   else if (frame.type === 'mirror-run') {
@@ -7156,7 +7185,8 @@ function addLaptop(deviceId) {
   if (!mirror.laptops.has(deviceId)) {
     mirror.laptops.set(deviceId, {
       seq: 0, failures: 0, retryTimer: null,
-      paced: null, transfers: 0, lastResyncAt: 0, resyncTimer: null
+      paced: null, lastResyncAt: 0, resyncTimer: null, reloaded: false,
+      wordsInFlight: new Map(), wordBytes: 0
     });
   }
   mirror.needsSnapshot.add(deviceId);
@@ -7165,26 +7195,43 @@ function addLaptop(deviceId) {
 
 // A snapshot means measuring every shared chat, so a laptop can't ask for them as fast as it can
 // send. One request in the gap is kept for the end of it, because that one may be the one that
-// matters. While one is on its way a request means nothing: another would fill the link.
-function resyncRequested(deviceId) {
+// matters. While one is on its way a request means nothing, because another would fill the link.
+// The exception is a page that has just loaded, which may have lost parts of it.
+function resyncRequested(deviceId, reloaded) {
   const laptop = mirror.laptops.get(deviceId);
   if (!laptop) {
     addLaptop(deviceId);
     return;
   }
-  if (laptop.paced) return;
+  if (reloaded) laptop.reloaded = true;
+  if (laptop.paced && !laptop.reloaded) return;
   const wait = laptop.lastResyncAt + MIRROR_RESYNC_MIN_MS - Date.now();
   if (wait <= 0) {
-    laptop.lastResyncAt = Date.now();
-    addLaptop(deviceId);
+    answerResync(deviceId, laptop);
   } else if (laptop.resyncTimer === null) {
     laptop.resyncTimer = setTimeout(() => {
       laptop.resyncTimer = null;
-      if (mirror.laptops.get(deviceId) !== laptop || laptop.paced) return;
-      laptop.lastResyncAt = Date.now();
-      addLaptop(deviceId);
+      if (mirror.laptops.get(deviceId) === laptop && (!laptop.paced || laptop.reloaded)) answerResync(deviceId, laptop);
     }, wait);
   }
+}
+
+function answerResync(deviceId, laptop) {
+  laptop.lastResyncAt = Date.now();
+  if (laptop.reloaded) {
+    laptop.reloaded = false;
+    // Whatever was on its way to the old page may have landed with nobody there.
+    laptop.wordsInFlight.clear();
+    laptop.wordBytes = 0;
+    if (laptop.paced) {
+      // Parts lost in the gap will never be acked, and later ones may not come to say so. This
+      // follows them through the link, and its ack says they've all left it.
+      window.api.remote.send(deviceId, { type: 'mirror-part-fence', transfer: laptop.paced.transfer, part: laptop.paced.next }).catch(() => {});
+      markTransferToRestart(deviceId, laptop);
+      return;
+    }
+  }
+  addLaptop(deviceId);
 }
 
 function dropLaptop(deviceId) {
@@ -7233,9 +7280,10 @@ function sendToLaptop(deviceId, frame) {
 // is coming for what wasn't sent.
 function mirrorFrameFailed(deviceId) {
   const laptop = mirror.laptops.get(deviceId);
-  if (!laptop || laptop.retryTimer !== null) return;
-  console.warn('A mirror frame could not be sent. Sending a new snapshot.');
+  if (!laptop) return;
   laptop.paced = null;
+  if (laptop.retryTimer !== null) return;
+  console.warn('A mirror frame could not be sent. Sending a new snapshot.');
   const delay = Math.min(MIRROR_RETRY_MS * 2 ** laptop.failures, MIRROR_RETRY_MAX_MS);
   laptop.failures += 1;
   laptop.retryTimer = setTimeout(() => {
@@ -7304,7 +7352,7 @@ function mirrorTick() {
   mirror.dirty = new Set();
 
   const shared = sharedChats();
-  sendMirrorChanges(shared, everything, dirty);
+  const sharedSetChanged = sendMirrorChanges(shared, everything, dirty);
 
   if (everything) {
     const details = JSON.stringify(mirrorHomeDetails());
@@ -7312,6 +7360,12 @@ function mirrorTick() {
       // These change rarely, and only a snapshot carries them.
       mirror.sentHome = details;
       for (const id of mirror.laptops.keys()) mirror.needsSnapshot.add(id);
+    }
+  }
+  // A transfer under way has the wrong chats in it now. Its held frames go in this same tick.
+  if (sharedSetChanged) {
+    for (const [id, laptop] of mirror.laptops) {
+      if (laptop.paced) mirror.needsSnapshot.add(id);
     }
   }
   // A chat crossing the limit changes what every laptop is sent, so they all need to know. One
@@ -7326,9 +7380,12 @@ function mirrorTick() {
   if ([...shared.keys()].some(id => state.runningChats.has(id))) scheduleMirrorTick(MIRROR_TICK_MS);
 }
 
+// True if the set of shared chats has changed.
 function sendMirrorChanges(shared, everything, dirty) {
+  let setChanged = false;
   for (const id of mirror.sent.keys()) {
     if (shared.has(id)) continue;
+    setChanged = true;
     mirror.sent.delete(id);
     mirror.sentRunning.delete(id);
     mirror.tooLarge.delete(id);
@@ -7336,6 +7393,7 @@ function sendMirrorChanges(shared, everything, dirty) {
   }
   for (const [id, c] of shared) {
     const running = state.runningChats.has(id);
+    if (!mirror.sent.has(id)) setChanged = true;
     if (everything || running || dirty.has(id) || !mirror.sent.has(id)) {
       const next = ChatMirror.snapshotChat(c);
       const ops = ChatMirror.diffChat(mirror.sent.get(id) || null, next);
@@ -7349,6 +7407,7 @@ function sendMirrorChanges(shared, everything, dirty) {
       if (!mirror.tooLarge.has(id)) sendToLaptops({ type: 'mirror-run', chatId: id, running });
     }
   }
+  return setChanged;
 }
 
 // Sizes every chat in mirror.sent. True if one has crossed the limit that a frame can hold, either
@@ -7378,10 +7437,12 @@ function measureSharedChats() {
 function sendMirrorSnapshot(deviceId) {
   const laptop = mirror.laptops.get(deviceId);
   if (!laptop) return;
-  if (!laptop.paced) {
-    startMirrorTransfer(deviceId, laptop);
-    return;
-  }
+  if (laptop.paced) markTransferToRestart(deviceId, laptop);
+  else startMirrorTransfer(deviceId, laptop);
+}
+
+// No more of its parts go, and what it was holding is out of date, so that goes now.
+function markTransferToRestart(deviceId, laptop) {
   const { paced } = laptop;
   paced.restart = true;
   paced.held = [];
@@ -7389,10 +7450,12 @@ function sendMirrorSnapshot(deviceId) {
   if (paced.acked === paced.next) restartMirrorTransfer(deviceId, laptop);
 }
 
+// Numbered across laptops and connections, so a number can't come round again while a laptop
+// still remembers it.
 function startMirrorTransfer(deviceId, laptop) {
-  laptop.transfers += 1;
+  mirror.transfers += 1;
   laptop.paced = {
-    transfer: laptop.transfers, parts: mirrorSnapshotParts(), next: 0, acked: 0, inFlightBytes: 0,
+    transfer: mirror.transfers, parts: mirrorSnapshotParts(), next: 0, acked: 0, inFlightBytes: 0,
     held: [], heldBytes: 0, overflowed: false, restart: false, progressAt: Date.now()
   };
   sendNextParts(deviceId, laptop);
@@ -7438,7 +7501,8 @@ function sendNextParts(deviceId, laptop) {
     const { entries, bytes } = paced.parts[paced.next];
     const inFlight = paced.next - paced.acked;
     if (inFlight >= MIRROR_PART_WINDOW) return;
-    if (inFlight > 0 && paced.inFlightBytes + bytes > MIRROR_PART_WINDOW_BYTES) return;
+    const outstanding = paced.inFlightBytes + laptop.wordBytes;
+    if (outstanding > 0 && outstanding + bytes > MIRROR_PART_WINDOW_BYTES) return;
     paced.next += 1;
     paced.inFlightBytes += bytes;
     sendToLaptop(deviceId, {
@@ -7452,20 +7516,26 @@ function sendNextParts(deviceId, laptop) {
 // A laptop that stays connected and never acks only holds up itself. Nothing ends the session for
 // it, and it's told, so it can say so and ask again.
 function dropStalledTransfer(deviceId, laptop) {
-  if (!laptop.paced || Date.now() - laptop.paced.progressAt < MIRROR_TRANSFER_STALL_MS) return;
+  const { paced } = laptop;
+  if (!paced || Date.now() - paced.progressAt < MIRROR_TRANSFER_STALL_MS) return;
   laptop.paced = null;
   console.warn('A snapshot stopped being acknowledged, and was dropped.');
   window.api.remote.send(deviceId, { type: 'mirror-too-large', reason: 'stalled' }).catch(() => {});
+  // One that was waiting to restart has waited long enough.
+  if (paced.restart) restartMirrorTransfer(deviceId, laptop);
 }
 
-// Only the next part of the current transfer counts, so a laptop can't rush the window open.
+// An ack covers every part up to it, because the link is ordered: earlier ones have left it, even
+// if a page reload missed them. Only parts of this transfer that have been sent can be acked.
 function applyMirrorPartAck(deviceId, frame) {
   const laptop = mirror.laptops.get(deviceId);
   const paced = laptop?.paced;
   if (!paced || frame.transfer !== paced.transfer) return;
-  if (frame.part !== paced.acked + 1 || paced.acked >= paced.next) return;
-  paced.inFlightBytes -= paced.parts[paced.acked].bytes;
-  paced.acked += 1;
+  if (!Number.isSafeInteger(frame.part) || frame.part <= paced.acked || frame.part > paced.next) return;
+  while (paced.acked < frame.part) {
+    paced.inFlightBytes -= paced.parts[paced.acked].bytes;
+    paced.acked += 1;
+  }
   paced.progressAt = Date.now();
   if (paced.restart) {
     if (paced.acked === paced.next) restartMirrorTransfer(deviceId, laptop);
@@ -7481,7 +7551,10 @@ function applyMirrorPartAck(deviceId, frame) {
     scheduleMirrorTick(0);
     return;
   }
-  for (const held of paced.held) sendToLaptop(deviceId, held);
+  // A change to what's shared would have restarted this, but a tick may not have seen one yet.
+  for (const held of paced.held) {
+    if (sharedChatById(held.chatId)) sendToLaptop(deviceId, held);
+  }
   finishMirrorSnapshot(deviceId);
 }
 
@@ -7493,7 +7566,7 @@ function finishMirrorSnapshot(deviceId) {
     if (!mirror.tooLarge.has(id)) sendToLaptop(deviceId, { type: 'mirror-run', chatId: id, running: mirror.sentRunning.has(id), now: Date.now() });
   }
   // After the snapshot, so a chat the words belong to is there for them to go back to.
-  flushReturnedWords(deviceId);
+  sendReturnedWords(deviceId);
 }
 
 // ---- Watching ----
@@ -7511,7 +7584,8 @@ function mirrorHome(deviceId) {
   if (!home) {
     home = {
       connected: false, offlineAt: null, expected: null, awaitingSnapshot: true, info: null, clockOffset: 0,
-      snapshotWaitMs: MIRROR_SNAPSHOT_WAIT_MS, snapshotTimer: null
+      snapshotWaitMs: MIRROR_SNAPSHOT_WAIT_MS, snapshotTimer: null,
+      transfer: null, removedInTransfer: new Map(), justLoaded: false
     };
     mirror.homes.set(deviceId, home);
   }
@@ -7520,7 +7594,11 @@ function mirrorHome(deviceId) {
 
 function requestMirrorSnapshot(deviceId, home) {
   home.awaitingSnapshot = true;
-  window.api.remote.send(deviceId, { type: 'mirror-resync-request' }).catch(() => {});
+  const frame = { type: 'mirror-resync-request' };
+  // Only this page can know. The home PC ignores any other request during a transfer.
+  if (home.justLoaded) frame.reload = true;
+  home.justLoaded = false;
+  window.api.remote.send(deviceId, frame).catch(() => {});
   watchForSnapshot(deviceId, home);
 }
 
@@ -7535,20 +7613,24 @@ function watchForSnapshot(deviceId, home) {
 }
 
 function acknowledgePart(deviceId, frame) {
-  if (Number.isSafeInteger(frame.transfer)) {
+  if (Number.isSafeInteger(frame.transfer) && Number.isSafeInteger(frame.part)) {
     window.api.remote.send(deviceId, { type: 'mirror-part-ack', part: frame.part, transfer: frame.transfer }).catch(() => {});
   }
 }
 
 // The home PC sends a snapshot when it sees this device connect, so that normally just arrives.
 // It won't if only this end started again, which is why it gets asked after a moment.
-function homeDeviceStatus(device) {
+function homeDeviceStatus(device, firstStatus) {
   const home = mirrorHome(device.id);
   if (device.connected === home.connected) return;
   home.connected = device.connected;
   home.awaitingSnapshot = true;
   home.nextPart = null;
   home.snapshotWaitMs = MIRROR_SNAPSHOT_WAIT_MS;
+  home.transfer = null;
+  home.removedInTransfer.clear();
+  // Connected before this page had heard anything means the page is new, not the connection.
+  home.justLoaded = firstStatus && device.connected;
   clearTimeout(home.snapshotTimer);
   home.offlineAt = device.connected ? null : Date.now();
   if (device.connected) {
@@ -7633,7 +7715,16 @@ function applyMirrorSnapshot(deviceId, home, frame) {
   home.info = ChatMirror.cleanHome(frame.home);
   home.clockOffset = Number.isFinite(frame.now) ? frame.now - Date.now() : 0;
   home.expected = frame.seq + 1;
-  if (!parted || frame.part === 1) home.incoming = new Set();
+  const transfer = Number.isSafeInteger(frame.transfer) ? frame.transfer : null;
+  if (!parted || frame.part === 1) {
+    home.incoming = new Set();
+    // A transfer that began after a removal knows about it, so what's in this one is shared now.
+    for (const [chatId, removedFrom] of home.removedInTransfer) {
+      if (removedFrom !== transfer) home.removedInTransfer.delete(chatId);
+    }
+  }
+  home.transfer = transfer;
+  home.justLoaded = false;
   const { incoming } = home;
   const more = parted && frame.part < frame.of;
   home.nextPart = more ? frame.part + 1 : null;
@@ -7643,7 +7734,7 @@ function applyMirrorSnapshot(deviceId, home, frame) {
   else clearTimeout(home.snapshotTimer);
 
   for (const raw of frame.chats) {
-    if (!raw || typeof raw.id !== 'string') continue;
+    if (!raw || typeof raw.id !== 'string' || home.removedInTransfer.has(raw.id)) continue;
     const key = remoteChatKey(deviceId, raw.id);
     incoming.add(key);
     // One chat that can't be applied or drawn mustn't stop the ones after it.
