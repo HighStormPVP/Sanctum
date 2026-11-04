@@ -6,7 +6,7 @@
 
 **Architecture:** Three layers. A Cloudflare Worker handles finding devices and carries relay traffic, but only ever sees ciphertext. A main-process layer (`lib/remote/`) holds keys, runs end-to-end encryption, and moves frames over WebRTC or the relay with no loss during a switch. A renderer layer diffs chat state into mirror frames, applies them on the laptop, routes laptop actions into the home chat loop, and routes tool calls to the named device.
 
-**Tech Stack:** Electron 33 (Node 20, CommonJS), `ws`, `@noble/curves` 1.x, `@noble/ciphers` 1.x, `@noble/hashes` 1.x, `cpace-ts`, Cloudflare Workers with Durable Objects (WebSocket Hibernation API), Miniflare for local tests, `node:test`, `playwright-core` for two-instance tests.
+**Tech Stack:** Electron 33 (Node 20, CommonJS), `ws`, `@noble/curves` 1.x, `@noble/ciphers` 1.x, `@noble/hashes` 1.x, Cloudflare Workers with Durable Objects (WebSocket Hibernation API), Miniflare for local tests, `node:test`, `playwright-core` for two-instance tests.
 
 **Spec:** `docs/superpowers/specs/2026-11-04-remote-control-design.md`. Read it first. This plan decides how; the spec decides what.
 
@@ -68,7 +68,7 @@
 ### Task 1: Crypto wrappers and pairing key agreement
 
 **Files:**
-- Modify: `package.json` (add `@noble/curves`, `@noble/ciphers`, `@noble/hashes` at latest 1.x, exact versions; `cpace-ts`, `ws`)
+- Modify: `package.json` (add, at these exact versions: `@noble/curves` 1.9.7, `@noble/ciphers` 1.3.0, `@noble/hashes` 1.8.0, `ws` 8.22.1)
 - Create: `lib/remote/crypto.js`, `lib/remote/pake.js`
 - Test: `test/remote-crypto.test.js`
 
@@ -80,12 +80,29 @@
   - `hkdf(ikm, salt, info, length)`
   - `seal(key, nonce, plaintext, aad)`, `open(key, nonce, ciphertext, aad)` (XChaCha20-Poly1305; `open` throws on tampering)
   - `deviceIdFromPublicKey(publicKey) -> string` (16 lowercase base32 characters of SHA-256)
-- Produces, from `pake.js`: `pakeStart(code, role) -> { message, finish(peerMessage) -> sharedKey }`, where `role` is `'home'` or `'laptop'`.
+- Produces, from `pake.js`: `pakeStart(code, role) -> { message, finish(peerMessage) -> { sharedKey, confirmMessage, verifyConfirm(peerConfirm) -> bool } }`, where `role` is `'home'` (SPAKE2's A) or `'laptop'` (SPAKE2's B). `finish` throws on an invalid peer message.
+- Also exports `spake2ForTest({ w, x, role, idA, idB, aad })` so tests can inject the values the RFC's vectors fix. It isn't used in production paths.
 
-- [ ] **Step 1: Write failing tests.** `require` loads all three noble packages and `ws` in CJS. Sign and verify round-trips, and a flipped bit fails. `seal`/`open` round-trips, and a flipped bit or wrong AAD throws. `hkdf` matches an RFC 5869 vector. The same code on both roles gives an equal key. Different codes give unequal keys. Neither `message` contains the code or an unsalted hash of it.
+**Owner decision (4 November 2026):** `pake.js` implements RFC 9382's `SPAKE2-P256-SHA256-HKDF-HMAC` on `@noble/curves` P-256. `cpace-ts` was rejected: it can't load through `require` under Electron 33, and its map-to-curve step is a closed WASM blob. This is the only cryptography we write ourselves, so follow the RFC exactly and invent nothing:
+
+- `M` and `N` are the RFC's P-256 constants, copied exactly.
+- `w` comes from `scrypt(code, salt = 'sanctum-pairing-v1', N = 2^15, r = 8, p = 1, 64 bytes)` using Node's `crypto`, then reduced modulo the group order as the RFC says, and must not be 0.
+- `x` and `y` are uniform random nonzero scalars from the curve library's random scalar function.
+- `idA` is `'sanctum-home'`, `idB` is `'sanctum-laptop'`, and `AAD` is `'sanctum-pairing-v1'`.
+- Reject a peer point that doesn't decode to a valid curve point, or that is the identity after the mask is removed. Compare confirmation MACs in constant time.
+
+- [ ] **Step 1: Write failing tests.**
+  - `require` loads all three noble packages and `ws` in CJS.
+  - Sign and verify round-trips, and a flipped bit fails. `seal`/`open` round-trips, and a flipped bit or wrong AAD throws. `hkdf` matches an RFC 5869 vector.
+  - **Every `SPAKE2-P256-SHA256-HKDF-HMAC` test vector in RFC 9382 Appendix B passes** through `spake2ForTest`: `pA`, `pB`, the transcript, the keys, and both confirmation MACs. Fetch the vectors from the RFC and paste them into the test.
+  - `M` and `N` in the code equal the RFC's values.
+  - The same code on both roles gives an equal `sharedKey`, and each side's `verifyConfirm` accepts the other's `confirmMessage`.
+  - Different codes give unequal keys, and `verifyConfirm` returns false on both sides.
+  - Tampered messages: the identity point, an off-curve point, and wrong-length bytes all throw from `finish`. A flipped confirmation byte returns false.
+  - Neither `message` contains the code or an unsalted hash of it. Two `pakeStart` calls with one code give different messages.
 - [ ] **Step 2: Run** `node --test test/remote-crypto.test.js`. Expected: FAIL, modules missing.
-- [ ] **Step 3: Implement both files.** `pake.js` wraps `cpace-ts`. Add a test of the library against the published CPace test vectors. **Decision gate:** if `cpace-ts` fails those vectors, can't load through `require`, or depends on unreviewed crypto of its own, stop and tell the owner. The fallback is RFC 9382 SPAKE2 over `@noble/curves` P-256, checked against the RFC's vectors, which the spec's "no home-made cryptography" rule makes the owner's call.
-- [ ] **Step 4: Run tests.** Expected: PASS. Also run the `require` check under Electron: `node_modules/.bin/electron -e` with `ELECTRON_RUN_AS_NODE=1` set for that one command. Expected: loads with no error.
+- [ ] **Step 3: Implement both files.**
+- [ ] **Step 4: Run tests.** Expected: PASS. Also run the `require` check under Electron 33's own Node by running its binary directly with `ELECTRON_RUN_AS_NODE=1` set for that one command, on a small script that loads `lib/remote/crypto.js` and `lib/remote/pake.js` and completes one exchange. Expected: prints the matching result with no error.
 - [ ] **Step 5: Commit.**
 
 ---

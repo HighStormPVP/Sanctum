@@ -107,7 +107,7 @@ How it works:
 **Encryption**
 
 - End-to-end between the two devices, with fresh session keys on each connection, so a key stolen later can't decrypt recorded traffic.
-- Use a vetted library. No home-made cryptography. The choice of library is Builder.
+- Use vetted libraries for all cryptographic primitives, and invent no cryptography. The one piece written here is the pairing exchange: the owner chose RFC 9382 SPAKE2 on `@noble/curves` P-256, checked against the RFC's test vectors and by independent review, after the available library proved unsuitable.
 
 **PIN (Owner, details are Call)**
 
@@ -206,7 +206,7 @@ Each home PC sends its own stream to each connected device. If two laptops are c
 
 ## Left to the builder
 
-- Crypto and WebSocket library choices, and the PAKE variant, as long as it's a maintained implementation of a standard one.
+- Crypto and WebSocket library choices, apart from the pairing exchange above.
 - Message format, sequence numbering, chunk sizes, and batching.
 - Reconnect timing and exact limits.
 - How the event stream is introduced into `renderer.js`.
