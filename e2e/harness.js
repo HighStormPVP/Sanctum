@@ -79,9 +79,9 @@ async function startFakeOllama() {
 
 // `flags` become SANCTUM_REMOTE_TEST, which main.js reads only in an unpackaged app. The
 // default keeps to this machine's own networking. Without no-stun an instance also asks the
-// real STUN server for its address, as the shipped app does.
-async function launchDevice(name, { flags = 'log,no-stun', ollamaUrl }) {
-  const profile = fs.mkdtempSync(path.join(os.tmpdir(), `sanctum-e2e-${name}-`));
+// real STUN server for its address, as the shipped app does. Passing the `profile` of an
+// instance that has quit restarts that instance.
+async function launchDevice(name, { flags = 'log,no-stun', ollamaUrl, profile = fs.mkdtempSync(path.join(os.tmpdir(), `sanctum-e2e-${name}-`)) }) {
   const env = { ...process.env, OLLAMA_URL: ollamaUrl, SANCTUM_REMOTE_TEST: flags };
   delete env.ELECTRON_RUN_AS_NODE;
   const app = await electron.launch({
@@ -99,12 +99,18 @@ async function launchDevice(name, { flags = 'log,no-stun', ollamaUrl }) {
   const page = await app.firstWindow();
   await page.waitForLoadState('domcontentloaded');
   await waitFor(`${name}'s window.api.remote`, () => page.evaluate(() => Boolean(window.api?.remote)));
-  // Keep everything the renderer is handed, to look at later.
+  // Keep everything the renderer is handed, to look at later. The app's mirror talks over any
+  // live connection by itself, so its frames go in a list of their own, and __frames holds
+  // only what a test sent.
   const record = () =>
     page.evaluate(() => {
       window.__frames = [];
+      window.__mirrorFrames = [];
       window.__statuses = [];
-      window.api.remote.onFrame((deviceId, frame) => window.__frames.push(frame));
+      window.api.remote.onFrame((deviceId, frame) => {
+        const mirrored = typeof frame.type === 'string' && frame.type.startsWith('mirror-');
+        (mirrored ? window.__mirrorFrames : window.__frames).push(frame);
+      });
       window.api.remote.onStatus((status) => window.__statuses.push(status));
     });
   await record();
@@ -125,6 +131,7 @@ async function launchDevice(name, { flags = 'log,no-stun', ollamaUrl }) {
     // Comes up the first time a connection needs it.
     transport: () => waitFor(`${name}'s hidden window`, () => app.windows().find((w) => w.url().includes(TRANSPORT_PAGE))),
     frames: () => page.evaluate(() => window.__frames),
+    mirrorFrames: () => page.evaluate(() => window.__mirrorFrames),
     frameCount: () => page.evaluate(() => window.__frames.length),
     windowCount: () => app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows().length),
     hiddenWindowFacts: () =>
@@ -141,13 +148,16 @@ async function launchDevice(name, { flags = 'log,no-stun', ollamaUrl }) {
           sessionPersists: win.webContents.session.isPersistent()
         };
       }, TRANSPORT_PAGE),
-    async stop() {
+    async quit() {
       if (!exited) {
         await Promise.race([app.close().catch(() => {}), sleep(20000)]);
         if (!exited) child.kill();
       }
       await waitFor(`${name} to exit`, () => exited, 10000).catch(() => {});
       await sleep(100); // Windows holds the profile's files for a moment after exit
+    },
+    async stop() {
+      await device.quit();
       fs.rmSync(profile, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
     }
   };
@@ -170,11 +180,12 @@ async function pair(home, laptop, address) {
   return assert.fail('the pairing slot never opened');
 }
 
-// A relay, a fake Ollama, and two paired instances with live sessions.
-async function startPair({ flags } = {}) {
+// A relay, a fake Ollama, and two paired instances with live sessions. A test that needs its
+// own fake Ollama at home passes it as `homeOllama`, and stops it itself.
+async function startPair({ flags, homeOllama } = {}) {
   const relay = await startRelay();
   const ollama = await startFakeOllama();
-  const home = await launchDevice('home', { flags, ollamaUrl: ollama.url });
+  const home = await launchDevice('home', { flags, ollamaUrl: (homeOllama ?? ollama).url });
   const laptop = await launchDevice('laptop', { flags, ollamaUrl: ollama.url });
   await pair(home, laptop, relay.address);
   await waitFor('the session on both ends', async () => (await home.entry())?.connected && (await laptop.entry())?.connected);
@@ -188,7 +199,8 @@ async function startPair({ flags } = {}) {
     homeId,
     laptopId,
     async stop() {
-      await Promise.all([home.stop(), laptop.stop()]);
+      // Through the object, since a test that restarts an instance puts the new one there.
+      await Promise.all([this.home.stop(), this.laptop.stop()]);
       await relay.stop();
       await ollama.stop();
     }

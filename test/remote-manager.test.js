@@ -3981,3 +3981,10 @@ test('shutting down closes the direct path', async (t) => {
   home.manager.shutdown();
   assert.deepEqual(home.direct.of('close'), [['close', laptop.id]]);
 });
+
+test('status names this device, so a home PC can tell its laptops what it is called', async (t) => {
+  const world = newWorld(t);
+  const device = await world.device('  Study PC  ');
+  device.start();
+  assert.equal(device.manager.status().name, 'Study PC');
+});
