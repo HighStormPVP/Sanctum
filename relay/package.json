@@ -2,12 +2,17 @@
   "name": "sanctum-relay",
   "version": "0.0.0",
   "private": true,
-  "description": "Sanctum Remote Control relay: a Cloudflare Worker that passes encrypted frames between the owner's devices.",
+  "description": "Sanctum Remote Control relay: a Cloudflare Worker that passes encrypted frames between the owner's devices. Test-only dependencies live here, not in the app's package.json. To run the tests: `npm ci` in the repo root, then `npm ci --prefix relay`, then `npm run test:relay` from the root. Needs Node 22 or later because of Miniflare.",
   "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
-    "deploy": "wrangler deploy"
+    "test": "node --test test/",
+    "deploy": "npx wrangler@4 deploy"
   },
   "devDependencies": {
-    "wrangler": "^4.0.0"
+    "miniflare": "4.20260730.0",
+    "ws": "8.22.1"
   }
 }
