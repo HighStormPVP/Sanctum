@@ -198,6 +198,39 @@ function fakeRelay() {
   return relay;
 }
 
+// The secret's file, in memory, with sealing that visibly changes the bytes.
+function fakeAutoUnlock() {
+  const store = { bytes: null, writes: 0, failProtect: false, failUnprotect: false };
+  return {
+    store,
+    read: () => store.bytes,
+    write(bytes) {
+      store.bytes = Buffer.from(bytes);
+      store.writes += 1;
+    },
+    remove() {
+      store.bytes = null;
+    },
+    protect(bytes) {
+      if (store.failProtect) throw new Error('no secure storage');
+      return Buffer.concat([Buffer.from('sealed:'), Buffer.from(bytes).reverse()]);
+    },
+    unprotect(bytes) {
+      if (store.failUnprotect) throw new Error('no secure storage');
+      return Buffer.from(bytes).subarray('sealed:'.length).reverse();
+    }
+  };
+}
+
+// For what finishes on the thread pool: the keystore's scrypt.
+async function until(what, check) {
+  for (let i = 0; i < 2000; i++) {
+    if (check()) return;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.fail(`timed out waiting for ${what}`);
+}
+
 function newWorld(t) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sanctum-manager-'));
   const world = { clock: fakeClock(), relay: fakeRelay(), devices: [], keystoreOffset: 0 };
@@ -206,18 +239,19 @@ function newWorld(t) {
     fs.rmSync(dir, { recursive: true, force: true });
   });
   let count = 0;
-  world.keystore = () =>
+  world.newFile = () => path.join(dir, `keys-${count++}.json`);
+  world.keystore = (file = world.newFile()) =>
     createKeystore({
-      file: path.join(dir, `keys-${count++}.json`),
+      file,
       protect: (bytes) => bytes,
       unprotect: (bytes) => bytes,
       kdfCost: FAST,
       now: () => Date.now() + world.keystoreOffset
     });
   // A device with a PIN set, whose manager isn't running yet, so a test can seed peers.
-  world.device = async (name, { pin = true, address = ADDRESS, keystore = world.keystore() } = {}) => {
+  world.device = async (name, { pin = true, address = ADDRESS, file = world.newFile(), keystore = world.keystore(file) } = {}) => {
     if (pin) assert.deepEqual(await keystore.setPin(PIN), { ok: true });
-    const device = { name, keystore, frames: [], statuses: [], address };
+    const device = { name, keystore, file, autoUnlock: fakeAutoUnlock(), frames: [], statuses: [], address };
     device.identity = () => keystore.getIdentity();
     device.id = pin ? deviceIdFromPublicKey(keystore.getIdentity().publicKey) : null;
     device.start = () => {
@@ -230,6 +264,7 @@ function newWorld(t) {
             device.address = url;
           }
         },
+        autoUnlock: device.autoUnlock,
         clock: world.clock,
         deviceName: name
       });
@@ -238,6 +273,14 @@ function newWorld(t) {
       return device;
     };
     device.entry = (id) => device.manager.status().devices.find((entry) => entry.id === id);
+    // The app restarting: same files, nothing in memory.
+    device.restart = () => {
+      device.manager.shutdown();
+      device.keystore = world.keystore(device.file);
+      device.identity = () => device.keystore.getIdentity();
+      keystore = device.keystore;
+      return device.start();
+    };
     world.devices.push(device);
     return device;
   };
@@ -334,7 +377,7 @@ function rawHost(relay, { code, identity = newIdentity(), name = 'Host' }) {
 
 // Pairs through the real flow and returns what `pair` answered.
 async function pairNow(world, home, laptop, name = 'Laptop') {
-  const { code } = home.manager.createCode();
+  const { code } = await home.manager.createCode();
   assert.ok(code);
   world.relay.pump();
   const answer = laptop.manager.pair(code, name);
@@ -355,7 +398,7 @@ test('with no address, status says disabled and no client is created', async (t)
   assert.equal(status.enabled, false);
   assert.equal(world.relay.deviceConnects.length, 0);
   assert.equal(world.relay.pairConnects.length, 0);
-  assert.ok(device.manager.createCode().error);
+  assert.ok((await device.manager.createCode()).error);
   assert.equal(world.relay.pairConnects.length, 0);
   const paired = await device.manager.pair('ABCDEF', 'Device');
   assert.equal(paired.ok, false);
@@ -412,7 +455,7 @@ test('while locked no connection starts, and unlock starts them', async (t) => {
   assert.equal(world.relay.deviceConnects.length, 0);
 
   // Nothing that opens a connection works yet.
-  assert.ok(device.manager.createCode().error);
+  assert.ok((await device.manager.createCode()).error);
   assert.equal((await device.manager.pair('ABCDEF', 'Device')).ok, false);
   assert.equal(world.relay.pairConnects.length, 0);
 
@@ -470,7 +513,7 @@ test('a pairing on both ends lists each device with the right role and fingerpri
   home.start();
   laptop.start();
 
-  const created = home.manager.createCode();
+  const created = await home.manager.createCode();
   assert.match(created.code, /^[2-9A-Z]{6}$/);
   assert.equal(created.expiresAt, world.clock.now() + 10 * MINUTES);
   assert.equal(home.manager.status().codePending, true);
@@ -513,7 +556,7 @@ test('home side: the manager discards a code after 10 minutes without the relay 
   const world = newWorld(t);
   const home = await world.device('Home');
   home.start();
-  const { code } = home.manager.createCode();
+  const { code } = await home.manager.createCode();
   world.relay.pump();
   const hostClient = world.relay.pairConnects[0];
 
@@ -537,7 +580,7 @@ test('home side: attempts running out and then 15 seconds of nothing cancels the
   const world = newWorld(t);
   const home = await world.device('Home');
   home.start();
-  const { code } = home.manager.createCode();
+  const { code } = await home.manager.createCode();
   world.relay.pump();
   const wrong = code === '222222' ? '333333' : '222222';
 
@@ -558,7 +601,7 @@ test('home side: the fifth attempt can still complete inside those 15 seconds', 
   const world = newWorld(t);
   const home = await world.device('Home');
   home.start();
-  const { code } = home.manager.createCode();
+  const { code } = await home.manager.createCode();
   world.relay.pump();
   const wrong = code === '222222' ? '333333' : '222222';
   for (let i = 0; i < 4; i++) {
@@ -584,7 +627,7 @@ test('home side: a failed result with no attempts left cancels the code at once'
   const world = newWorld(t);
   const home = await world.device('Home');
   home.start();
-  const { code } = home.manager.createCode();
+  const { code } = await home.manager.createCode();
   world.relay.pump();
   const wrong = code === '222222' ? '333333' : '222222';
   for (let i = 0; i < 5; i++) {
@@ -607,9 +650,9 @@ test('home side: a new code replaces the old one, and cancelCode ends it', async
   home.start();
   laptop.start();
 
-  const first = home.manager.createCode();
+  const first = await home.manager.createCode();
   world.relay.pump();
-  const second = home.manager.createCode();
+  const second = await home.manager.createCode();
   world.relay.pump();
   assert.notEqual(first.code, second.code);
   assert.equal(world.relay.pairConnects[0].closed, true);
@@ -623,7 +666,7 @@ test('home side: a new code replaces the old one, and cancelCode ends it', async
   world.relay.pump();
   assert.deepEqual(await old, { ok: false, error: WRONG_CODE_RETRY });
 
-  home.manager.createCode();
+  await home.manager.createCode();
   world.relay.pump();
   home.manager.cancelCode();
   assert.equal(home.manager.status().codePending, false);
@@ -634,7 +677,7 @@ test('home side: the relay ending the slot ends the code', async (t) => {
   const world = newWorld(t);
   const home = await world.device('Home');
   home.start();
-  home.manager.createCode();
+  await home.manager.createCode();
   world.relay.pump();
   world.relay.pairConnects[0].opts.onClose();
   assert.equal(home.manager.status().codePending, false);
@@ -722,7 +765,7 @@ test('a one-sided pairing: home has the peer, laptop reports failure, and the en
 
   // The last message is lost.
   world.relay.dropPair = ({ role, data }) => role === 'host' && data.t === 'identity';
-  const { code } = home.manager.createCode();
+  const { code } = await home.manager.createCode();
   world.relay.pump();
   const pairing = laptop.manager.pair(code, 'Laptop');
   world.relay.pump();
@@ -749,7 +792,7 @@ test('a one-sided pairing: pairing again works and does not create a duplicate',
   laptop.start();
 
   world.relay.dropPair = ({ role, data }) => role === 'host' && data.t === 'identity';
-  const first = home.manager.createCode();
+  const first = await home.manager.createCode();
   world.relay.pump();
   const pairing = laptop.manager.pair(first.code, 'Laptop');
   world.relay.pump();
@@ -780,7 +823,7 @@ test("a peer's name is untrusted: empty becomes Unnamed device, and it stops at 
   home.start();
 
   async function pairRaw(name) {
-    const { code } = home.manager.createCode();
+    const { code } = await home.manager.createCode();
     world.relay.pump();
     const raw = rawGuest(world.relay, { code, name });
     world.relay.pump();
@@ -861,7 +904,7 @@ test('a device can never pair with itself', async (t) => {
   const world = newWorld(t);
   const device = await world.device('Device');
   device.start();
-  const { code } = device.manager.createCode();
+  const { code } = await device.manager.createCode();
   world.relay.pump();
   const pairing = device.manager.pair(code, 'Device');
   world.relay.pump();
@@ -911,7 +954,7 @@ test('a provisional entry that never connects is dropped after 10 minutes', asyn
   const world = newWorld(t);
   const home = await world.device('Home');
   home.start();
-  const { code } = home.manager.createCode();
+  const { code } = await home.manager.createCode();
   world.relay.pump();
   const raw = rawGuest(world.relay, { code });
   world.relay.pump();
@@ -950,7 +993,7 @@ test('pairing again with the same key does not duplicate a provisional entry, an
   const id = deviceIdFromPublicKey(identity.publicKey);
 
   async function pairRaw() {
-    const { code } = home.manager.createCode();
+    const { code } = await home.manager.createCode();
     world.relay.pump();
     const raw = rawGuest(world.relay, { code, identity });
     world.relay.pump();
@@ -1778,11 +1821,12 @@ test('a stale auth arriving at a restarted handshake does not chase its own tail
 
 // ---- Locking ----
 
-test('after lock, a live connection stays up and works, because the spec says it must', async (t) => {
+test('while idle-locked, a live connection stays up and works', async (t) => {
   const { world, home, laptop } = await connected(t);
   laptop.manager.lock();
   const status = laptop.manager.status();
   assert.equal(status.locked, true);
+  assert.equal(status.idleLocked, true);
   assert.equal(status.devices[0].connected, true);
   assert.equal(laptop.keystore.getIdentity(), null);
 
@@ -1799,31 +1843,27 @@ test('after lock, a live connection stays up and works, because the spec says it
   assert.equal(home.entry(laptop.id).connected, true);
 });
 
-test('while locked no new session starts, even for a paired device', async (t) => {
+test('while idle-locked, a restarted home PC gets a new session with no PIN entered', async (t) => {
   const { world, home, laptop } = await connected(t);
+  const old = liveLinkState(world, home, laptop);
   laptop.manager.lock();
 
-  // The home PC restarts. Its new session has nobody to talk to on this side.
-  const before = auths(world.relay, laptop.id, home.id).length;
   home.manager.shutdown();
   home.start();
   world.relay.pump();
-  world.run(30 * 1000);
-  assert.equal(auths(world.relay, laptop.id, home.id).length, before);
-  assert.equal(home.entry(laptop.id).connected, false);
-
-  // The old connection dies on its own, and stays down until the PIN is entered.
-  world.run(30 * 1000);
-  assert.deepEqual(laptop.manager.status().devices, []);
-  world.run(MINUTES);
-  assert.deepEqual(laptop.manager.status().devices, []);
-
-  assert.equal((await laptop.manager.unlock(PIN)).ok, true);
-  world.run(25 * 1000);
-  assert.equal(laptop.entry(home.id).connected, true);
   assert.equal(home.entry(laptop.id).connected, true);
-});
+  assert.equal(laptop.entry(home.id).connected, true);
+  assert.equal(laptop.keystore.isUnlocked(), false);
+  assert.equal(laptop.manager.status().idleLocked, true);
 
+  const fresh = liveLinkState(world, home, laptop);
+  assert.notDeepEqual(fresh.connectionId, old.connectionId);
+  assert.deepEqual(laptop.frames.pop().frame, { probe: true });
+
+  // And it still holds well past the old session's timeouts.
+  world.run(5 * MINUTES);
+  assert.equal(laptop.entry(home.id).connected, true);
+});
 test('lock with nothing live closes the relay, cancels a code, and aborts a pairing', async (t) => {
   const world = newWorld(t);
   const home = await world.device('Home');
@@ -1831,7 +1871,7 @@ test('lock with nothing live closes the relay, cancels a code, and aborts a pair
   home.start();
   laptop.start();
 
-  home.manager.createCode();
+  await home.manager.createCode();
   world.relay.pump();
   home.manager.lock();
   assert.equal(home.manager.status().codePending, false);
@@ -1864,45 +1904,259 @@ test('a lock that lands during an unlock wins', async (t) => {
   assert.equal(world.relay.deviceConnects.length, 0);
 });
 
-test('a client that was still connecting when the lock came is closed', async (t) => {
+test('a client still connecting when the idle lock comes carries on and signs in', async (t) => {
   const world = newWorld(t);
   const device = await world.device('Device');
   device.keystore.addPeer({ deviceId: 'aaaaaaaaaaaaaaaa', publicKey: newIdentity().publicKey, name: 'Other', role: 'home' });
   device.start();
   assert.equal(world.relay.deviceConnects.length, 1);
   device.manager.lock();
-  assert.equal(world.relay.deviceConnects[0].closed, true);
-  world.run(MINUTES);
-  assert.equal(world.relay.deviceConnects.length, 1);
+  assert.equal(world.relay.deviceConnects[0].closed, false);
+  world.relay.pump();
+  assert.equal(hellos(world.relay, device.id, 'aaaaaaaaaaaaaaaa').length, 1);
 });
-
-test('a reconnect still signing in when the lock comes is closed, even with a live session holding on', async (t) => {
+test('a reconnect still signing in when the idle lock comes finishes, and the session resumes', async (t) => {
   const { world, home, laptop } = await connected(t);
   world.relay.kill(laptop.id);
   world.clock.advance(1000); // the retry has started, and nothing has been delivered to it
   const client = world.relay.deviceConnects[world.relay.deviceConnects.length - 1];
   assert.equal(client.deviceId, laptop.id);
   assert.equal(client.closed, false);
-  assert.ok(laptop.entry(home.id));
 
   laptop.manager.lock();
-  assert.equal(client.closed, true);
+  assert.equal(client.closed, false);
+  world.relay.pump();
+  assert.equal(laptop.entry(home.id).connected, true);
+  home.manager.send(laptop.id, { back: true });
+  world.relay.pump();
+  assert.deepEqual(laptop.frames.pop().frame, { back: true });
 });
-
-test('a relay drop while locked is not retried until unlock', async (t) => {
+test('a relay drop while idle-locked reconnects by itself, with backoff', async (t) => {
   const { world, home, laptop } = await connected(t);
   laptop.manager.lock();
   const count = world.relay.deviceConnects.length;
   world.relay.kill(laptop.id);
-  world.run(5 * MINUTES);
-  assert.equal(world.relay.deviceConnects.length, count);
-  assert.equal((await laptop.manager.unlock(PIN)).ok, true);
-  world.run(1000);
-  assert.equal(world.relay.deviceConnects.length, count + 1);
+  assert.equal(laptop.entry(home.id).connected, false);
+
+  // Long enough that the session is gone too, so this needs a new one.
+  world.relay.refuse = true;
+  world.run(60 * 1000);
+  assert.ok(world.relay.deviceConnects.length > count + 1);
+  world.relay.refuse = false;
   world.run(30 * 1000);
+
+  assert.equal(laptop.manager.status().locked, true);
+  assert.equal(laptop.entry(home.id).connected, true);
+  assert.equal(home.entry(laptop.id).connected, true);
+  home.manager.send(laptop.id, { back: true });
+  laptop.manager.send(home.id, { back: true });
+  world.relay.pump();
+  assert.deepEqual(laptop.frames.pop().frame, { back: true });
+  assert.deepEqual(home.frames.pop().frame, { back: true });
+});
+
+test('after a restart with no PIN entered, no connection starts, even if it was idle-locked before', async (t) => {
+  const { world, home, laptop } = await connected(t);
+  laptop.manager.lock();
+  world.relay.pump();
+  const sent = auths(world.relay, laptop.id, home.id).length;
+
+  laptop.restart();
+  home.manager.shutdown();
+  home.start();
+  world.run(5 * MINUTES);
+
+  const status = laptop.manager.status();
+  assert.equal(status.locked, true);
+  assert.equal(status.idleLocked, false);
+  assert.deepEqual(status.devices, []);
+  assert.equal(world.relay.deviceConnects.filter((client) => client.deviceId === laptop.id).length, 1);
+  assert.equal(auths(world.relay, laptop.id, home.id).length, sent);
+  assert.equal(home.entry(laptop.id).connected, false);
+
+  assert.equal((await laptop.manager.unlock(PIN)).ok, true);
+  world.run(25 * 1000);
   assert.equal(laptop.entry(home.id).connected, true);
 });
 
+test('lock() on a device locked at start grants nothing', async (t) => {
+  const world = newWorld(t);
+  const device = await world.device('Device');
+  device.keystore.addPeer({ deviceId: 'aaaaaaaaaaaaaaaa', publicKey: newIdentity().publicKey, name: 'Other', role: 'home' });
+  device.keystore.lock();
+  device.start();
+  device.manager.lock();
+  world.run(5 * MINUTES);
+  assert.equal(device.manager.status().idleLocked, false);
+  assert.equal(world.relay.deviceConnects.length, 0);
+});
+
+test('while idle-locked, any end of a session brings a new one, with no PIN', async (t) => {
+  const { world, home, laptop } = await connected(t);
+  laptop.manager.lock();
+
+  // A decrypt failure.
+  const first = liveLinkState(world, home, laptop);
+  world.relay.inject(home.id, laptop.id, forgeLink(DATA, first.connectionId, first.nextSeq, new Uint8Array(64)));
+  world.relay.pump();
+  assert.equal(laptop.entry(home.id).connected, true);
+  const second = liveLinkState(world, home, laptop);
+  assert.notDeepEqual(second.connectionId, first.connectionId);
+
+  // 45 seconds of silence.
+  world.relay.drop = ({ to, data }) => to === laptop.id && data.t === 'link';
+  world.run(45 * 1000);
+  world.relay.drop = () => false;
+  world.run(30 * 1000);
+  assert.equal(laptop.entry(home.id).connected, true);
+  const third = liveLinkState(world, home, laptop);
+  assert.notDeepEqual(third.connectionId, second.connectionId);
+  assert.equal(laptop.keystore.isUnlocked(), false);
+});
+
+test('while idle-locked, a stranger still gets nothing', async (t) => {
+  const { world, home, laptop } = await connected(t);
+  laptop.manager.lock();
+  const stranger = newIdentity();
+  const strangerId = deviceIdFromPublicKey(stranger.publicKey);
+  const session = createSession({ identity: stranger, peerPublicKey: newIdentity().publicKey, role: 'home' });
+  world.relay.inject(strangerId, laptop.id, session.hello);
+  world.relay.pump();
+  assert.deepEqual(world.relay.log.filter((m) => m.to === strangerId), []);
+  assert.equal(laptop.manager.status().devices.length, 1);
+});
+
+test('while idle-locked, what a person does stays refused, except turning control off', async (t) => {
+  const { world, home, laptop } = await connected(t);
+  laptop.manager.setControlAllowed(true, { fromLocalUi: true });
+  laptop.manager.setControlAllowed(false, { fromLocalUi: true });
+  laptop.manager.lock();
+  const contacts = world.relay.pairConnects.length;
+
+  assert.ok((await laptop.manager.createCode()).error);
+  assert.equal((await laptop.manager.pair('ABCDEF', 'Laptop', PIN)).ok, false);
+  assert.equal(laptop.manager.removeDevice(home.id).ok, false);
+  assert.equal(laptop.manager.setAddress('wss://other.example/abc').ok, false);
+  assert.equal(laptop.manager.setControlAllowed(true, { fromLocalUi: true }).ok, false);
+  assert.equal(world.relay.pairConnects.length, contacts);
+  assert.equal(laptop.entry(home.id).connected, true);
+  assert.equal(laptop.address, ADDRESS);
+  assert.equal(laptop.keystore.getControlAllowed(), false);
+
+  await laptop.manager.unlock(PIN);
+  laptop.manager.setControlAllowed(true, { fromLocalUi: true });
+  laptop.manager.lock();
+  assert.deepEqual(laptop.manager.setControlAllowed(false, { fromLocalUi: true }), { ok: true });
+  assert.equal(laptop.keystore.getControlAllowed(), false);
+});
+
+test('unlock ends the idle lock and leaves running connections alone', async (t) => {
+  const { world, home, laptop } = await connected(t);
+  const before = liveLinkState(world, home, laptop);
+  laptop.manager.lock();
+  const hellosBefore = hellos(world.relay, laptop.id, home.id).length;
+
+  assert.equal((await laptop.manager.unlock(PIN)).ok, true);
+  world.relay.pump();
+  const status = laptop.manager.status();
+  assert.equal(status.locked, false);
+  assert.equal(status.idleLocked, false);
+  assert.equal(hellos(world.relay, laptop.id, home.id).length, hellosBefore);
+  const after = liveLinkState(world, home, laptop);
+  assert.deepEqual(after.connectionId, before.connectionId);
+  assert.ok((await laptop.manager.createCode()).code);
+});
+
+test('a second unlock queued behind the first changes nothing', async (t) => {
+  const world = newWorld(t);
+  const home = await world.device('Home');
+  const laptop = await world.device('Laptop');
+  seedPair(home, laptop);
+  home.start();
+  world.relay.pump();
+  laptop.keystore.lock();
+  laptop.start();
+
+  // Locked at start: one relay connection and one hello, however many unlocks land.
+  const results = await Promise.all([laptop.manager.unlock(PIN), laptop.manager.unlock(PIN), laptop.manager.unlock('000000')]);
+  assert.deepEqual(results.map((result) => result.ok), [true, true, true]);
+  assert.equal(world.relay.deviceConnects.filter((client) => client.deviceId === laptop.id).length, 1);
+  world.relay.pump();
+  assert.equal(hellos(world.relay, laptop.id, home.id).length, 1);
+  assert.equal(laptop.entry(home.id).connected, true);
+
+  // Idle-locked with a live session: the session isn't touched.
+  const before = liveLinkState(world, home, laptop);
+  const timers = world.clock.pendingTimers();
+  laptop.manager.lock();
+  await Promise.all([laptop.manager.unlock(PIN), laptop.manager.unlock(PIN)]);
+  world.relay.pump();
+  assert.equal(world.clock.pendingTimers(), timers);
+  assert.equal(hellos(world.relay, laptop.id, home.id).length, 1);
+  assert.deepEqual(liveLinkState(world, home, laptop).connectionId, before.connectionId);
+  assert.equal(laptop.manager.status().devices.length, 1);
+});
+
+test('a provisional peer that goes live during an idle lock is confirmed at unlock', async (t) => {
+  const world = newWorld(t);
+  const home = await world.device('Home');
+  const laptop = await world.device('Laptop');
+  seedPair(home, laptop);
+  const { provisional: _none, ...entry } = home.keystore.listPeers()[0];
+  home.keystore.addPeer({ ...entry, provisional: true });
+
+  world.relay.drop = ({ data }) => data.t === 'session-hello' || data.t === 'session-auth';
+  home.start();
+  laptop.start();
+  world.relay.pump();
+  home.manager.lock();
+
+  world.relay.drop = () => false;
+  world.run(25 * 1000);
+  assert.equal(home.entry(laptop.id).connected, true);
+
+  // Past its 10 minutes, and nothing has ended it, since it proved itself.
+  world.run(15 * MINUTES);
+  assert.equal(home.entry(laptop.id).connected, true);
+
+  assert.equal((await home.manager.unlock(PIN)).ok, true);
+  assert.equal(home.keystore.listPeers()[0].provisional, undefined);
+  world.run(15 * MINUTES);
+  assert.equal(home.keystore.listPeers().length, 1);
+  assert.equal(home.entry(laptop.id).connected, true);
+
+  // And it's on disk, so a restart agrees.
+  home.restart();
+  assert.equal((await home.manager.unlock(PIN)).ok, true);
+  assert.equal(home.keystore.listPeers()[0].provisional, undefined);
+});
+
+test('a provisional peer that never connects during an idle lock goes at 10 minutes, and is written at unlock', async (t) => {
+  const world = newWorld(t);
+  const home = await world.device('Home');
+  home.keystore.addPeer({ deviceId: 'aaaaaaaaaaaaaaaa', publicKey: newIdentity().publicKey, name: 'Other', role: 'laptop', provisional: true });
+  home.start();
+  world.relay.pump();
+  home.manager.lock();
+
+  world.run(10 * MINUTES);
+  assert.equal(home.entry('aaaaaaaaaaaaaaaa'), undefined);
+  assert.equal(world.relay.deviceConnects[0].closed, true);
+
+  assert.equal((await home.manager.unlock(PIN)).ok, true);
+  assert.deepEqual(home.keystore.listPeers(), []);
+  assert.deepEqual(home.manager.status().devices, []);
+});
+
+test('shutdown during an idle lock leaves nothing behind', async (t) => {
+  const { world, home, laptop } = await connected(t);
+  laptop.manager.lock();
+  laptop.manager.shutdown();
+  home.manager.shutdown();
+  world.run(5 * MINUTES);
+  assert.equal(world.clock.pendingTimers(), 0);
+  assert.ok(world.relay.deviceConnects.every((client) => client.closed));
+});
 test('being removed while locked ends the connection at once, and is saved at unlock', async (t) => {
   const { world, home, laptop } = await connected(t);
   laptop.manager.lock();
@@ -1928,9 +2182,14 @@ test('ten wrong PINs delete the keys and end every connection', async (t) => {
   assert.equal(result.wiped, true);
   assert.deepEqual(laptop.manager.status().devices, []);
   assert.equal(laptop.manager.status().hasPin, false);
+  assert.equal(laptop.manager.status().idleLocked, false);
   assert.equal(laptop.manager.send(home.id, { a: 1 }), false);
   world.relay.pump();
   assert.equal(world.relay.deviceConnects[1].closed, true);
+  const count = world.relay.deviceConnects.length;
+  world.run(5 * MINUTES);
+  assert.equal(world.relay.deviceConnects.length, count);
+  assert.deepEqual(laptop.manager.status().devices, []);
 });
 
 test('unlock when already unlocked does not spend an attempt', async (t) => {
@@ -1972,7 +2231,7 @@ test('shutdown closes everything and leaves no timers behind', async (t) => {
   home.start();
   laptop.start();
   world.relay.pump();
-  home.manager.createCode();
+  await home.manager.createCode();
   world.relay.pump();
   laptop.manager.shutdown();
   home.manager.shutdown();
@@ -1980,6 +2239,350 @@ test('shutdown closes everything and leaves no timers behind', async (t) => {
   assert.equal(world.clock.pendingTimers(), 0);
   assert.ok(world.relay.deviceConnects.every((client) => client.closed));
   assert.ok(world.relay.pairConnects.every((client) => client.closed));
+});
+
+// ---- A device with nobody there to type a PIN ----
+
+test('the first code on a device with no PIN makes a sealed secret, and it shows nowhere', async (t) => {
+  const world = newWorld(t);
+  const home = await world.device('Home', { pin: false });
+  home.start();
+  assert.equal(home.autoUnlock.store.bytes, null);
+
+  const created = await home.manager.createCode();
+  assert.match(created.code, /^[2-9A-Z]{6}$/);
+  const sealed = home.autoUnlock.store.bytes;
+  assert.ok(sealed);
+  assert.equal(sealed.subarray(0, 7).toString(), 'sealed:');
+  const secret = Buffer.from(sealed.subarray(7)).reverse().toString();
+  assert.match(secret, /^[0-9]{40}$/);
+  assert.equal(home.keystore.hasPin(), true);
+
+  const status = home.manager.status();
+  assert.equal(status.hasPin, false);
+  assert.equal(status.needsPin, false);
+  assert.equal(status.locked, false);
+  assert.equal(status.idleLocked, false);
+  for (const seen of [status, ...home.statuses]) assert.ok(!JSON.stringify(seen).includes(secret));
+
+  // A second code doesn't make a second secret.
+  await home.manager.createCode();
+  assert.equal(home.autoUnlock.store.writes, 1);
+  assert.deepEqual(home.autoUnlock.store.bytes, sealed);
+});
+
+test('secrets differ from one device to the next', async (t) => {
+  const world = newWorld(t);
+  const one = await world.device('One', { pin: false });
+  const two = await world.device('Two', { pin: false });
+  one.start();
+  two.start();
+  await one.manager.createCode();
+  await two.manager.createCode();
+  assert.notDeepEqual(one.autoUnlock.store.bytes, two.autoUnlock.store.bytes);
+});
+
+test('no address means no secret', async (t) => {
+  const world = newWorld(t);
+  const home = await world.device('Home', { pin: false, address: null });
+  home.start();
+  assert.ok((await home.manager.createCode()).error);
+  assert.equal(home.autoUnlock.store.writes, 0);
+  assert.equal(home.keystore.hasPin(), false);
+});
+
+test('a new manager on the same files unlocks itself and reconnects, with no PIN', async (t) => {
+  const world = newWorld(t);
+  const home = await world.device('Home', { pin: false });
+  const laptop = await world.device('Laptop');
+  home.start();
+  laptop.start();
+  const { answer } = await pairNow(world, home, laptop);
+  assert.equal(answer.ok, true);
+  world.relay.pump();
+  assert.equal(home.entry(laptop.id).connected, true);
+  assert.equal(home.manager.status().hasPin, false);
+
+  home.restart();
+  assert.equal(home.manager.status().locked, true);
+  assert.equal(home.manager.status().hasPin, false);
+  await until('the home PC to unlock itself', () => !home.manager.status().locked);
+  world.relay.pump();
+  assert.equal(home.entry(laptop.id).connected, true);
+  assert.equal(laptop.entry(answer.device.id).connected, true);
+  assert.equal(home.autoUnlock.store.writes, 1);
+
+  home.manager.send(laptop.id, { back: true });
+  world.relay.pump();
+  assert.deepEqual(laptop.frames.pop().frame, { back: true });
+});
+
+test('a device on a secret never idle-locks', async (t) => {
+  const world = newWorld(t);
+  const home = await world.device('Home', { pin: false });
+  home.start();
+  await home.manager.createCode();
+  home.manager.lock();
+  const status = home.manager.status();
+  assert.equal(status.locked, false);
+  assert.equal(status.idleLocked, false);
+  assert.equal(status.codePending, true);
+  assert.equal(home.keystore.isUnlocked(), true);
+});
+
+test('pair with a PIN replaces the secret, the file goes, and the device follows the laptop rules', async (t) => {
+  const world = newWorld(t);
+  const realHome = await world.device('Real home');
+  const device = await world.device('Both', { pin: false });
+  const laptop = await world.device('Its laptop');
+  realHome.start();
+  device.start();
+  laptop.start();
+
+  // It serves a laptop first, on its secret.
+  const served = await pairNow(world, device, laptop);
+  assert.equal(served.answer.ok, true);
+  world.relay.pump();
+  assert.ok(device.autoUnlock.store.bytes);
+
+  const { code } = await realHome.manager.createCode();
+  world.relay.pump();
+  const pairing = device.manager.pair(code, 'Both', '424242');
+  await until('the PIN to be set', () => device.manager.status().hasPin);
+  world.relay.pump();
+  const answer = await pairing;
+  assert.equal(answer.ok, true, answer.error);
+  assert.equal(answer.device.role, 'home');
+  assert.equal(device.autoUnlock.store.bytes, null);
+
+  const status = device.manager.status();
+  assert.equal(status.hasPin, true);
+  assert.equal(status.needsPin, false);
+  world.relay.pump();
+  assert.equal(device.entry(laptop.id).connected, true);
+  assert.equal(device.entry(laptop.id).role, 'laptop');
+  assert.equal(device.entry(realHome.id).role, 'home');
+
+  // Now it idle-locks.
+  device.manager.lock();
+  assert.equal(device.manager.status().idleLocked, true);
+  assert.equal(device.entry(laptop.id).connected, true);
+
+  // And it wants the PIN at start, with no connection until then.
+  const connects = world.relay.deviceConnects.length;
+  device.restart();
+  world.run(MINUTES);
+  assert.equal(device.manager.status().locked, true);
+  assert.equal(device.manager.status().hasPin, true);
+  assert.equal(world.relay.deviceConnects.length, connects);
+  assert.equal((await device.manager.unlock('424242')).ok, true);
+  world.run(25 * 1000);
+  assert.equal(device.entry(laptop.id).connected, true);
+});
+
+test('a first pairing with a home PC with no PIN is refused without contacting anyone, and status says why', async (t) => {
+  const world = newWorld(t);
+  const home = await world.device('Home', { pin: false });
+  home.start();
+  await home.manager.createCode();
+  home.manager.cancelCode();
+  const contacts = world.relay.pairConnects.length;
+
+  for (const pin of [undefined, null, '']) {
+    const answer = await home.manager.pair('ABCDEF', 'Home', pin);
+    assert.equal(answer.ok, false);
+    assert.match(answer.error, /PIN/);
+  }
+  assert.equal(world.relay.pairConnects.length, contacts);
+  assert.equal(home.manager.status().needsPin, true);
+  assert.equal(home.manager.status().hasPin, false);
+  assert.ok(home.autoUnlock.store.bytes);
+
+  // Setting it directly clears that too, and the secret with it.
+  assert.equal((await home.manager.setPin('424242')).ok, true);
+  const status = home.manager.status();
+  assert.equal(status.needsPin, false);
+  assert.equal(status.hasPin, true);
+  assert.equal(home.autoUnlock.store.bytes, null);
+});
+
+test("a bad PIN to pair leaves everything as it was", async (t) => {
+  const world = newWorld(t);
+  const device = await world.device('Device', { pin: false });
+  device.start();
+  await device.manager.createCode();
+  device.manager.cancelCode();
+  const sealed = device.autoUnlock.store.bytes;
+  const contacts = world.relay.pairConnects.length;
+
+  const answer = await device.manager.pair('ABCDEF', 'Device', '123');
+  assert.equal(answer.ok, false);
+  assert.match(answer.error, /PIN/);
+  assert.equal(world.relay.pairConnects.length, contacts);
+  assert.deepEqual(device.autoUnlock.store.bytes, sealed);
+  assert.equal(device.manager.status().hasPin, false);
+  assert.equal(device.manager.status().locked, false);
+
+  // Still the same secret that opens it.
+  device.restart();
+  await until('it to unlock itself', () => !device.manager.status().locked);
+  assert.equal(device.manager.status().hasPin, false);
+  assert.deepEqual(device.autoUnlock.store.bytes, sealed);
+});
+
+test('a brand new device pairing with a PIN never makes a secret', async (t) => {
+  const world = newWorld(t);
+  const home = await world.device('Home');
+  const laptop = await world.device('Laptop', { pin: false });
+  home.start();
+  laptop.start();
+  const { code } = await home.manager.createCode();
+  world.relay.pump();
+  const pairing = laptop.manager.pair(code, 'Laptop', PIN);
+  await until('the PIN to be set', () => laptop.manager.status().hasPin);
+  world.relay.pump();
+  assert.equal((await pairing).ok, true);
+  assert.equal(laptop.autoUnlock.store.writes, 0);
+  assert.equal(laptop.manager.status().locked, false);
+});
+
+test('pair on a device that already has a PIN ignores the argument', async (t) => {
+  const world = newWorld(t);
+  const home = await world.device('Home');
+  const laptop = await world.device('Laptop');
+  home.start();
+  laptop.start();
+  const { code } = await home.manager.createCode();
+  world.relay.pump();
+  const pairing = laptop.manager.pair(code, 'Laptop', '999999');
+  world.relay.pump();
+  assert.equal((await pairing).ok, true);
+
+  laptop.manager.lock();
+  assert.equal((await laptop.manager.unlock('999999')).ok, false);
+  assert.equal((await laptop.manager.unlock(PIN)).ok, true);
+});
+
+test('with no secure storage, nothing is written and status says so', async (t) => {
+  const world = newWorld(t);
+  const keystore = createKeystore({
+    file: world.newFile(),
+    protect: (bytes) => bytes,
+    unprotect: (bytes) => bytes,
+    kdfCost: FAST,
+    isProtectionAvailable: () => false
+  });
+  const home = await world.device('Home', { pin: false, keystore });
+  home.start();
+
+  assert.ok((await home.manager.createCode()).error);
+  assert.equal((await home.manager.pair('ABCDEF', 'Home', PIN)).ok, false);
+  assert.equal(home.autoUnlock.store.writes, 0);
+  assert.equal(home.manager.status().storageAvailable, false);
+  assert.equal(world.relay.pairConnects.length, 0);
+});
+
+test('a protect that fails writes nothing and sets no PIN', async (t) => {
+  const world = newWorld(t);
+  const home = await world.device('Home', { pin: false });
+  home.autoUnlock.store.failProtect = true;
+  home.start();
+  assert.ok((await home.manager.createCode()).error);
+  assert.equal(home.autoUnlock.store.bytes, null);
+  assert.equal(home.keystore.hasPin(), false);
+  assert.equal(world.relay.pairConnects.length, 0);
+});
+
+test('a keystore that refuses the secret leaves no file behind', async (t) => {
+  const world = newWorld(t);
+  const real = world.keystore();
+  const refusing = { ...real, setPin: async () => ({ ok: false, error: 'Could not save the PIN.' }) };
+  const home = await world.device('Home', { pin: false, keystore: refusing });
+  home.start();
+  assert.equal((await home.manager.createCode()).error, 'Could not save the PIN.');
+  assert.equal(home.autoUnlock.store.writes, 1);
+  assert.equal(home.autoUnlock.store.bytes, null);
+  assert.equal(home.manager.status().hasPin, false);
+  assert.equal(world.relay.pairConnects.length, 0);
+});
+
+test('secure storage that turns up late gets the device going', async (t) => {
+  const world = newWorld(t);
+  const file = world.newFile();
+  let available = true;
+  const make = () =>
+    createKeystore({
+      file,
+      protect: (bytes) => bytes,
+      unprotect: (bytes) => bytes,
+      kdfCost: FAST,
+      isProtectionAvailable: () => available
+    });
+  const home = await world.device('Home', { pin: false, keystore: make() });
+  home.start();
+  await home.manager.createCode();
+  const sealed = home.autoUnlock.store.bytes;
+  home.manager.shutdown();
+
+  available = false;
+  home.keystore = make();
+  const device = await world.device('Home again', { pin: false, keystore: home.keystore });
+  device.autoUnlock.store.bytes = sealed;
+  device.start();
+  assert.equal(device.manager.status().storageAvailable, false);
+  assert.deepEqual(device.autoUnlock.store.bytes, sealed);
+
+  available = true;
+  assert.equal(device.manager.status().storageAvailable, true);
+  await until('it to unlock itself', () => !device.manager.status().locked);
+  assert.equal(device.manager.status().hasPin, false);
+});
+
+test('a crash before the secret was sealed under leaves a file that the next start clears', async (t) => {
+  const world = newWorld(t);
+  const home = await world.device('Home', { pin: false });
+  home.autoUnlock.store.bytes = Buffer.from('sealed:leftover');
+  home.start();
+  assert.equal(home.autoUnlock.store.bytes, null);
+  assert.equal(home.manager.status().hasPin, false);
+  assert.ok((await home.manager.createCode()).code);
+  assert.ok(home.autoUnlock.store.bytes);
+});
+
+test('a crash just after a real PIN leaves a file that costs one attempt, once, and no wipe', async (t) => {
+  const world = newWorld(t);
+  const device = await world.device('Device');
+  device.keystore.lock();
+  device.autoUnlock.store.bytes = Buffer.concat([Buffer.from('sealed:'), Buffer.from('0'.repeat(40))]);
+  device.start();
+  await until('the leftover file to go', () => device.autoUnlock.store.bytes === null);
+  assert.equal(device.manager.status().hasPin, true);
+  assert.equal(device.manager.status().locked, true);
+  assert.equal((await device.manager.unlock(PIN)).ok, true);
+  assert.equal(device.manager.status().locked, false);
+});
+
+test('a secret that cannot be opened for now stays, and nothing is guessed', async (t) => {
+  const world = newWorld(t);
+  const home = await world.device('Home', { pin: false });
+  home.start();
+  await home.manager.createCode();
+  const sealed = home.autoUnlock.store.bytes;
+
+  home.autoUnlock.store.failUnprotect = true;
+  home.restart();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(home.manager.status().locked, true);
+  assert.deepEqual(home.autoUnlock.store.bytes, sealed);
+  // A person's guesses can't use up the attempts on a key nobody knows, or wipe it.
+  for (let i = 0; i < 10; i++) {
+    world.keystoreOffset += 10 * MINUTES;
+    assert.equal((await home.manager.unlock('000000')).ok, false);
+  }
+
+  home.autoUnlock.store.failUnprotect = false;
+  home.restart();
+  await until('it to unlock itself', () => !home.manager.status().locked);
 });
 
 // ---- The real relay client, against a fake socket ----

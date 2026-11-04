@@ -97,7 +97,7 @@ async function startWorld(t) {
 // is waiting. A person can't type a code that fast, but a test can. That answer doesn't
 // count as a failed code, so asking again is fine.
 async function pairWithCode(home, laptop) {
-  const { code } = home.manager.createCode();
+  const { code } = await home.manager.createCode();
   assert.ok(code);
   for (let i = 0; i < 50; i++) {
     const answer = await laptop.manager.pair(code, laptop.name);
@@ -159,7 +159,7 @@ test('a wrong code fails, and the same code is then refused without asking again
   const home = await world.device('Home');
   const laptop = await world.device('Laptop');
 
-  const { code } = home.manager.createCode();
+  const { code } = await home.manager.createCode();
   const wrong = code === '222222' ? '333333' : '222222';
   await sleep(200);
   const first = await laptop.manager.pair(wrong, 'Laptop');

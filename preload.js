@@ -190,7 +190,7 @@ contextBridge.exposeInMainWorld('api', {
     lock:       ()            => ipcRenderer.invoke('remote:lock'),
     createCode: ()            => ipcRenderer.invoke('remote:createCode'),
     cancelCode: ()            => ipcRenderer.invoke('remote:cancelCode'),
-    pair:       (code, name)  => ipcRenderer.invoke('remote:pair', { code, name }),
+    pair:       (code, name, pin) => ipcRenderer.invoke('remote:pair', { code, name, pin }),
     removeDevice: (id)        => ipcRenderer.invoke('remote:removeDevice', { id }),
     setControlAllowed: (allowed) => ipcRenderer.invoke('remote:setControlAllowed', { allowed }),
     send:       (deviceId, frame) => ipcRenderer.invoke('remote:send', { deviceId, frame }),

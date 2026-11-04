@@ -554,19 +554,49 @@ function remoteAddressStore(file) {
   };
 }
 
+// Flushed before the keystore comes to depend on it, since the identity can't be opened
+// without this file if a home PC loses power right after.
+function remoteAutoUnlockFile(file) {
+  return {
+    read() {
+      try {
+        return fs.readFileSync(file);
+      } catch (err) {
+        if (err.code === 'ENOENT') return null;
+        throw err;
+      }
+    },
+    write(bytes) {
+      const fd = fs.openSync(file, 'w', 0o600);
+      try {
+        fs.writeSync(fd, bytes);
+        fs.fsyncSync(fd);
+      } finally {
+        fs.closeSync(fd);
+      }
+    },
+    remove() {
+      fs.rmSync(file, { force: true });
+    }
+  };
+}
+
 function startRemoteControl() {
   const userData = app.getPath('userData');
+  // Both callers hand over text as bytes, and safeStorage takes a string.
+  const protect = (bytes) => safeStorage.encryptString(Buffer.from(bytes).toString('utf8'));
+  const unprotect = (bytes) => Buffer.from(safeStorage.decryptString(Buffer.from(bytes)), 'utf8');
   const keystore = createKeystore({
     file: path.join(userData, 'remote-keys.json'),
-    // The keystore hands over JSON text as bytes, and safeStorage takes a string.
-    protect: (bytes) => safeStorage.encryptString(Buffer.from(bytes).toString('utf8')),
-    unprotect: (bytes) => Buffer.from(safeStorage.decryptString(Buffer.from(bytes)), 'utf8'),
+    protect,
+    unprotect,
     isProtectionAvailable: () => safeStorage.isEncryptionAvailable()
   });
   remoteManager = createRemoteManager({
     keystore,
     relay: remoteRelayClient,
     addressStore: remoteAddressStore(path.join(userData, 'remote-service.json')),
+    autoUnlock: { ...remoteAutoUnlockFile(path.join(userData, 'remote-autounlock.bin')), protect, unprotect },
     deviceName: os.hostname()
   });
   remoteManager.onFrame((deviceId, frame) => sendToLocalUi('remote:frame', { deviceId, frame }));
@@ -602,7 +632,7 @@ handleRemote('remote:unlock', ({ pin }) => remoteManager.unlock(pin));
 handleRemote('remote:lock', () => remoteManager.lock());
 handleRemote('remote:createCode', () => remoteManager.createCode());
 handleRemote('remote:cancelCode', () => remoteManager.cancelCode());
-handleRemote('remote:pair', ({ code, name }) => remoteManager.pair(code, name));
+handleRemote('remote:pair', ({ code, name, pin }) => remoteManager.pair(code, name, pin));
 handleRemote('remote:removeDevice', ({ id }) => remoteManager.removeDevice(id));
 // handleRemote has checked the sender by now, which is what makes this claim true.
 handleRemote('remote:setControlAllowed', ({ allowed }) => remoteManager.setControlAllowed(allowed, { fromLocalUi: true }));
