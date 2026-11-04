@@ -6574,6 +6574,9 @@ function homeDeviceStatus(device) {
     // exactly as it was until a snapshot says otherwise, but it stops moving: see style.css.
     for (const c of remoteChatsOf(device.id)) state.runningChats.delete(c.id);
     updateSendButton();
+    // The screen was last painted up to a second ago. Bringing it up to offlineAt now means a
+    // redraw later shows the same time, not one a second on.
+    if (currentChat()?.remote?.deviceId === device.id) paintRemoteClockValues();
   }
   paintRemoteOffline();
 }
@@ -6717,7 +6720,10 @@ function paintRemoteOffline() {
 // The home PC paints these from timers of its own, which don't run here.
 function paintRemoteClocks() {
   const c = currentChat();
-  if (!c?.remote || !mirror.homes.get(c.remote.deviceId)?.connected) return;
+  if (c?.remote && mirror.homes.get(c.remote.deviceId)?.connected) paintRemoteClockValues();
+}
+
+function paintRemoteClockValues() {
   for (const el of $$('#thread .msg-status-time')) {
     const m = el.closest('.msg')?.__msg;
     if (m?.startup) el.textContent = startupTimeLabel(m);
@@ -7378,7 +7384,8 @@ async function showPreview(iframe, code) {
 
 function renderMarkdown(text) {
   if (!text) return '';
-  let src = String(text);
+  // A lone surrogate survives JSON, and would throw out of encodeURIComponent below.
+  let src = String(text).toWellFormed();
 
   // 0. Strip leaked reasoning. Some local models (Qwen3 among them) emit their
   // chain-of-thought inline as <think>…</think> even when thinking is off,

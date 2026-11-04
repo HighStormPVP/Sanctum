@@ -694,6 +694,27 @@ test('mirroring chats', async (t) => {
     await submit(home, 'Counting while the laptop goes away');
     const reply = await ollama.next();
     await dropThenCheck('.msg-status-time');
+
+    // The screen and a redraw have to agree on when the clock stopped, wherever in its second
+    // the connection happens to go. The steps move the drop across a whole second.
+    const trials = [];
+    for (let i = 0; i < 10; i++) {
+      await sleep(137 * i);
+      assert.deepEqual(await laptop.remote('setAddress', 'ws://127.0.0.1:9/nowhere-at-all'), { ok: true });
+      await waitFor('the laptop to show offline', async () => (await offlineMark(laptop)) === '1', 10000);
+      const [shown, redrawn] = await laptop.page.evaluate(() => {
+        const read = () => document.querySelector('#thread .msg-status-time').textContent;
+        const before = read();
+        renderActiveChat();
+        return [before, read()];
+      });
+      trials.push({ shown, redrawn });
+      assert.deepEqual(await laptop.remote('setAddress', pair.relay.address), { ok: true });
+      await waitFor('the laptop to reconnect', async () => (await offlineMark(laptop)) === null && (await laptop.entry()).connected === true, 30000);
+    }
+    t.diagnostic(`redraw while offline: ${trials.filter((x) => x.shown === x.redrawn).length} of ${trials.length} kept the same time`);
+    assert.deepEqual(trials.filter((x) => x.shown !== x.redrawn), [], 'a redraw moved the timer');
+    await threadsMatch(pair, 'back after the trials', 'msg-status-text');
     await threadsMatch(pair, 'back after the startup row', 'msg-status-text');
     reply.think('Thinking, and then saying nothing for a long time. ');
     await waitFor('the silence notice', () => home.page.evaluate(() => Boolean(document.querySelector('#thread .msg-silent'))), 12000);
@@ -879,7 +900,9 @@ const PAYLOADS = (evilUrl) => [
   '`<img id="fuzz-x">` \\(<img id="fuzz-x">\\) $$<img id="fuzz-x">$$ \\[<b id="fuzz-x">\\]',
   '\u0000CB0\u0000 \u0000IC0\u0000',
   '1. <img id="fuzz-x">\n- <img id="fuzz-x">\n# <img id="fuzz-x">\n> <img id="fuzz-x">\n| <a id="fuzz-x"> | b |',
-  '<think>x</think><img id="fuzz-x"><think>'
+  '<think>x</think><img id="fuzz-x"><think>',
+  // A lone surrogate crosses a frame intact, and encodeURIComponent throws on it.
+  '```python\n\ud800\n``` \udfff `\ud800`'
 ];
 
 const MARKDOWN = '# Head\n\n## Two\n\n**b** *i* `c` [l](https://a.example/x)\n\n- one\n- two\n\n1. first\n\n> quote\n\n---\n\n\\(x^2\\) $$y_1$$\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n```python\n# file.py\nprint(1)\n```\n\n```html\n<b>x</b>\n```';
