@@ -121,7 +121,14 @@
   - `createPairingGuest({ code, identity, name }) -> { first, handle(msg) -> { reply?, peer?, failed? } }`
   - `peer` is `{ deviceId, publicKey, name }`
 
-Flow: PAKE messages, then each side sends its identity public key, name, and a signature over the transcript, encrypted under the PAKE key. Five failed attempts cancel the code.
+Flow, in order. Messages are JSON-safe objects with base64 fields, opaque to the Worker:
+
+1. The guest sends its `pake` message. The host starts a new `pakeStart` for each attempt, because `finish` is single-use, then replies with its own `pake` message and `confirmMessage`.
+2. The guest calls `finish`, checks `verifyConfirm`, then sends its `confirmMessage`. The host checks it. A failed confirmation at this point is a failed attempt. `sharedKey` is not used for anything until `verifyConfirm` returns true.
+3. Both derive `sealKey = hkdf(sharedKey, undefined, 'sanctum-pairing-seal-v1', 32)`, since `sharedKey` is 16 bytes and `seal` needs 32.
+4. Each side sends `seal(sealKey, randomNonce24, { publicKey, name, signature })`, with the role as AAD. The signature is over `'sanctum-pairing-identity-v1' || role || SHA-256(len(homePake) || homePake || len(laptopPake) || laptopPake)`, using 8-byte little-endian lengths as in RFC 9382. Each side verifies the other's, so a device proves it holds the identity key it claims, for this exchange.
+
+Five failed attempts cancel the code. `pakeStart` blocks for about 90 ms, which is acceptable here because attempts are capped.
 
 - [ ] **Step 1: Write failing tests.**
   - `newCode` is 6 characters, all from `CODE_ALPHABET`. `CODE_ALPHABET` has none of `0 O 1 I L`.
