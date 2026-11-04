@@ -10,7 +10,7 @@ const { safeFetchText } = require('./lib/url-rules');
 const { grepInWorker } = require('./lib/grep-runner');
 const { detectRepetitionLoop, splitOutputLines, quoteWindowsArg, encodePowerShell } = require('./lib/text-rules');
 const { killTree } = require('./lib/kill-tree');
-const { createKeystore } = require('./lib/remote/keystore');
+const { createKeystore, retryTransient } = require('./lib/remote/keystore');
 const { createManager: createRemoteManager } = require('./lib/remote/manager');
 const remoteRelayClient = require('./lib/remote/relay-client');
 
@@ -560,7 +560,7 @@ function remoteAutoUnlockFile(file) {
   return {
     read() {
       try {
-        return fs.readFileSync(file);
+        return retryTransient(() => fs.readFileSync(file));
       } catch (err) {
         if (err.code === 'ENOENT') return null;
         throw err;
@@ -576,7 +576,7 @@ function remoteAutoUnlockFile(file) {
       }
     },
     remove() {
-      fs.rmSync(file, { force: true });
+      retryTransient(() => fs.rmSync(file, { force: true }));
     }
   };
 }

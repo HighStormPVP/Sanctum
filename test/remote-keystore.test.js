@@ -60,7 +60,7 @@ test('production defaults are scrypt N=2^17, r=8, p=1', async (t) => {
   assert.deepStrictEqual({ N: stored.N, r: stored.r, p: stored.p }, { N: 131072, r: 8, p: 1 });
   assert.strictEqual(Buffer.from(stored.salt, 'base64').length, 16);
   ks.lock();
-  assert.deepStrictEqual(await createKeystore({ file, ...identityFns }).unlock(PIN), { ok: true });
+  assert.deepStrictEqual(await createKeystore({ file, ...identityFns }).unlock(PIN), { ok: true, tested: true });
 });
 
 test('delays: none for 3 wrong, then 1 s doubling, capped at 5 minutes', () => {
@@ -142,7 +142,7 @@ test('the file goes through protect on write and unprotect on read', async (t) =
   assert.ok(fs.readFileSync(file).subarray(0, MARK.length).equals(MARK));
   const reopened = make({ protect, unprotect });
   assert.strictEqual(reopened.getControlAllowed(), true);
-  assert.deepStrictEqual(await reopened.unlock(PIN), { ok: true });
+  assert.deepStrictEqual(await reopened.unlock(PIN), { ok: true, tested: true });
   assert.deepStrictEqual(reopened.getIdentity().publicKey, ks.getIdentity().publicKey);
 });
 
@@ -159,7 +159,7 @@ test('the right PIN unlocks after a restart with the same identity and peers', a
   assert.deepStrictEqual(ks.listPeers(), []);
 
   const reopened = make();
-  assert.deepStrictEqual(await reopened.unlock(PIN), { ok: true });
+  assert.deepStrictEqual(await reopened.unlock(PIN), { ok: true, tested: true });
   assert.deepStrictEqual(reopened.getIdentity().secretKey, original.secretKey);
   assert.deepStrictEqual(reopened.getIdentity().publicKey, original.publicKey);
   assert.deepStrictEqual(reopened.listPeers(), [peer(1, { role: 'home' }), peer(2, { provisional: true })]);
@@ -174,7 +174,7 @@ test('a wrong PIN does not unlock, and waits grow, including across a restart', 
   // Three free wrong guesses.
   for (let i = 0; i < 3; i++) {
     const result = await ks.unlock(WRONG);
-    assert.deepStrictEqual(result, { ok: false, waitMs: 0 });
+    assert.deepStrictEqual(result, { ok: false, waitMs: 0, tested: true });
   }
   assert.strictEqual(ks.isUnlocked(), false);
 
@@ -182,7 +182,7 @@ test('a wrong PIN does not unlock, and waits grow, including across a restart', 
   for (const expected of [1000, 2000, 4000, 8000]) {
     ks = make();
     const result = await ks.unlock(WRONG);
-    assert.deepStrictEqual(result, { ok: false, waitMs: expected });
+    assert.deepStrictEqual(result, { ok: false, waitMs: expected, tested: true });
 
     // During the wait, even the right PIN is refused without being tried.
     clock.t += expected - 1;
@@ -206,7 +206,7 @@ test('a call during the wait does not count as an attempt', async (t) => {
     assert.ok(r.waitMs > 0);
   }
   clock.t += 1000;
-  assert.deepStrictEqual(await ks.unlock(WRONG), { ok: false, waitMs: 2000 }); // fifth wrong, not twenty-fifth
+  assert.deepStrictEqual(await ks.unlock(WRONG), { ok: false, waitMs: 2000, tested: true }); // fifth wrong, not twenty-fifth
 });
 
 test('waits cap at five minutes', async (t) => {
@@ -238,7 +238,7 @@ test('a clock moved backwards restarts the wait in full', async (t) => {
   clock.t += 3999;
   assert.deepStrictEqual(await make().unlock(PIN), { ok: false, waitMs: 1 });
   clock.t += 1;
-  assert.deepStrictEqual(await make().unlock(PIN), { ok: true });
+  assert.deepStrictEqual(await make().unlock(PIN), { ok: true, tested: true });
 });
 
 test('a correct PIN resets the counter', async (t) => {
@@ -247,11 +247,11 @@ test('a correct PIN resets the counter', async (t) => {
   await ks.setPin(PIN);
   ks.lock();
   await failTimes(ks, clock, 5);
-  assert.deepStrictEqual(await ks.unlock(PIN), { ok: true });
+  assert.deepStrictEqual(await ks.unlock(PIN), { ok: true, tested: true });
   ks.lock();
   // Back to three free guesses, also after a restart.
   ks = make();
-  for (let i = 0; i < 3; i++) assert.deepStrictEqual(await ks.unlock(WRONG), { ok: false, waitMs: 0 });
+  for (let i = 0; i < 3; i++) assert.deepStrictEqual(await ks.unlock(WRONG), { ok: false, waitMs: 0, tested: true });
 });
 
 test('ten wrong in a row wipes the keys, even if the right PIN follows', async (t) => {
@@ -268,7 +268,7 @@ test('ten wrong in a row wipes the keys, even if the right PIN follows', async (
     results.push(await ks.unlock(WRONG));
     clock.t += 10 * 60 * 1000;
   }
-  assert.deepStrictEqual(results[9], { ok: false, wiped: true });
+  assert.deepStrictEqual(results[9], { ok: false, wiped: true, tested: true });
   assert.ok(results.slice(0, 9).every((r) => !r.wiped));
 
   for (const view of [ks, make()]) {
@@ -297,7 +297,7 @@ test('the tenth guess is only a wipe if it is wrong', async (t) => {
   await ks.setPin(PIN);
   ks.lock();
   await failTimes(ks, clock, 9);
-  assert.deepStrictEqual(await ks.unlock(PIN), { ok: true });
+  assert.deepStrictEqual(await ks.unlock(PIN), { ok: true, tested: true });
 });
 
 test('a wrong PIN is never treated as a damaged file', async (t) => {
@@ -395,7 +395,7 @@ test('setPin changes the PIN when unlocked, keeping the identity and peers', asy
   const reopened = make();
   const old = await reopened.unlock(PIN);
   assert.strictEqual(old.ok, false);
-  assert.deepStrictEqual(await reopened.unlock('987654'), { ok: true });
+  assert.deepStrictEqual(await reopened.unlock('987654'), { ok: true, tested: true });
   assert.deepStrictEqual(reopened.getIdentity().secretKey, id.secretKey);
   assert.deepStrictEqual(reopened.listPeers(), [peer(5)]);
 });
@@ -410,7 +410,7 @@ test('setPin when locked is refused and changes nothing', async (t) => {
   assert.strictEqual(result.ok, false);
   assert.ok(result.error);
   assert.deepStrictEqual(fs.readFileSync(file), before);
-  assert.deepStrictEqual(await ks.unlock(PIN), { ok: true });
+  assert.deepStrictEqual(await ks.unlock(PIN), { ok: true, tested: true });
 });
 
 test('a device added while the PIN is being changed is not lost', async (t) => {
@@ -435,7 +435,7 @@ test('locking while the PIN is being changed abandons the change', async (t) => 
   const result = await changing;
   assert.strictEqual(result.ok, false);
   assert.strictEqual(ks.isUnlocked(), false);
-  assert.deepStrictEqual(await make().unlock(PIN), { ok: true });
+  assert.deepStrictEqual(await make().unlock(PIN), { ok: true, tested: true });
 });
 
 test('peers: add, replace by deviceId, remove, and they persist', async (t) => {
@@ -587,7 +587,7 @@ test('if the attempt cannot be recorded, the PIN is not tested', async (t) => {
   assert.strictEqual(result.ok, false);
   assert.ok(result.error);
   assert.strictEqual(ks.isUnlocked(), false);
-  assert.deepStrictEqual(await ks.unlock(PIN), { ok: true });
+  assert.deepStrictEqual(await ks.unlock(PIN), { ok: true, tested: true });
 });
 
 test('the guess is counted before it is tested, so a kill mid-check still costs a try', async (t) => {
@@ -652,7 +652,7 @@ test('a brief lock while recording an attempt does not stop the right PIN', asyn
   ks.lock();
   const counter = { calls: 0 };
   const result = await patched(fs, 'renameSync', flaky(2, 'EPERM', counter), () => ks.unlock(PIN));
-  assert.deepStrictEqual(result, { ok: true });
+  assert.deepStrictEqual(result, { ok: true, tested: true });
 });
 
 test('setPin survives a brief lock too', async (t) => {
@@ -713,7 +713,7 @@ test('the wipe retries its fallback delete when the rewrite is blocked', async (
       return real(target, ...rest);
     }, () => ks.unlock(WRONG)));
   // The rewrite could not land, but the delete got through on the third try.
-  assert.deepStrictEqual(result, { ok: false, wiped: true });
+  assert.deepStrictEqual(result, { ok: false, wiped: true, tested: true });
   assert.strictEqual(unlinks.calls, 3);
   assert.ok(!fs.existsSync(file));
   assert.strictEqual(ks.hasPin(), false);
@@ -777,7 +777,7 @@ test('reload brings the pairing back once protection is available', async (t) =>
   assert.strictEqual(ks.isAvailable(), true);
   assert.strictEqual(ks.hasPin(), true);
   assert.strictEqual(ks.getControlAllowed(), true);
-  assert.deepStrictEqual(await ks.unlock(PIN), { ok: true });
+  assert.deepStrictEqual(await ks.unlock(PIN), { ok: true, tested: true });
   assert.deepStrictEqual(ks.getIdentity().publicKey, identity.publicKey);
   assert.deepStrictEqual(ks.listPeers(), [peer(1)]);
   assert.deepStrictEqual(fs.readdirSync(dir), ['remote.keys']);
@@ -863,7 +863,7 @@ test('lock() or reload() during an in-flight correct PIN keeps the store locked'
     assert.strictEqual(ks.getIdentity(), null, interfere);
     // The guess was counted and is not refunded.
     assert.strictEqual(JSON.parse(fs.readFileSync(file, 'utf8')).attempts.failed, 1, interfere);
-    assert.deepStrictEqual(await ks.unlock(PIN), { ok: true }, interfere);
+    assert.deepStrictEqual(await ks.unlock(PIN), { ok: true, tested: true }, interfere);
   }
 });
 
@@ -883,7 +883,7 @@ test('lock() or reload() during an in-flight tenth wrong PIN does not wipe', asy
     assert.strictEqual(doc.attempts.failed, 10, 'counted, not refunded');
     // One more wrong guess (after the wait) does wipe.
     clock.t += 10 * 60 * 1000;
-    assert.deepStrictEqual(await ks.unlock(WRONG), { ok: false, wiped: true }, interfere);
+    assert.deepStrictEqual(await ks.unlock(WRONG), { ok: false, wiped: true, tested: true }, interfere);
   }
 });
 
@@ -973,7 +973,7 @@ test('a read that keeps failing with EPERM leaves the file alone until reload() 
   assert.strictEqual(ks.reload(), true);
   assert.strictEqual(ks.hasPin(), true);
   assert.strictEqual(ks.getControlAllowed(), true);
-  assert.deepStrictEqual(await ks.unlock(PIN), { ok: true });
+  assert.deepStrictEqual(await ks.unlock(PIN), { ok: true, tested: true });
   assert.deepStrictEqual(ks.listPeers(), [peer(1)]);
 });
 
@@ -1001,7 +1001,7 @@ test('if the reset write fails after a correct PIN, the next successful write ca
     if (++renames === 2) throw lockError('ENOSPC');
     return real(...args);
   }, () => ks.unlock(PIN));
-  assert.deepStrictEqual(result, { ok: true });
+  assert.deepStrictEqual(result, { ok: true, tested: true });
   assert.strictEqual(JSON.parse(fs.readFileSync(file, 'utf8')).attempts.failed, 6, 'disk still high');
 
   ks.setControlAllowed(true); // any successful write
@@ -1009,7 +1009,7 @@ test('if the reset write fails after a correct PIN, the next successful write ca
 
   // In memory it was already clear, so three free guesses follow.
   ks.lock();
-  for (let i = 0; i < 3; i++) assert.deepStrictEqual(await ks.unlock(WRONG), { ok: false, waitMs: 0 });
+  for (let i = 0; i < 3; i++) assert.deepStrictEqual(await ks.unlock(WRONG), { ok: false, waitMs: 0, tested: true });
 });
 
 test('setAsideAsDamaged moves the file away, keeps a copy, and leaves an empty unpaired store', async (t) => {
@@ -1063,4 +1063,152 @@ test('pinFormatError is the rule setPin uses', async (t) => {
     assert.ok(pinFormatError(bad));
     assert.deepEqual(await store.setPin(bad), { ok: false, error: pinFormatError(bad) });
   }
+});
+
+test('pinKind records what setPin was told, reads while locked and after a restart, and a person is the default', async (t) => {
+  const file = path.join(tempDir(t), 'keys.json');
+  const store = createKeystore({ file, kdfCost: FAST, ...identityFns });
+  assert.equal(store.pinKind(), null);
+
+  assert.deepEqual(await store.setPin('1'.repeat(40), { kind: 'device' }), { ok: true });
+  assert.equal(store.pinKind(), 'device');
+  store.lock();
+  assert.equal(store.pinKind(), 'device');
+  assert.equal(createKeystore({ file, kdfCost: FAST, ...identityFns }).pinKind(), 'device');
+
+  await store.unlock('1'.repeat(40));
+  assert.deepEqual(await store.setPin(PIN), { ok: true });
+  assert.equal(store.pinKind(), 'user');
+  store.lock();
+  assert.equal(createKeystore({ file, kdfCost: FAST, ...identityFns }).pinKind(), 'user');
+});
+
+test('a refused setPin does not change the kind, and a file with no kind means a person', async (t) => {
+  const file = path.join(tempDir(t), 'keys.json');
+  const store = createKeystore({ file, kdfCost: FAST, ...identityFns });
+  await store.setPin('1'.repeat(40), { kind: 'device' });
+  assert.equal((await store.setPin('12', { kind: 'user' })).ok, false);
+  assert.equal(store.pinKind(), 'device');
+
+  const outer = JSON.parse(fs.readFileSync(file, 'utf8'));
+  delete outer.pinKind;
+  fs.writeFileSync(file, JSON.stringify(outer));
+  assert.equal(createKeystore({ file, kdfCost: FAST, ...identityFns }).pinKind(), 'user');
+});
+
+test('the kind is only a hint: it opens nothing, and the PIN is what unlocks', async (t) => {
+  const file = path.join(tempDir(t), 'keys.json');
+  const store = createKeystore({ file, kdfCost: FAST, ...identityFns });
+  await store.setPin(PIN);
+  store.lock();
+  const outer = JSON.parse(fs.readFileSync(file, 'utf8'));
+  outer.pinKind = 'device';
+  fs.writeFileSync(file, JSON.stringify(outer));
+
+  const changed = createKeystore({ file, kdfCost: FAST, ...identityFns });
+  assert.equal((await changed.unlock(WRONG)).ok, false);
+  assert.equal(changed.isUnlocked(), false);
+  assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).attempts.failed, 1);
+  assert.equal((await changed.unlock(PIN)).ok, true);
+});
+
+test('wiping and setting aside clear the kind', async (t) => {
+  const dir = tempDir(t);
+  const file = path.join(dir, 'keys.json');
+  const store = createKeystore({ file, kdfCost: FAST, ...identityFns });
+  await store.setPin(PIN);
+  store.setAsideAsDamaged();
+  assert.equal(store.pinKind(), null);
+
+  let time = 0;
+  const counted = createKeystore({
+    file: path.join(dir, 'other.json'),
+    kdfCost: FAST,
+    now: () => {
+      time += 10 * 60 * 1000;
+      return time;
+    },
+    ...identityFns
+  });
+  await counted.setPin(PIN);
+  counted.lock();
+  let result;
+  for (let i = 0; i < 10; i++) result = await counted.unlock(WRONG);
+  assert.equal(result.wiped, true);
+  assert.equal(counted.pinKind(), null);
+});
+
+test('unlock says tested only when the PIN was actually tried', async (t) => {
+  let time = 1000;
+  const file = path.join(tempDir(t), 'keys.json');
+  const store = createKeystore({ file, kdfCost: FAST, now: () => time, ...identityFns });
+  await store.setPin(PIN);
+
+  // Already unlocked: nothing was tried.
+  assert.deepEqual(await store.unlock(WRONG), { ok: true });
+  store.lock();
+
+  for (let i = 0; i < 4; i++) {
+    const result = await store.unlock(WRONG);
+    assert.equal(result.ok, false);
+    assert.equal(result.tested, true);
+  }
+  // Inside the wait: refused without being tried.
+  const refused = await store.unlock(PIN);
+  assert.equal(refused.ok, false);
+  assert.ok(refused.waitMs > 0);
+  assert.equal(refused.tested, undefined);
+
+  time += 60 * 1000;
+  assert.deepEqual(await store.unlock(PIN), { ok: true, tested: true });
+  store.lock();
+
+  // No PIN to try, and not a string.
+  assert.equal((await createKeystore({ file: `${file}.none`, kdfCost: FAST, ...identityFns }).unlock(PIN)).tested, undefined);
+  assert.equal((await store.unlock(7)).tested, undefined);
+
+  // A result thrown away because of a lock wasn't a test either.
+  const racing = store.unlock(PIN);
+  await new Promise((resolve) => setImmediate(resolve));
+  store.lock();
+  const raced = await racing;
+  if (!raced.ok) assert.equal(raced.tested, undefined);
+});
+
+test('an uncounted unlock writes no count, ignores the wait, and a wrong one wipes nothing', async (t) => {
+  let time = 1000;
+  const file = path.join(tempDir(t), 'keys.json');
+  const store = createKeystore({ file, kdfCost: FAST, now: () => time, ...identityFns });
+  await store.setPin(PIN);
+  store.lock();
+  const failed = () => JSON.parse(fs.readFileSync(file, 'utf8')).attempts.failed;
+
+  for (let i = 0; i < 4; i++) await store.unlock(WRONG);
+  assert.equal(failed(), 4);
+  time += 1;
+
+  for (let i = 0; i < 20; i++) {
+    const result = await store.unlock(WRONG, { uncounted: true });
+    assert.deepEqual(result, { ok: false, tested: true });
+  }
+  assert.equal(failed(), 4);
+  assert.equal(store.hasPin(), true);
+
+  // Inside the wait a counted guess is refused, and an uncounted one is still tried.
+  assert.ok((await store.unlock(PIN)).waitMs > 0);
+  assert.deepEqual(await store.unlock(PIN, { uncounted: true }), { ok: true, tested: true });
+  assert.equal(failed(), 0);
+});
+
+test('consumeSetAside reports a file set aside at load, once, and a clean start reports nothing', async (t) => {
+  const file = path.join(tempDir(t), 'keys.json');
+  const first = createKeystore({ file, kdfCost: FAST, ...identityFns });
+  assert.equal(first.consumeSetAside(), false);
+  await first.setPin(PIN);
+  assert.equal(createKeystore({ file, kdfCost: FAST, ...identityFns }).consumeSetAside(), false);
+
+  fs.writeFileSync(file, 'not json');
+  const damaged = createKeystore({ file, kdfCost: FAST, ...identityFns });
+  assert.equal(damaged.consumeSetAside(), true);
+  assert.equal(damaged.consumeSetAside(), false);
 });
