@@ -322,6 +322,10 @@
         </div>
       </header>
       <div class="modal-body">
+        <section class="approval-section" id="pe-device-row" hidden>
+          <div class="approval-label">Machine</div>
+          <pre class="approval-code" id="pe-device"></pre>
+        </section>
         <section class="approval-section">
           <div class="approval-label">Tool</div>
           <pre class="approval-code dim" id="pe-tool-name">read_file</pre>
@@ -669,6 +673,22 @@
         <button type="submit" class="approval-approve" id="remote-connect-submit">Connect</button>
       </footer>
     </form>
+  </div>
+
+  <!-- REMOTE CONTROL: ASKED ONCE, AFTER PAIRING -->
+  <div class="modal-overlay" id="remote-control-ask-overlay" hidden>
+    <div class="modal remote-dialog" role="dialog" aria-labelledby="remote-control-ask-title">
+      <header class="modal-head">
+        <h2 id="remote-control-ask-title">Let my home PC control this laptop?</h2>
+      </header>
+      <div class="modal-body">
+        <p class="remote-dialog-text">When this is on, the model at home can run commands and edit files here, following each chat's safety mode. You can change this at any time in Settings &gt; Devices.</p>
+      </div>
+      <footer class="approval-footer">
+        <button type="button" class="ghost-btn" id="remote-control-ask-off">Leave off</button>
+        <button type="button" class="approval-approve" id="remote-control-ask-on">Turn on</button>
+      </footer>
+    </div>
   </div>
 
   <!-- REMOTE CONTROL: KEYS THAT WERE RESET -->

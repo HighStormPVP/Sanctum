@@ -16,7 +16,7 @@ const PARTITION = 'remote-transport';
 const REFUSED = /can only be used from this app's own window/;
 
 const REMOTE_METHODS = [
-  'cancelCode', 'createCode', 'lock', 'onFrame', 'onStatus', 'pair', 'removeDevice',
+  'audit', 'cancelCode', 'createCode', 'endRun', 'lock', 'onFrame', 'onStatus', 'pair', 'removeDevice',
   'send', 'setAddress', 'setControlAllowed', 'setPin', 'status', 'unlock'
 ];
 
@@ -134,7 +134,9 @@ test('the preload surface', async (t) => {
         ['remote:pair', { code: 'ABC', name: 'x', pin: PIN }],
         ['remote:removeDevice', { id: laptopId }],
         ['remote:setControlAllowed', { allowed: true }],
-        ['remote:send', { deviceId: laptopId, frame: { type: 'from-hidden' } }]
+        ['remote:send', { deviceId: laptopId, frame: { type: 'from-hidden' } }],
+        ['remote:audit', { event: 'from-hidden' }],
+        ['remote:endRun', { deviceId: laptopId, id: 'x' }]
       ];
       for (const [channel, args] of calls) {
         const answer = await fromHidden(channel, args);

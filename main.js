@@ -15,6 +15,7 @@ const { createKeystore, retryTransient } = require('./lib/remote/keystore');
 const { createManager: createRemoteManager } = require('./lib/remote/manager');
 const remoteRelayClient = require('./lib/remote/relay-client');
 const { createDirectPath } = require('./lib/remote/direct-path');
+const RemoteRules = require('./lib/remote-rules');
 
 // Only this app's own page may use anything registered on ipcMain. The hidden transport window
 // parses what peers and the network send, so a renderer exploit there must not reach the
@@ -440,9 +441,15 @@ function createWindow() {
     for (const [, entry] of activeChatStreams) { try { entry.controller.abort(); } catch {} }
   };
   contents.on('did-start-navigation', (details) => {
-    if (details.isMainFrame && !details.isSameDocument) abortStreams();
+    if (details.isMainFrame && !details.isSameDocument) {
+      abortStreams();
+      endRemoteRunsWithPage();
+    }
   });
-  contents.once('destroyed', abortStreams);
+  contents.once('destroyed', () => {
+    abortStreams();
+    endRemoteRunsWithPage();
+  });
 
   mainWindow.loadFile(path.join(__dirname, 'index.html'));
 }
@@ -541,6 +548,7 @@ app.on('before-quit', (e) => {
 
   const cleanup = (async () => {
     // Kill in-flight generations first so nothing reloads a model behind us.
+    endRemoteRunsWithPage();
     if (remoteManager) { try { remoteManager.shutdown(); } catch {} }
     for (const [, entry] of activeChatStreams) { try { entry.controller.abort(); } catch {} }
     for (const task of backgroundTasks.values()) { if (task.proc) killTree(task.proc); }
@@ -708,6 +716,7 @@ function startRemoteControl() {
     addressStore: remoteAddressStore(path.join(userData, 'remote-service.json')),
     autoUnlock: { ...remoteAutoUnlockFile(path.join(userData, 'remote-autounlock.bin')), protect, unprotect },
     deviceName: os.hostname(),
+    onToolRefused: noteToolRefused,
     createDirect: (callbacks) => createDirectPath({
       ...callbacks,
       openTransport: openRemoteTransport,
@@ -715,13 +724,25 @@ function startRemoteControl() {
       blockCandidates: remoteTestFlags.has('block-ice')
     })
   });
-  remoteManager.onFrame((deviceId, frame) => sendToLocalUi('remote:frame', { deviceId, frame }));
-  remoteManager.onStatus((status) => sendToLocalUi('remote:status', status));
+  remoteManager.onFrame((deviceId, frame) => {
+    const delivered = sendToLocalUi('remote:frame', { deviceId, frame });
+    if (!delivered && frame?.type === 'tool-call') refuseWithNoWindow(deviceId, frame);
+  });
+  // The work ends first, so a switch turned off has taken effect by the time anything says so.
+  remoteManager.onStatus((status) => {
+    reconcileRemoteWork(status);
+    sendToLocalUi('remote:status', status);
+  });
 }
 
 function sendToLocalUi(channel, payload) {
-  if (!mainWindow || mainWindow.isDestroyed()) return;
-  try { mainWindow.webContents.send(channel, payload); } catch {}
+  if (!mainWindow || mainWindow.isDestroyed()) return false;
+  try {
+    mainWindow.webContents.send(channel, payload);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 // Only this app's own page in its main window, so never a preview, and never another
@@ -753,6 +774,96 @@ handleRemote('remote:removeDevice', ({ id }) => remoteManager.removeDevice(id));
 // handleRemote has checked the sender by now, which is what makes this claim true.
 handleRemote('remote:setControlAllowed', ({ allowed }) => remoteManager.setControlAllowed(allowed, { fromLocalUi: true }));
 handleRemote('remote:send', ({ deviceId, frame }) => remoteManager.send(deviceId, frame));
+handleRemote('remote:audit', (entry) => writeRemoteAudit(entry));
+handleRemote('remote:endRun', ({ deviceId, id }) => endRemoteRun(remoteRunKey({ deviceId, id }), 'stopped'));
+
+// =================== WHAT A HOME PC RUNS HERE ===================
+// The switch going off, the link dropping, and Stop all have to reach a process, so what a home PC
+// started is kept here, where they are, rather than in a page that may be gone. A live run_command
+// ends with the link, because the model has been told it failed. A background task only ends with
+// the switch or the pairing: the design has it keep going, and report on reconnect.
+const REMOTE_AUDIT_MAX_BYTES = 16 * 1024 * 1024;
+const remoteRuns = new Map(); // `${deviceId}:${id}` -> { child, deviceId, id, command, ended }
+
+// One JSON object per line, in this device's own profile, and it can't grow without limit however
+// many refusals a paired device asks for.
+function writeRemoteAudit(entry) {
+  try {
+    const file = path.join(app.getPath('userData'), 'remote-audit.log');
+    try {
+      if (fs.statSync(file).size > REMOTE_AUDIT_MAX_BYTES) fs.renameSync(file, `${file}.old`);
+    } catch (err) {
+      if (err.code !== 'ENOENT') throw err;
+    }
+    fs.appendFileSync(file, RemoteRules.auditLine({ ...entry, ts: new Date().toISOString() }) + '\n');
+    return { ok: true };
+  } catch (e) {
+    return { error: e.message };
+  }
+}
+
+function noteToolRefused({ deviceId, deviceName, reason, frame }) {
+  const tool = typeof frame?.name === 'string' ? frame.name : '';
+  writeRemoteAudit({
+    event: 'refused', device: deviceId, deviceName, chatTitle: frame?.chatTitle, tool, args: RemoteRules.auditArgs(tool, frame?.args), reason, ok: false
+  });
+}
+
+// A Mac with its window closed has nothing to run this, and home shouldn't wait to find out.
+function refuseWithNoWindow(deviceId, frame) {
+  const reason = "Sanctum's window is closed on this device, so nothing ran.";
+  noteToolRefused({ deviceId, reason, frame });
+  remoteManager.send(deviceId, { type: 'tool-result', id: frame.id, result: { error: reason }, summary: 'refused', ok: false });
+}
+
+function remoteRunKey(remoteCall) {
+  return `${remoteCall?.deviceId}:${remoteCall?.id}`;
+}
+
+// The switch can have gone off between a frame reaching the page and the page getting here.
+function remoteCallRefused(remoteCall) {
+  if (!remoteCall) return null;
+  if (!remoteManager) return "Remote Control didn't start.";
+  return remoteManager.toolCallRefusal(remoteCall.deviceId);
+}
+
+function endRemoteRun(key, reason) {
+  const run = remoteRuns.get(key);
+  if (!run || run.ended) return { ok: true };
+  run.ended = true;
+  killTree(run.child);
+  writeRemoteAudit({ event: 'ended', device: run.deviceId, tool: 'run_command', args: { command: run.command }, reason, ok: false });
+  return { ok: true };
+}
+
+function endRemoteTask(task, reason) {
+  task.status = 'killed';
+  killTree(task.proc);
+  writeRemoteAudit({ event: 'ended', device: task.remoteDevice, tool: 'run_command_async', args: { command: task.command }, reason, ok: false });
+}
+
+function reconcileRemoteWork(status) {
+  const off = status.controlAllowed !== true || status.needsPin === true;
+  const homes = new Map((status.devices || []).filter((d) => d.role === 'home').map((d) => [d.id, d]));
+  for (const [key, run] of remoteRuns) {
+    if (off) endRemoteRun(key, 'off');
+    else if (!homes.get(run.deviceId)?.connected) endRemoteRun(key, 'offline');
+  }
+  for (const task of backgroundTasks.values()) {
+    if (!task.remoteDevice || task.status !== 'running') continue;
+    if (off) endRemoteTask(task, 'off');
+    else if (!homes.has(task.remoteDevice)) endRemoteTask(task, 'removed');
+  }
+}
+
+// The page that would have answered is going away, so nothing else will tell the home PC.
+function endRemoteRunsWithPage() {
+  for (const [key, run] of remoteRuns) {
+    if (run.ended) continue;
+    endRemoteRun(key, 'page closed');
+    remoteManager?.send(run.deviceId, { type: 'tool-result', id: run.id, result: { error: 'Sanctum was reloaded or closed on this device, so that stopped.' }, summary: 'stopped', ok: false });
+  }
+}
 
 // =================== MCP SERVERS ===================
 ipcMain.handle('mcp:list', () => mcpManager ? mcpManager.listServers() : []);
@@ -1942,13 +2053,16 @@ ipcMain.handle('file:from_path', async (_e, { path: filePath }) => {
 const backgroundTasks = new Map();
 let nextTaskId = 1;
 
-ipcMain.handle('shell:run_async', async (_e, { command, cwd, allowlist }) => {
+ipcMain.handle('shell:run_async', async (_e, { command, cwd, allowlist, remoteCall }) => {
   try {
+    const refused = remoteCallRefused(remoteCall);
+    if (refused) return { error: refused };
     const wd = cwd ? resolveSafe(cwd) : os.homedir();
     if (allowlist?.length && !withinAllowlist(wd, allowlist)) {
       return { error: `cwd "${cwd}" outside allowed roots` };
     }
-    const taskId = 'task_' + (nextTaskId++);
+    // An id of its own, so one a model remembers from here can't find a task on the home PC.
+    const taskId = (remoteCall ? 'remote_task_' : 'task_') + (nextTaskId++);
     const proc = spawn(command, [], {
       cwd: wd,
       // Same resolved shell as sync shell:run — Git Bash on Windows if
@@ -1960,7 +2074,8 @@ ipcMain.handle('shell:run_async', async (_e, { command, cwd, allowlist }) => {
       id: taskId, command, cwd: wd,
       proc, stdout: '', stderr: '',
       status: 'running', exitCode: null,
-      startedAt: Date.now(), finishedAt: null
+      startedAt: Date.now(), finishedAt: null,
+      remoteDevice: remoteCall?.deviceId ?? null
     };
     const cap = (s) => s.length > 200_000 ? s.slice(-200_000) : s;
     proc.stdout.on('data', d => { task.stdout = cap(task.stdout + d.toString()); });
@@ -1982,8 +2097,11 @@ ipcMain.handle('shell:run_async', async (_e, { command, cwd, allowlist }) => {
   } catch (e) { return { error: e.message }; }
 });
 
-ipcMain.handle('shell:task_status', async (_e, taskId) => {
-  const task = backgroundTasks.get(taskId);
+// With a scope, only what that device started exists.
+const taskInScope = (task, scope) => task && (!scope || task.remoteDevice === scope) ? task : null;
+
+ipcMain.handle('shell:task_status', async (_e, taskId, scope) => {
+  const task = taskInScope(backgroundTasks.get(taskId), scope);
   if (!task) return { error: 'task not found: ' + taskId };
   const elapsed = Math.round(((task.finishedAt || Date.now()) - task.startedAt) / 1000);
   return {
@@ -1995,9 +2113,10 @@ ipcMain.handle('shell:task_status', async (_e, taskId) => {
   };
 });
 
-ipcMain.handle('shell:task_list', async () => {
+ipcMain.handle('shell:task_list', async (_e, scope) => {
   const out = [];
   for (const t of backgroundTasks.values()) {
+    if (!taskInScope(t, scope)) continue;
     out.push({
       id: t.id, command: t.command, status: t.status, exitCode: t.exitCode,
       runtime_seconds: Math.round(((t.finishedAt || Date.now()) - t.startedAt) / 1000)
@@ -2006,8 +2125,8 @@ ipcMain.handle('shell:task_list', async () => {
   return { tasks: out };
 });
 
-ipcMain.handle('shell:task_kill', async (_e, taskId) => {
-  const task = backgroundTasks.get(taskId);
+ipcMain.handle('shell:task_kill', async (_e, taskId, scope) => {
+  const task = taskInScope(backgroundTasks.get(taskId), scope);
   if (!task) return { error: 'task not found' };
   if (task.status !== 'running') return { error: `task already ${task.status}` };
   task.status = 'killed';
@@ -2753,7 +2872,9 @@ ipcMain.handle('fs:grep', async (_e, { pattern, root, glob: globFilter, caseInse
 });
 
 // =============== SHELL ===============
-ipcMain.handle('shell:run', async (_e, { command, cwd }) => {
+ipcMain.handle('shell:run', async (_e, { command, cwd, remoteCall }) => {
+  const refused = remoteCallRefused(remoteCall);
+  if (refused) return { error: refused };
   return new Promise((resolve) => {
     const wd = cwd ? resolveSafe(cwd) : os.homedir();
     let timedOut = false;
@@ -2766,6 +2887,7 @@ ipcMain.handle('shell:run', async (_e, { command, cwd }) => {
       windowsHide: true
     }, (err, stdout, stderr) => {
       clearTimeout(timer);
+      if (remoteCall) remoteRuns.delete(remoteRunKey(remoteCall));
       resolve({
         command,
         cwd: wd,
@@ -2775,6 +2897,7 @@ ipcMain.handle('shell:run', async (_e, { command, cwd }) => {
         timedOut
       });
     });
+    if (remoteCall) remoteRuns.set(remoteRunKey(remoteCall), { child, deviceId: remoteCall.deviceId, id: remoteCall.id, command, ended: false });
     const timer = setTimeout(() => { timedOut = true; killTree(child); }, 60_000);
   });
 });

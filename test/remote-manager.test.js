@@ -262,7 +262,7 @@ function newWorld(t) {
   // A device with a PIN set, whose manager isn't running yet, so a test can seed peers.
   world.device = async (name, { pin = true, address = ADDRESS, file = world.newFile(), keystore = world.keystore(file) } = {}) => {
     if (pin) assert.deepEqual(await keystore.setPin(PIN), { ok: true });
-    const device = { name, keystore, file, autoUnlock: fakeAutoUnlock(), frames: [], statuses: [], address };
+    const device = { name, keystore, file, autoUnlock: fakeAutoUnlock(), frames: [], statuses: [], refusals: [], address };
     device.identity = () => keystore.getIdentity();
     device.id = pin ? deviceIdFromPublicKey(keystore.getIdentity().publicKey) : null;
     device.start = () => {
@@ -278,7 +278,8 @@ function newWorld(t) {
         autoUnlock: device.autoUnlock,
         clock: world.clock,
         deviceName: name,
-        createDirect: device.createDirect
+        createDirect: device.createDirect,
+        onToolRefused: (info) => device.refusals.push(info)
       });
       const send = device.manager.send;
       device.manager.send = (id, frame) => {
@@ -1244,7 +1245,7 @@ test('the manager has no route from a frame to anything but onFrame listeners', 
   device.start();
   assert.deepEqual(Object.keys(device.manager).sort(), [
     'cancelCode', 'createCode', 'lock', 'onFrame', 'onStatus', 'pair', 'removeDevice',
-    'send', 'setAddress', 'setControlAllowed', 'setPin', 'shutdown', 'status', 'unlock'
+    'send', 'setAddress', 'setControlAllowed', 'setPin', 'shutdown', 'status', 'toolCallRefusal', 'unlock'
   ]);
 
   // The code that handles what arrives never mentions the switch, and doesn't branch on what
@@ -4243,4 +4244,245 @@ test('a device that is locked as a laptop goes on serving its own laptops', asyn
   assert.equal(serving.manager.send(other.id, { type: 'mirror-ops', seq: 1 }), false);
   world.relay.pump();
   assert.deepEqual(own.frames.map((f) => f.frame.type), servingFrames);
+});
+
+// ---- Tool calls ----
+
+const TOOL_CALL = (id = 'call1') => ({ type: 'tool-call', id, name: 'run_command', args: { command: 'ls' }, chatTitle: 'A chat' });
+const toolFrames = (device) => device.frames.filter(({ frame }) => frame.type === 'tool-call' || frame.type === 'tool-result');
+
+test('a tool call is refused in the manager while the switch is off, and the renderer never sees it', async (t) => {
+  const { world, home, laptop } = await connected(t);
+  assert.equal(home.manager.send(laptop.id, TOOL_CALL()), true);
+  world.run(1);
+  assert.deepEqual(toolFrames(laptop), [], 'it never reached a listener');
+  const [{ frame }] = toolFrames(home);
+  assert.equal(frame.type, 'tool-result');
+  assert.equal(frame.id, 'call1');
+  assert.equal(frame.ok, false);
+  assert.match(frame.result.error, /switch/);
+  assert.equal(laptop.refusals.length, 1);
+  assert.equal(laptop.refusals[0].deviceId, home.id);
+  assert.equal(laptop.refusals[0].frame.name, 'run_command');
+  assert.match(laptop.refusals[0].reason, /switch/);
+});
+
+test('a tool call reaches the renderer once the switch is on, and stops again the moment it is off', async (t) => {
+  const { world, home, laptop } = await connected(t);
+  assert.deepEqual(laptop.manager.setControlAllowed(true, { fromLocalUi: true }), { ok: true });
+  home.manager.send(laptop.id, TOOL_CALL('on'));
+  world.run(1);
+  assert.deepEqual(toolFrames(laptop).map(({ frame }) => frame.id), ['on']);
+  assert.deepEqual(laptop.refusals, []);
+  assert.equal(laptop.manager.toolCallRefusal(home.id), null);
+
+  assert.deepEqual(laptop.manager.setControlAllowed(false, { fromLocalUi: true }), { ok: true });
+  assert.match(laptop.manager.toolCallRefusal(home.id), /switch/);
+  home.manager.send(laptop.id, TOOL_CALL('off'));
+  world.run(1);
+  assert.deepEqual(toolFrames(laptop).map(({ frame }) => frame.id), ['on']);
+  assert.equal(laptop.refusals.length, 1);
+});
+
+test("a device paired as this device's laptop can never ask, even with this device's own switch on", async (t) => {
+  const { world, home, laptop } = await connected(t);
+  assert.deepEqual(home.manager.setControlAllowed(true, { fromLocalUi: true }), { ok: true });
+  laptop.manager.send(home.id, TOOL_CALL('backwards'));
+  world.run(1);
+  assert.deepEqual(toolFrames(home), []);
+  assert.equal(home.refusals.length, 1);
+  assert.match(home.refusals[0].reason, /doesn't take/);
+  assert.match(home.manager.toolCallRefusal(laptop.id), /doesn't take/);
+  const [{ frame }] = toolFrames(laptop);
+  assert.equal(frame.ok, false);
+});
+
+test('a device nobody knows has no answer about what it may ask', async (t) => {
+  const { laptop } = await connected(t);
+  assert.ok(laptop.manager.toolCallRefusal('no-such-device'));
+});
+
+test("a tool call with an id it can't answer to gets no answer, and is still recorded", async (t) => {
+  const { world, home, laptop } = await connected(t);
+  assert.deepEqual(laptop.manager.setControlAllowed(true, { fromLocalUi: true }), { ok: true });
+  for (const id of ['a b', '', 'x'.repeat(65), 7, null]) home.manager.send(laptop.id, { ...TOOL_CALL(), id });
+  world.run(1);
+  assert.deepEqual(toolFrames(laptop), []);
+  assert.deepEqual(toolFrames(home), []);
+  assert.equal(laptop.refusals.length, 5);
+});
+
+test('a device owing a PIN refuses a tool call, whatever its switch says', async (t) => {
+  const { world, home, laptop } = await connected(t);
+  assert.deepEqual(laptop.manager.setControlAllowed(true, { fromLocalUi: true }), { ok: true });
+  // The one way to get there with the switch already on: the keystore no longer says a person set it.
+  laptop.keystore.pinKind = () => 'device';
+  assert.equal(laptop.manager.status().needsPin, true);
+  home.manager.send(laptop.id, TOOL_CALL());
+  world.run(1);
+  assert.deepEqual(toolFrames(laptop), []);
+  assert.match(laptop.refusals[0].reason, /PIN/);
+  assert.match(toolFrames(home)[0].frame.result.error, /PIN/);
+});
+
+test('an idle-locked laptop keeps taking tool calls and answering them', async (t) => {
+  const { world, home, laptop } = await connected(t);
+  assert.deepEqual(laptop.manager.setControlAllowed(true, { fromLocalUi: true }), { ok: true });
+  laptop.manager.lock();
+  assert.equal(laptop.manager.status().idleLocked, true);
+
+  home.manager.send(laptop.id, TOOL_CALL('locked'));
+  world.run(1);
+  assert.deepEqual(toolFrames(laptop).map(({ frame }) => frame.id), ['locked']);
+
+  assert.equal(laptop.manager.send(home.id, { type: 'tool-result', id: 'locked', result: { a: 1 }, summary: 's', ok: true }), true);
+  assert.equal(laptop.manager.send(home.id, { type: 'control-state', allowed: true, mcpTools: [], os: 'win32', shell: 'Bash' }), true);
+  world.run(1);
+  const got = home.frames.map(({ frame }) => frame.type);
+  assert.ok(got.includes('tool-result') && got.includes('control-state'), got.join());
+
+  // Turning it off still works, and takes effect.
+  assert.deepEqual(laptop.manager.setControlAllowed(false, { fromLocalUi: true }), { ok: true });
+  home.manager.send(laptop.id, TOOL_CALL('after'));
+  world.run(1);
+  assert.deepEqual(toolFrames(laptop).filter(({ frame }) => frame.type === 'tool-call').map(({ frame }) => frame.id), ['locked']);
+});
+
+test('while locked a tool result may be 8 MiB, on the plain copy, and nothing else gets past 64 KiB', async (t) => {
+  const { world, home, laptop } = await connected(t);
+  laptop.manager.lock();
+  const pad = (size) => 'x'.repeat(size);
+  assert.equal(laptop.manager.send(home.id, { type: 'tool-result', id: 'r1', result: { text: pad(7 * MIB) }, summary: '', ok: true }), true);
+  assert.equal(laptop.manager.send(home.id, { type: 'tool-result', id: 'r2', result: { text: pad(8 * MIB) }, summary: '', ok: true }), false);
+  assert.equal(laptop.manager.send(home.id, { type: 'tool-result', id: 'r3', result: { text: 'é'.repeat(4.2 * MIB) }, summary: '', ok: true }), false, 'counted in bytes');
+  assert.equal(laptop.manager.send(home.id, { type: 'control-state', allowed: true, mcpTools: [pad(70 * 1024)] }), false);
+  assert.equal(laptop.manager.send(home.id, { type: 'mirror-part-ack', pad: pad(70 * 1024) }), false);
+  assert.equal(laptop.manager.send(home.id, { type: 'action', id: 'a', kind: 'stop', chatId: 'c' }), false);
+  assert.equal(laptop.manager.send(home.id, { type: 'tool-call', id: 'x', name: 'run_command', args: {} }), false);
+  assert.equal(laptop.manager.send(home.id, { type: new String('tool-result'), id: 'r4' }), false); // eslint-disable-line no-new-wrappers
+  world.run(1);
+  assert.deepEqual(home.frames.filter(({ frame }) => frame.type === 'tool-result').map(({ frame }) => frame.id), ['r1']);
+});
+
+test("a locked device with laptops of its own can stop a call, and can't start one", async (t) => {
+  const world = newWorld(t);
+  const above = await world.device('Above');
+  const home = await world.device('Home');
+  const laptop = await world.device('Laptop');
+  seedPair(above, home);
+  seedPair(home, laptop);
+  above.start();
+  home.start();
+  laptop.start();
+  world.relay.pump();
+  assert.equal(home.entry(above.id).connected, true);
+  assert.equal(home.entry(laptop.id).connected, true);
+  home.manager.lock();
+  assert.equal(home.manager.status().idleLocked, true);
+  assert.equal(home.manager.send(laptop.id, TOOL_CALL()), false);
+  assert.equal(home.manager.send(laptop.id, { type: 'tool-cancel', id: 'call1' }), true);
+  world.run(1);
+  assert.ok(laptop.frames.some(({ frame }) => frame.type === 'tool-cancel'));
+});
+
+// Everything sent from here on goes nowhere, as if the other end had vanished without a word.
+function losingEverything(world, ms, stopWhen = () => false) {
+  const { drop } = world.relay;
+  world.relay.drop = () => true;
+  world.relay.pump();
+  let elapsed = 0;
+  while (elapsed < ms && !stopWhen()) {
+    world.clock.advance(100);
+    elapsed += 100;
+  }
+  world.relay.drop = drop;
+  return elapsed;
+}
+
+test('while a call is out, a device that goes quiet shows as offline within 5 seconds', async (t) => {
+  const { world, home, laptop } = await connected(t);
+  assert.deepEqual(laptop.manager.setControlAllowed(true, { fromLocalUi: true }), { ok: true });
+  home.manager.send(laptop.id, TOOL_CALL());
+  world.run(1);
+  assert.equal(home.entry(laptop.id).connected, true);
+
+  // Busy isn't gone: it answers its probes for as long as anyone likes.
+  world.run(20000);
+  assert.equal(home.entry(laptop.id).connected, true, 'a working device stays connected');
+
+  // Now a closed lid, a lost network, or a direct path that has died with nothing to say so.
+  const took = losingEverything(world, 10000, () => !home.entry(laptop.id).connected);
+  assert.ok(took <= 5000, `took ${took} ms`);
+  assert.equal(home.statuses.at(-1).devices.find((d) => d.id === laptop.id).connected, false, 'and a status said so');
+
+  // Hearing from it again ends that, on the same session.
+  world.run(16000);
+  assert.equal(home.entry(laptop.id).connected, true);
+});
+
+test('a laptop running a call notices its home PC going quiet too', async (t) => {
+  const { world, home, laptop } = await connected(t);
+  assert.deepEqual(laptop.manager.setControlAllowed(true, { fromLocalUi: true }), { ok: true });
+  home.manager.send(laptop.id, TOOL_CALL());
+  world.run(1);
+  const took = losingEverything(world, 10000, () => !laptop.entry(home.id).connected);
+  assert.ok(took <= 5000, `took ${took} ms`);
+});
+
+test('with no call out, nothing watches, and nothing extra goes over the relay', async (t) => {
+  const { world, home, laptop } = await connected(t);
+  world.run(1);
+  const before = world.relay.log.length;
+  world.run(5000);
+  assert.equal(world.relay.log.length, before);
+  losingEverything(world, 14000);
+  assert.equal(home.entry(laptop.id).connected, true, 'quiet means nothing with no call out');
+});
+
+test('a result ends the watching, and so does a cancel with nothing left out', async (t) => {
+  const { world, home, laptop } = await connected(t);
+  assert.deepEqual(laptop.manager.setControlAllowed(true, { fromLocalUi: true }), { ok: true });
+  home.manager.send(laptop.id, TOOL_CALL('first'));
+  world.run(1);
+  laptop.manager.send(home.id, { type: 'tool-result', id: 'first', result: {}, summary: '', ok: true });
+  world.run(1);
+  world.run(1100); // one tick for each end to notice
+  const count = world.relay.log.length;
+  world.run(4000);
+  assert.equal(world.relay.log.length, count, 'no probes once it has answered');
+
+  home.manager.send(laptop.id, TOOL_CALL('second'));
+  world.run(1);
+  home.manager.send(laptop.id, { type: 'tool-cancel', id: 'second' });
+  laptop.manager.send(home.id, { type: 'tool-result', id: 'second', result: {}, summary: '', ok: false });
+  world.run(1);
+  world.run(1100);
+  const later = world.relay.log.length;
+  world.run(4000);
+  assert.equal(world.relay.log.length, later);
+});
+
+test('a call that never gets an answer stops being watched in the end', async (t) => {
+  const { world, home, laptop } = await connected(t);
+  assert.deepEqual(laptop.manager.setControlAllowed(true, { fromLocalUi: true }), { ok: true });
+  home.manager.send(laptop.id, TOOL_CALL());
+  world.run(1);
+  world.run(6 * MINUTES);
+  const count = world.relay.log.length;
+  world.run(2000);
+  assert.equal(world.relay.log.length, count, 'nothing but heartbeats, and none are due in this gap');
+  assert.equal(home.entry(laptop.id).connected, true);
+});
+
+test('a tool call from a home PC gets through unchanged, and nothing about it is kept when a session ends', async (t) => {
+  const { world, home, laptop } = await connected(t);
+  assert.deepEqual(laptop.manager.setControlAllowed(true, { fromLocalUi: true }), { ok: true });
+  const frame = TOOL_CALL('whole');
+  home.manager.send(laptop.id, frame);
+  world.run(1);
+  assert.deepEqual(toolFrames(laptop)[0].frame, frame);
+  const timers = world.clock.pendingTimers();
+  laptop.manager.shutdown();
+  home.manager.shutdown();
+  assert.ok(world.clock.pendingTimers() < timers);
 });

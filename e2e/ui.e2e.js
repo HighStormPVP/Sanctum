@@ -352,6 +352,27 @@ test('two devices, through the interface', async (t) => {
     homeId = after.devices[0].id;
     homeName = after.devices[0].name;
 
+    // The switch is asked about here, and stays off unless it's turned on.
+    await appeared(laptop, '#remote-control-ask-overlay');
+    assert.equal(await textOf(laptop, '#remote-control-ask-title'), 'Let my home PC control this laptop?');
+    assert.equal(await laptop.page.evaluate(() => document.activeElement?.id), 'remote-control-ask-off', 'the safe answer is the one a stray Enter gives');
+    assert.equal((await status(laptop)).controlAllowed, false);
+    await click(laptop, '#remote-control-ask-off');
+    await gone(laptop, '#remote-control-ask-overlay');
+    assert.equal((await status(laptop)).controlAllowed, false);
+
+    await laptop.page.evaluate(() => askAboutControl());
+    await appeared(laptop, '#remote-control-ask-overlay');
+    await laptop.page.keyboard.press('Escape');
+    await gone(laptop, '#remote-control-ask-overlay');
+    assert.equal((await status(laptop)).controlAllowed, false, 'closing it leaves it off');
+
+    await laptop.page.evaluate(() => askAboutControl());
+    await click(laptop, '#remote-control-ask-on');
+    await gone(laptop, '#remote-control-ask-overlay');
+    await waitFor('the switch to take', async () => (await status(laptop)).controlAllowed === true);
+    assert.deepEqual(await laptop.remote('setControlAllowed', false), { ok: true });
+
     // The other end says so, and the used code is gone from the screen.
     await waitFor('home to hear', async () => (await status(home)).devices.length === 1, 10000);
     laptopId = (await status(home)).devices[0].id;

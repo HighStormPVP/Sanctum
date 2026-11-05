@@ -1862,6 +1862,15 @@ button { font-family: inherit; }
   letter-spacing: 0;
   flex-shrink: 0;
 }
+/* Which machine ran this. Plain words beside the label, so it reads as part of the card. */
+.te-device {
+  color: var(--text-2);
+  flex-shrink: 0;
+  max-width: 28ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .te-shell-summary {
   color: var(--text-3);
   overflow: hidden;

@@ -753,7 +753,7 @@ function richChat() {
   return {
     id: 'rich', title: 'Rich', model: 'some:model', modality: 'code', createdAt: 5, updatedAt: Date.now(),
     webEnabled: true, thinkingEnabled: true, planMode: true, approvalMode: false, noApproval: false, readOnly: false, noFetch: false,
-    projectFolder: 'C:\\work\\folder',
+    projectFolder: 'C:\\work\\folder', folderElsewhere: '/Users/someone/folder',
     messages: [
       { role: 'user', content: 'plain', modality: 'chat', attachments: [{ kind: 'image', name: 'a.png', pages: 2, ext: 'png' }, { kind: 'video', name: 'v.mp4', ext: 'mp4' }, { kind: 'pdf', name: 'a.pdf', pages: 3 }] },
       { role: 'user', content: 'waiting', queued: true, attachments: [] },
@@ -770,7 +770,9 @@ function richChat() {
           event('web_search', 'running'), event('web_search', 'done'), event('web_search', 'error'),
           event('run_command', 'running'), event('run_command', 'done'), event('run_command', 'error'),
           event('run_command_async', 'done'), event('calc', 'running'), event('calc', 'done'), event('calc', 'error'),
-          event('some_mcp_tool', 'done')
+          event('some_mcp_tool', 'done'),
+          { ...event('read_file', 'done'), device: 'MacBook' },
+          { ...event('run_command', 'done'), device: 'MacBook', shell: 'Bash' }
         ]
       },
       ...['starting', 'checking-deps', 'deps-missing', 'installing', 'install-done', 'probing', 'extracting', 'extracting-audio', 'dedup',
@@ -984,7 +986,7 @@ test('a paired home can send anything: only the expected rendering comes of it',
           window.__sendOps(chat.id, [{ type: 'msg-remove', index: count }]);
         }
       }
-      for (const field of ['title', 'model', 'modality', 'projectFolder']) {
+      for (const field of ['title', 'model', 'modality', 'projectFolder', 'folderElsewhere']) {
         window.__sendOps(chat.id, [{ type: 'meta', set: { [field]: payload } }]);
         window.__check(`meta ${field}`);
       }

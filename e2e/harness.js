@@ -108,7 +108,7 @@ async function launchDevice(name, { flags = 'log,no-stun', ollamaUrl, profile = 
       window.__mirrorFrames = [];
       window.__statuses = [];
       window.api.remote.onFrame((deviceId, frame) => {
-        const mirrored = typeof frame.type === 'string' && frame.type.startsWith('mirror-');
+        const mirrored = typeof frame.type === 'string' && (frame.type.startsWith('mirror-') || frame.type === 'control-state');
         (mirrored ? window.__mirrorFrames : window.__frames).push(frame);
       });
       window.api.remote.onStatus((status) => window.__statuses.push(status));

@@ -67,7 +67,9 @@ const state = {
     state.mcpServers = servers || [];
     try { state.mcpTools = await window.api.mcp.getTools(); } catch { state.mcpTools = []; }
     if (typeof renderMcpSettings === 'function') renderMcpSettings();
+    sendControlStateToHomes();
   });
+  sendControlStateToHomes();
 
   if (!state.order.length) {
     createChat();
@@ -3376,7 +3378,7 @@ function renderActiveChat() {
     // Project-folder gating: agentic chats are locked until you pick a folder.
     const composerForm = $('#composer-form');
     const composerInput = $('#composer-input');
-    if (isAgent && !c.projectFolder) {
+    if (isAgent && !chatHasFolder(c)) {
       if (folderNeeded) folderNeeded.hidden = false;
       composerForm?.classList.add('disabled');
       if (composerInput) {
@@ -3392,11 +3394,12 @@ function renderActiveChat() {
         composerInput.placeholder = composerPlaceholder(c.modality);
       }
       if (folderChip) {
-        if (isAgent && c.projectFolder) {
+        if (isAgent && chatFolderPath(c)) {
           folderChip.hidden = false;
-          const name = c.projectFolder.split(/[\\/]/).pop() || c.projectFolder;
+          const folder = chatFolderPath(c);
+          const name = folder.split(/[\\/]/).pop() || folder;
           $('#agent-folder-name').textContent = name;
-          folderChip.title = `Project folder: ${c.projectFolder}\nClick to change`;
+          folderChip.title = `Project folder: ${folder}\nClick to change`;
         } else {
           folderChip.hidden = true;
         }
@@ -3631,7 +3634,7 @@ function renderEmptyState() {
 function renderAgenticEmptyState(c) {
   const wrap = document.createElement('div');
   wrap.className = 'empty agentic-empty';
-  if (!c.projectFolder) {
+  if (!chatHasFolder(c)) {
     wrap.innerHTML = `
       <div class="empty-orb"></div>
       <h2>Select a project folder</h2>
@@ -3646,7 +3649,8 @@ function renderAgenticEmptyState(c) {
       if (btn) btn.addEventListener('click', pickProjectFolder);
     }, 0);
   } else {
-    const folderName = c.projectFolder.split(/[\\/]/).pop() || c.projectFolder;
+    const folder = chatFolderPath(c);
+    const folderName = folder.split(/[\\/]/).pop() || folder;
     wrap.innerHTML = `
       <div class="empty-orb"></div>
       <h2>Ready to work</h2>
@@ -4015,6 +4019,7 @@ function renderCompactToolEvent(ev) {
   el.innerHTML = `
     <span class="te-shell-dot"></span>
     <span class="te-shell-label">${escapeHtml(label)}</span>
+    ${ev.device ? `<span class="te-device">${escapeHtml(ev.device)}</span>` : ''}
     <span class="te-shell-summary">${escapeHtml(argSummary)}</span>
     <span class="te-shell-status">${escapeHtml(statusText)}</span>
   `;
@@ -4037,7 +4042,7 @@ function renderShellToolEvent(ev) {
   // A remote chat's commands ran on the home PC, so that's the shell to name.
   const c = currentChat();
   const homeShell = c?.remote ? mirror.homes.get(c.remote.deviceId)?.info?.shell?.name : null;
-  const shellName = homeShell || (state.shellInfo || window.api?.shellInfo)?.name || (window.api?.platform === 'win32' ? 'Cmd' : 'Bash');
+  const shellName = ev.shell || homeShell || (state.shellInfo || window.api?.shellInfo)?.name || (window.api?.platform === 'win32' ? 'Cmd' : 'Bash');
   const label = isAsync ? `${shellName} · async` : shellName;
   const cmd = ev.input || ev.argSummary || '';
   const truncatedCmd = cmd.length > 200 ? cmd.slice(0, 200) + '…' : cmd;
@@ -4052,6 +4057,7 @@ function renderShellToolEvent(ev) {
     <div class="te-shell-head">
       <span class="te-shell-dot"></span>
       <span class="te-shell-label">${escapeHtml(label)}</span>
+      ${ev.device ? `<span class="te-device">${escapeHtml(ev.device)}</span>` : ''}
       <span class="te-shell-summary">${escapeHtml(truncatedCmd)}</span>
       <span class="te-shell-status">${statusText}</span>
     </div>
@@ -4746,7 +4752,7 @@ function wireComposer() {
     e.preventDefault();
     const c = currentChat();
     if (!c) return;
-    if (c.modality === 'agent' && !c.projectFolder) return;
+    if (c.modality === 'agent' && !chatHasFolder(c)) return;
     // Whether this runs or queues is for the home PC to say, when it gets there.
     if (c.remote) { await dispatchSend(); return; }
 
@@ -4881,6 +4887,7 @@ async function processNextQueued(c) {
   msg.queued = false;
   const attachments = msg._attachmentData || [];
   delete msg._attachmentData;
+  if (msg._fromDevice) remoteTools.starters.set(c.id, msg._fromDevice);
   delete msg._fromDevice;
   saveToStorage();
   renderIfOpen(c);
@@ -4913,7 +4920,7 @@ async function dispatchSend() {
   const c = currentChat();
   if (!c) return;
   // Agentic chats are locked until a project folder is selected.
-  if (c.modality === 'agent' && !c.projectFolder) {
+  if (c.modality === 'agent' && !chatHasFolder(c)) {
     return;
   }
   if (c.remote) { await sendComposerToHome(c); return; }
@@ -5099,7 +5106,8 @@ async function _runOllamaChatInner(c, attachments) {
   if (firstQueued >= 0) c.messages.splice(firstQueued, 0, assistantMsg);
   else c.messages.push(assistantMsg);
   // Mark this chat as running so the send button flips to a stop button.
-  state.runningChats.set(c.id, { channelId: null, abortRequested: false });
+  state.runningChats.set(c.id, { channelId: null, abortRequested: false, startedBy: remoteTools.starters.get(c.id) ?? null });
+  remoteTools.starters.delete(c.id);
   updateSendButton();
   renderIfOpen(c);
 
@@ -5133,10 +5141,10 @@ async function _runOllamaChatInner(c, attachments) {
   if (c.webEnabled && modelSupportsTools(c.model)) {
     history.unshift({ role: 'system', content: WEB_SEARCH_PROMPT });
   }
-  if (c.projectFolder) {
-    const pf = projectFolderPrompt(c);
-    if (pf) history.unshift({ role: 'system', content: pf });
-  }
+  const pf = projectFolderPrompt(c);
+  if (pf) history.unshift({ role: 'system', content: pf });
+  const devicesLine = devicesPrompt(c);
+  if (devicesLine) history.unshift({ role: 'system', content: devicesLine });
   if (state.settings.instructions?.trim()) {
     history.unshift({ role: 'system', content: state.settings.instructions.trim() });
   }
@@ -5563,7 +5571,8 @@ ollama pull qwen2.5vl:7b
       const ev = {
         name,
         argSummary: summarizeArgs(name, args),
-        status: 'running'
+        status: 'running',
+        ...toolCardPlace(name, args, c)
       };
       // Capture the raw command up-front for shell tools so the IN box can
       // show it even before the call completes (running state).
@@ -5643,6 +5652,8 @@ function stopChat(chatId) {
   const run = state.runningChats.get(chatId);
   if (!run) return;
   run.abortRequested = true;
+  run.endAsk?.();
+  cancelToolCallsOfChat(chatId);
   // Reflect the stop in the UI IMMEDIATELY so the user gets instant feedback.
   // The actual abort cycle (fetch interrupt → server-side aborted chunk →
   // promise resolve → break loop) takes several hundred ms; without an
@@ -5747,12 +5758,17 @@ Therefore:
 When the user asks you to do something destructive (delete files, etc.), trust that they mean it. Their request IS the approval to attempt. The per-call modal is the final safety check.`;
 
 function projectFolderPrompt(c) {
-  if (!c.projectFolder) return null;
-  const isWindows = /^[A-Za-z]:[\\/]/.test(c.projectFolder);
+  const folderDevice = RemoteRules.chatFolderDevice(c);
+  const elsewhere = folderDevice !== RemoteRules.HOME_DEVICE;
+  // A laptop's folder name comes from that device, and it goes in a system prompt.
+  const projectFolder = elsewhere ? RemoteRules.cleanLine(folderOn(c, folderDevice), 4096) : c.projectFolder;
+  if (!projectFolder) return null;
+  const onDevice = elsewhere ? pairedToolDevices().find((d) => d.id === folderDevice) : null;
+  const isWindows = /^[A-Za-z]:[\\/]/.test(projectFolder);
   const sep = isWindows ? '\\\\' : '/';
   // On Windows, commands run in Git Bash when it's installed. Telling the agent
   // it's on cmd.exe there made its del and dir commands fail.
-  const usesBash = !isWindows || /bash/i.test((state.shellInfo || window.api?.shellInfo)?.name || '');
+  const usesBash = !isWindows || /bash/i.test((elsewhere ? onDevice?.shell : shellNameHere()) || '');
   const platform = !isWindows ? 'POSIX (/bin/sh)' : (usesBash ? 'Windows, running Git Bash' : 'Windows (cmd.exe)');
   const shellExamples = usesBash
     ? `\`ls\`, \`rm -rf\`, \`mv\`, \`cp\`, \`cat\`. Paths use forward slashes${isWindows ? ' (write C:\\\\foo as C:/foo)' : ''}.`
@@ -5761,22 +5777,22 @@ function projectFolderPrompt(c) {
     ? 'Do not use cmd.exe commands such as `del` or `dir /b`. They do not work in this shell.'
     : 'Do not use POSIX commands such as `rm` or `ls`. They do not exist in this shell.';
 
-  return `PROJECT FOLDER: ${c.projectFolder}
+  return `PROJECT FOLDER: ${projectFolder}${onDevice ? ` (on the device "${onDevice.name}")` : ''}
 
 This chat is scoped to the folder above by default. All file and shell operations are expected to work inside it.
 
 PATHS:
-- For read_file / list_dir / write_file / apply_patch: prefer absolute paths inside the project folder, e.g. \`${c.projectFolder}${sep}filename.ext\`. Relative paths like \`project/\` or \`./\` resolve from the user's home directory (not the project folder).
+- For read_file / list_dir / write_file / apply_patch: prefer absolute paths inside the project folder, e.g. \`${projectFolder}${sep}filename.ext\`. Relative paths like \`project/\` or \`./\` resolve from the user's home directory (not the project folder).
 - IMPORTANT — you CAN try paths outside the project folder. If the user asks you to read or write outside this folder, just call the tool with the absolute path. The app will pop an approval modal showing the requested path and let the user grant access ("Just this once", "Allow this folder", or "Deny"). If they approve, the call succeeds and you can continue. If they deny, you'll receive {error: "...outside the allowed roots..."} — only then should you explain you couldn't access it.
 - DO NOT preemptively refuse paths outside the project folder. The user has explicit control via the approval modal — don't take their choice away.
 
 SHELL:
 - Platform: ${platform}.
 - Use ${shellExamples}
-- Always pass \`cwd\` set to "${c.projectFolder}" when calling run_command, unless the user explicitly asks you to run somewhere else.
+- Always pass \`cwd\` set to "${projectFolder}" when calling run_command, unless the user explicitly asks you to run somewhere else.
 - ${shellWarning}
 
-When the user says "the project folder" or "this folder", they mean: ${c.projectFolder}`;
+When the user says "the project folder" or "this folder", they mean: ${projectFolder}`;
 }
 
 const PLAN_MODE_PROMPT = `PLAN MODE IS ACTIVE.
@@ -5835,7 +5851,7 @@ function buildTools(modality, webEnabled, modelId, chat) {
       tools.push(...state.mcpTools);
     }
   }
-  return tools.length ? tools : null;
+  return tools.length ? addDeviceTools(tools, modality, readOnly) : null;
 }
 
 // Safe coercion for tool-call argument extraction. Models sometimes return
@@ -5873,6 +5889,8 @@ function summarizeArgs(name, args) {
 // safety settings, folder, and allowlist are the ones that apply.
 async function executeTool(name, args, c, offeredTools) {
   const startedAt = new Date().toISOString();
+  const deviceName = auditedDeviceName(name, args, c);
+  const origin = state.runningChats.get(c?.id)?.startedBy ?? undefined;
   const res = await executeToolImpl(name, args, c, offeredTools);
   try {
     await window.api.audit.log({
@@ -5880,6 +5898,8 @@ async function executeTool(name, args, c, offeredTools) {
       chat: c?.id,
       model: c?.model,
       tool: name,
+      device: deviceName,
+      origin,
       args,
       ok: !!res.ok,
       summary: res.summary,
@@ -5933,9 +5953,10 @@ async function executeToolImpl(name, args, c, offeredTools) {
     if (!planText) {
       return { result: { error: 'exit_plan_mode needs a non-empty `plan` argument with the plan text to show the user.' }, summary: 'bad args', ok: false };
     }
-    const approved = await requestPlanApproval(planText);
+    const approved = await requestPlanApproval(planText, c);
     if (!approved) {
       await window.api.audit.log({ ts: new Date().toISOString(), chat: c.id, model: c.model, tool: name, args: { planLen: planText.length }, status: 'plan-rejected', ok: false });
+      if (askWasUnanswered(c)) return toolError("Nobody answered at the home PC, so the plan wasn't approved. Stay in Plan Mode.", 'no answer');
       return { result: { error: 'rejected by user — refine the plan and call exit_plan_mode again when ready.' }, summary: 'rejected', ok: false };
     }
     // Flip the chat into Approval Mode. Plan/Approval/NoApproval are mutex,
@@ -5962,13 +5983,22 @@ async function executeToolImpl(name, args, c, offeredTools) {
     return { result: { error: 'this chat has No-Fetch mode on — web_fetch is disabled (use web_search results instead)' }, summary: 'no-fetch', ok: false };
   }
 
+  // Every gate above is the home PC's own, and applies wherever the call was going. Only now does
+  // it matter which machine that is.
+  const target = toolTarget(name, args, c);
+  if (target.error) {
+    await window.api.audit.log({ ts: new Date().toISOString(), chat: c?.id, model: c?.model, tool: name, args, status: 'blocked-no-device', ok: false });
+    return toolError(target.error, 'no device');
+  }
+
   if (skipAllApprovals) {
     approvalDecision = 'no-approval-mode';
   } else if (!skipApproval && (alwaysGated || forceApproval) && name !== 'calc') {
-    const ok = await requestApproval(name, args, c);
+    const ok = await requestApproval(name, args, c, target.named);
     approvalDecision = ok ? 'approved' : 'denied';
     if (!ok) {
       await window.api.audit.log({ ts: new Date().toISOString(), chat: c?.id, model: c?.model, tool: name, args, status: 'denied', ok: false });
+      if (askWasUnanswered(c)) return toolError("Nobody answered the approval at the home PC, so this didn't run.", 'no answer');
       return { result: { error: 'denied by user' }, summary: 'denied', ok: false };
     }
     // The chat may have been stopped or deleted while the pop-up was open.
@@ -5979,6 +6009,7 @@ async function executeToolImpl(name, args, c, offeredTools) {
   }
 
   try {
+    if (target.remote) return await runToolOnDevice(name, args, c, target);
     if (name === 'web_search') {
       const q = toStringArg(args?.query);
       if (!q) return { result: { error: 'web_search needs a string `query`' }, summary: 'bad args', ok: false };
@@ -6005,23 +6036,23 @@ async function executeToolImpl(name, args, c, offeredTools) {
     }
     const allow = c?.pathAllowlist || [];
     if (name === 'read_file') {
-      const res = await runWithPathExpansion(name, args, allow, (a) => window.api.fs.readFile(args.path || '', a), c);
+      const res = await runWithPathExpansion(name, args, allow, (a) => window.api.fs.readFile(args.path || '', a), c, target.named);
       if (res.error) return { result: { error: res.error }, summary: 'failed', ok: false };
       return { result: { path: res.path, content: res.content }, summary: `${(res.size / 1024).toFixed(1)} KB`, ok: true };
     }
     if (name === 'list_dir') {
-      const res = await runWithPathExpansion(name, args, allow, (a) => window.api.fs.listDir(args.path || '', a), c);
+      const res = await runWithPathExpansion(name, args, allow, (a) => window.api.fs.listDir(args.path || '', a), c, target.named);
       if (res.error) return { result: { error: res.error }, summary: 'failed', ok: false };
       const n = (res.entries || []).length;
       return { result: { path: res.path, entries: res.entries }, summary: `${n} item${n === 1 ? '' : 's'}`, ok: true };
     }
     if (name === 'write_file') {
-      const res = await runWithPathExpansion(name, args, allow, (a) => window.api.fs.writeFile(args.path || '', args.content || '', a), c);
+      const res = await runWithPathExpansion(name, args, allow, (a) => window.api.fs.writeFile(args.path || '', args.content || '', a), c, target.named);
       if (res.error) return { result: { error: res.error }, summary: 'failed', ok: false };
       return { result: { path: res.path, bytes: res.bytes }, summary: `${res.bytes} B written`, ok: true };
     }
     if (name === 'apply_patch') {
-      const res = await runWithPathExpansion(name, args, allow, (a) => window.api.fs.applyPatch(args.path || '', args.find || '', args.replace ?? '', a), c);
+      const res = await runWithPathExpansion(name, args, allow, (a) => window.api.fs.applyPatch(args.path || '', args.find || '', args.replace ?? '', a), c, target.named);
       if (res.error) return { result: { error: res.error }, summary: 'failed', ok: false };
       return { result: { path: res.path, before_lines: res.before_lines, after_lines: res.after_lines }, summary: 'patched', ok: true };
     }
@@ -6152,19 +6183,23 @@ function queueModal(show) {
 // When a file tool tries to access something outside the chat's pathAllowlist,
 // instead of dead-ending the agent, ask the user whether to grant access:
 // once, for-the-whole-folder, or deny. Returns one of 'once' | 'folder' | 'deny'.
-function requestPathExpansion(toolName, requestedPath, c) {
+function requestPathExpansion(toolName, requestedPath, c, device = null) {
   return queueModal(() => new Promise((resolve) => {
     const overlay = $('#path-expand-overlay');
-    if (!overlay) return resolve('deny');
+    if (!overlay || askIsOver(c)) return resolve('deny');
     $('#pe-tool-name').textContent = toolName;
     $('#pe-requested-path').textContent = requestedPath || '(unknown)';
-    $('#pe-current-folder').textContent = c?.projectFolder || '(none — no project folder set)';
+    $('#pe-current-folder').textContent = folderOn(c, device?.id ?? RemoteRules.HOME_DEVICE) || '(none — no project folder set)';
+    $('#pe-device-row').hidden = !device;
+    $('#pe-device').textContent = device ? device.name : '';
     overlay.hidden = false;
 
     let done = false;
+    const stopWaiting = askCanEnd(c, () => cleanup('deny'));
     const cleanup = (decision) => {
       if (done) return;
       done = true;
+      stopWaiting();
       overlay.hidden = true;
       $('#pe-deny').removeEventListener('click', onDeny);
       $('#pe-once').removeEventListener('click', onOnce);
@@ -6192,7 +6227,7 @@ function requestPathExpansion(toolName, requestedPath, c) {
 // outside the allowlist, prompts the user (path-expansion modal). If they
 // approve, retries with an expanded allowlist; if they choose "Allow this
 // folder", persists the expansion to the chat's pathAllowlist.
-async function runWithPathExpansion(toolName, args, allow, runFn, c) {
+async function runWithPathExpansion(toolName, args, allow, runFn, c, device = null) {
   let currentAllow = (allow || []).slice();
   let res = await runFn(currentAllow);
   if (!res || !res.error) return res;
@@ -6203,8 +6238,11 @@ async function runWithPathExpansion(toolName, args, allow, runFn, c) {
   const requestedPath = (m && m[1]) || toStringArg(args?.path) || toStringArg(args?.cwd) || '';
   if (!requestedPath) return res;
 
-  const decision = await requestPathExpansion(toolName, requestedPath, c);
-  if (decision === 'deny') return res;
+  const decision = await requestPathExpansion(toolName, requestedPath, c, device);
+  if (decision === 'deny') {
+    askWasUnanswered(c);
+    return res;
+  }
 
   let toAdd;
   if (decision === 'once') {
@@ -6218,7 +6256,12 @@ async function runWithPathExpansion(toolName, args, allow, runFn, c) {
   currentAllow.push(toAdd);
 
   if (decision === 'folder') {
-    if (c) {
+    if (c && device && device.id !== RemoteRules.HOME_DEVICE) {
+      c.pathAllowlists = c.pathAllowlists || {};
+      c.pathAllowlists[device.id] = c.pathAllowlists[device.id] || [];
+      if (!c.pathAllowlists[device.id].includes(toAdd)) c.pathAllowlists[device.id].push(toAdd);
+      saveToStorage();
+    } else if (c) {
       c.pathAllowlist = c.pathAllowlist || [];
       if (!c.pathAllowlist.includes(toAdd)) c.pathAllowlist.push(toAdd);
       saveToStorage();
@@ -6231,21 +6274,23 @@ async function runWithPathExpansion(toolName, args, allow, runFn, c) {
 // Shown when the agent calls exit_plan_mode(plan). Returns a Promise<boolean>:
 // true on Approve, false on Reject / Escape / overlay click. The plan text is
 // rendered as markdown so numbered lists and inline code look right.
-function requestPlanApproval(planText) {
+function requestPlanApproval(planText, c) {
   return queueModal(() => new Promise((resolve) => {
     const overlay  = $('#plan-approval-overlay');
     const bodyEl   = $('#plan-approval-body');
     const approve  = $('#plan-approval-approve');
     const deny     = $('#plan-approval-deny');
-    if (!overlay || !bodyEl || !approve || !deny) { resolve(false); return; }
+    if (!overlay || !bodyEl || !approve || !deny || askIsOver(c)) { resolve(false); return; }
 
     bodyEl.innerHTML = renderMarkdown(planText);
     overlay.hidden = false;
 
     let done = false;
+    const stopWaiting = askCanEnd(c, () => cleanup(false));
     const cleanup = (result) => {
       if (done) return;
       done = true;
+      stopWaiting();
       overlay.hidden = true;
       approve.removeEventListener('click', onYes);
       deny.removeEventListener('click', onNo);
@@ -6267,7 +6312,7 @@ function requestPlanApproval(planText) {
 }
 
 // ============== APPROVAL MODAL ==============
-function requestApproval(toolName, args, c) {
+function requestApproval(toolName, args, c, device = null) {
   return queueModal(() => new Promise((resolve) => {
     // Stopped or deleted while waiting its turn: nothing left to ask about.
     if (c && (!state.chats[c.id] || state.runningChats.get(c.id)?.abortRequested)) return resolve(false);
@@ -6291,16 +6336,22 @@ function requestApproval(toolName, args, c) {
 
     nameEl.textContent = preset.label;
     // With agents running in several chats, say which one is asking.
+    const desc = device ? preset.desc.replace(/on your (machine|disk)/, () => `on ${device.name}`) : preset.desc;
     descEl.textContent = (c && c.id !== state.activeId)
-      ? `From the chat "${c.title || 'New chat'}". ${preset.desc}`
-      : preset.desc;
-    bodyEl.innerHTML = renderApprovalBody(toolName, args);
+      ? `From the chat "${c.title || 'New chat'}". ${desc}`
+      : desc;
+    const machine = device
+      ? `<section class="approval-section"><div class="approval-label">Machine</div><pre class="approval-code" id="approval-device">${escapeHtml(device.name)}</pre></section>`
+      : '';
+    bodyEl.innerHTML = machine + renderApprovalBody(toolName, args);
     overlay.hidden = false;
 
     let done = false;
+    const stopWaiting = askCanEnd(c, () => cleanup(false));
     const cleanup = (result) => {
       if (done) return;
       done = true;
+      stopWaiting();
       overlay.hidden = true;
       approve.removeEventListener('click', onYes);
       deny.removeEventListener('click', onNo);
@@ -6530,6 +6581,7 @@ function wireRemoteUi() {
   wireRemoteDevicesPanel();
   wireRemoteCodeDialog();
   wireRemoteConnectDialog();
+  wireRemoteControlQuestion();
   wireRemotePinScreen();
   $('#remote-running-off')?.addEventListener('click', turnOffLaptopControl);
   $('#remote-reset-ok')?.addEventListener('click', () => { $('#remote-reset-overlay').hidden = true; });
@@ -6638,11 +6690,11 @@ function paintRemoteIndicators() {
 // The strong indicator. Task 12 drives this: a home PC's name while it's running something on
 // this laptop, null when it stops. It floats above everything, the PIN screen too, because a
 // locked laptop can still take commands, and turning that off must never wait for the PIN.
-function setLaptopRunning(homeLabel) {
+function setLaptopRunning(homeLabel, several = false) {
   const box = $('#remote-running');
   if (!box) return;
   box.hidden = !homeLabel;
-  $('#remote-running-text').textContent = homeLabel ? `${homeLabel} is running a command on this laptop` : '';
+  $('#remote-running-text').textContent = homeLabel ? `${homeLabel} ${several ? 'are' : 'is'} running a command on this laptop` : '';
   document.querySelector('.app')?.classList.toggle('laptop-running', !!homeLabel);
 }
 
@@ -7147,6 +7199,8 @@ async function submitConnect() {
   remoteStatusRefresh();
   // Still happened if the dialog has been closed since, and worth saying so.
   if (answer.ok) showToast(`Connected to ${answer.device?.name || 'your home PC'}`, 'ok');
+  // A PIN that couldn't be set has to come first, and until then the switch can't go on.
+  if (answer.ok && !answer.pinError) askAboutControl();
   if (remoteUi.connecting !== attempt) return;
   remoteUi.connecting = null;
   submit.disabled = false;
@@ -7163,6 +7217,486 @@ function explainKeysReset() {
   $('#remote-reset-overlay').hidden = false;
   $('#remote-reset-ok').focus();
   paintRemoteDevices();
+}
+
+// ============== TOOLS ON A LAPTOP ==============
+// The home PC's model running tools on a paired laptop.
+//
+// At home, executeToolImpl has applied every gate by the time anything here runs, and which machine
+// a call is for is decided by RemoteRules. A call to a laptop is a tool-call frame and a promise,
+// kept in remoteTools.pending until that same device answers it, or it goes offline, or its switch
+// goes off, or Stop, or the time limit. Whatever a laptop sends back is treated as hostile.
+//
+// On the laptop, the manager in the main process has already decided that this device may ask. What
+// happens here is checking what it asks for, against a closed list, and running it through the
+// same window.api calls the local tools use. While the screen is PIN-locked calls keep running, and
+// nothing about them reaches the page except the running indicator.
+const REMOTE_TOOL_LIMIT_MS = 180000; // past anything a tool takes: run_command and MCP stop at 60 s, so a long command is safe
+const REMOTE_ASK_WAIT_MS = 2 * 60 * 1000;
+const DEVICE_OS_LABELS = new Map([['win32', 'Windows'], ['darwin', 'macOS'], ['linux', 'Linux']]);
+
+const remoteTools = {
+  // At home.
+  pending: new Map(),   // call id -> { deviceId, deviceName, chatId, resolve, timer }
+  control: new Map(),   // laptop's deviceId -> what it has said on this connection. Nothing older counts.
+  mcpSeen: new Map(),   // a laptop tool's name here -> { deviceId, tool }, so a gone laptop's tool stays its own
+  starters: new Map(),  // chatId -> the laptop whose message is about to start a run
+  askWaitMs: REMOTE_ASK_WAIT_MS,
+  limitMs: REMOTE_TOOL_LIMIT_MS,
+  // On the laptop.
+  running: new Map(),   // `${deviceId}:${id}` -> { deviceId, id, name, args, chatTitle, timer }
+  homesUp: new Set()    // home PCs that have heard from this page on their current connection
+};
+
+const toolError = (error, summary = 'failed') => ({ result: { error }, summary, ok: false });
+
+// ---- Which machine ----
+
+function shellNameHere() {
+  return (state.shellInfo || window.api?.shellInfo)?.name;
+}
+
+function pairedToolDevices() {
+  const status = remoteStatusNow();
+  const peers = status.enabled === true ? remoteDevices().map((d) => ({ ...d, ...remoteTools.control.get(d.id) })) : [];
+  return RemoteRules.namedDevices({ homeName: status.name, homeOs: window.api.platform, homeShell: shellNameHere(), peers });
+}
+
+function toolDevices() {
+  return pairedToolDevices().filter((d) => d.available).map(({ id, name, os, shell }) => ({ id, name, os, shell }));
+}
+
+function folderOn(c, deviceId) {
+  if (deviceId === RemoteRules.HOME_DEVICE) return c?.projectFolder || null;
+  return c?.projectFolders && Object.hasOwn(c.projectFolders, deviceId) ? c.projectFolders[deviceId] || null : null;
+}
+
+// Access given on one machine says nothing about another.
+function allowlistOn(c, deviceId) {
+  if (deviceId === RemoteRules.HOME_DEVICE) return c?.pathAllowlist || [];
+  const listed = c?.pathAllowlists && Object.hasOwn(c.pathAllowlists, deviceId) ? c.pathAllowlists[deviceId] : [];
+  const folder = folderOn(c, deviceId);
+  return folder && !listed.includes(folder) ? [folder, ...listed] : listed;
+}
+
+function chatFolderPath(c) {
+  if (c?.projectFolder) return c.projectFolder;
+  return folderOn(c, RemoteRules.chatFolderDevice(c)) || c?.folderElsewhere || null;
+}
+
+function chatHasFolder(c) {
+  return !!chatFolderPath(c);
+}
+
+// Why a device can't be used right now, in words for the model.
+function toolDeviceProblem(requested, picked) {
+  const all = pairedToolDevices();
+  const wanted = typeof requested === 'string' ? requested.trim().toLowerCase() : null;
+  const device = picked.deviceId ? all.find((d) => d.id === picked.deviceId) : all.find((d) => d.name.toLowerCase() === wanted);
+  if (!device) return picked.deviceId ? "This chat's folder is on a device that's no longer paired." : picked.error;
+  const connected = remoteDevices().find((d) => d.id === device.id)?.connected === true;
+  return connected && remoteTools.control.get(device.id)?.allowed === false ? `${device.name} has turned off control from home.` : `${device.name} is offline`;
+}
+
+// Where this call goes: { device, remote, tool, named }, or { error }. `named` is the device to name
+// in a pop-up, when there's more than one it could be.
+function toolTarget(name, args, c) {
+  const devices = toolDevices();
+  const home = devices[0];
+  const seen = remoteTools.mcpSeen.get(name);
+  if (seen) {
+    const device = devices.find((d) => d.id === seen.deviceId);
+    const still = device && remoteTools.control.get(device.id)?.mcpTools.some((t) => t.function.name === seen.tool);
+    if (!still) return { error: toolDeviceProblem(undefined, { deviceId: seen.deviceId }) };
+    return { device, remote: true, tool: seen.tool, named: device };
+  }
+  if (!RemoteRules.routesToDevice(name)) return { device: home, remote: false, named: name.startsWith('mcp__') && devices.length > 1 ? home : null };
+  const picked = RemoteRules.resolveDevice(args?.device, c, devices);
+  if (picked.error) return { error: toolDeviceProblem(args?.device, picked) };
+  const device = devices.find((d) => d.id === picked.deviceId);
+  return { device, remote: device.id !== RemoteRules.HOME_DEVICE, named: devices.length > 1 ? device : null };
+}
+
+// What a tool card says about where it ran. Nothing while there's only one place it could be, and
+// nothing for tools that always stay at home.
+function toolCardPlace(name, args, c) {
+  if (RemoteRules.LOCAL_ONLY_TOOLS.has(name)) return {};
+  const target = toolTarget(name, args, c);
+  if (target.error || !target.named) return {};
+  return target.remote ? { device: target.device.name, shell: target.device.shell } : { device: target.device.name };
+}
+
+function auditedDeviceName(name, args, c) {
+  if (RemoteRules.LOCAL_ONLY_TOOLS.has(name)) return undefined;
+  return toolTarget(name, args, c).device?.name;
+}
+
+// ---- What the model is told ----
+
+function addDeviceTools(tools, modality, readOnly) {
+  const devices = toolDevices();
+  if (devices.length < 2) return tools;
+  const names = devices.map((d) => d.name);
+  const out = tools.map((tool) => RemoteRules.addDeviceArgument(tool, names));
+  if (modality === 'agent' && !readOnly) {
+    const taken = new Set(out.map((tool) => tool.function.name));
+    for (const name of taken) remoteTools.mcpSeen.delete(name);
+    for (const entry of RemoteRules.laptopToolDefs({ devices, control: remoteTools.control, taken })) {
+      remoteTools.mcpSeen.set(entry.publicName, { deviceId: entry.deviceId, tool: entry.tool });
+      out.push(entry.def);
+    }
+  }
+  return out;
+}
+
+function devicesPrompt(c) {
+  if ((c.modality !== 'agent' && c.modality !== 'code') || !modelSupportsTools(c.model)) return null;
+  const devices = toolDevices();
+  if (devices.length < 2) return null;
+  const fallback = RemoteRules.resolveDevice(undefined, c, devices).deviceId;
+  const lines = devices.map((d) => {
+    const isHome = d.id === RemoteRules.HOME_DEVICE;
+    const folder = folderOn(c, d.id);
+    const facts = [DEVICE_OS_LABELS.get(d.os) || 'unknown system', `shell ${d.shell}`];
+    if (folder) facts.push(`project folder ${RemoteRules.cleanLine(folder, 1024)}`);
+    if (d.id === fallback) facts.push('the default');
+    return `- "${d.name}"${isHome ? ' (the home PC, where you are running)' : ''}: ${facts.join(', ')}`;
+  });
+  return `DEVICES: you can work on more than one machine.
+
+${lines.join('\n')}
+
+File, command, and task tools take a \`device\` argument naming one of these. Leave it out to use the default. Systems and shells can differ, so write commands and paths for the device they run on. Web tools always run on the home PC. A call never moves to another device by itself: if a device is offline, you get an error saying so, and nothing has run.`;
+}
+
+// ---- Calling a laptop ----
+
+function callDevice(device, name, args, c) {
+  if (RemoteRules.chatsLocked(remoteStatusNow())) return Promise.resolve(toolError(`${device.name} can't be reached while this device is locked`, 'locked'));
+  const id = crypto.randomUUID();
+  const frame = { type: 'tool-call', id, name, args, chatTitle: c?.title || '' };
+  if (RemoteRules.overToolLimit(frame)) return Promise.resolve(toolError(`That's too large to send to ${device.name}.`, 'too large'));
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => giveUpOnToolCall(id, toolError(`${device.name} didn't answer in time, so that was stopped.`, 'no answer')), remoteTools.limitMs);
+    remoteTools.pending.set(id, { deviceId: device.id, deviceName: device.name, chatId: c?.id, resolve, timer });
+    const offline = () => endToolCall(id, toolError(`${device.name} is offline`, 'offline'));
+    window.api.remote.send(device.id, frame).then((sent) => { if (!sent) offline(); }, offline);
+  });
+}
+
+function endToolCall(id, out) {
+  const call = remoteTools.pending.get(id);
+  if (!call) return null;
+  remoteTools.pending.delete(id);
+  clearTimeout(call.timer);
+  call.resolve(out);
+  return call;
+}
+
+// It may still be running over there. If this is the wrong end of a dropped link, the laptop ends it
+// for that reason anyway.
+function giveUpOnToolCall(id, out) {
+  const call = endToolCall(id, out);
+  if (call) window.api.remote.send(call.deviceId, { type: 'tool-cancel', id }).catch(() => {});
+}
+
+function cancelToolCallsOfChat(chatId) {
+  for (const [id, call] of [...remoteTools.pending]) {
+    if (call.chatId === chatId) giveUpOnToolCall(id, toolError('stopped by user', 'stopped'));
+  }
+}
+
+function endToolCallsOfDevice(deviceId, say, summary) {
+  for (const [id, call] of [...remoteTools.pending]) {
+    if (call.deviceId === deviceId) giveUpOnToolCall(id, toolError(say(call.deviceName), summary));
+  }
+}
+
+// Only from the device it was asked of, and only while it's waiting. Anything else is dropped, so
+// one laptop can't answer for another.
+function finishToolCall(deviceId, frame) {
+  const call = typeof frame.id === 'string' ? remoteTools.pending.get(frame.id) : null;
+  if (call?.deviceId === deviceId) endToolCall(frame.id, RemoteRules.cleanToolResult(frame));
+}
+
+// A tool on a laptop, named fields only, so nothing a model made up travels with it. Which device
+// is the home PC's business, and stays here.
+async function runToolOnDevice(name, args, c, target) {
+  const { device } = target;
+  const allow = allowlistOn(c, device.id);
+  const folder = folderOn(c, device.id);
+  const root = folder || allow[0];
+  const text = (key) => toStringArg(args?.[key]);
+  // The pop-up for going outside a folder is decided here at home, from what the laptop said.
+  const withAccess = (fields) => runWithPathExpansion(name, args, allow, async (allowlist) => {
+    const out = await callDevice(device, name, { ...fields, allowlist }, c);
+    return typeof out.result?.error === 'string' ? { ...out, error: out.result.error } : out;
+  }, c, device);
+  let out;
+  if (name === 'read_file' || name === 'list_dir') out = await withAccess({ path: text('path') });
+  else if (name === 'write_file') out = await withAccess({ path: text('path'), content: text('content') });
+  else if (name === 'apply_patch') out = await withAccess({ path: text('path'), find: text('find'), replace: text('replace') });
+  else if (name === 'run_command') out = await callDevice(device, name, { command: text('command'), cwd: text('cwd') || folder || undefined }, c);
+  else if (name === 'run_command_async') out = await callDevice(device, name, { command: text('command'), cwd: text('cwd') || folder || undefined, allowlist: allow }, c);
+  else if (name === 'glob' || name === 'grep') {
+    if (!text('pattern')) return toolError('pattern required', 'bad args');
+    if (!root) return toolError(`no project folder set on ${device.name}: ${name} needs a root`, 'no root');
+    const fields = { pattern: text('pattern'), root, allowlist: allow };
+    if (name === 'grep' && text('glob')) fields.glob = text('glob');
+    if (name === 'grep') fields.case_insensitive = !!args?.case_insensitive;
+    out = await callDevice(device, name, fields, c);
+  } else if (name === 'task_status' || name === 'task_kill') out = await callDevice(device, name, { task_id: text('task_id') }, c);
+  else if (name === 'task_list') out = await callDevice(device, name, {}, c);
+  else out = await callDevice(device, target.tool, args && typeof args === 'object' ? args : {}, c);
+  // Said in the result as well as on the card, so the model can't lose track of where it was.
+  const result = out.result && typeof out.result === 'object' ? { ...out.result, device: device.name } : out.result;
+  return { result, summary: out.summary, ok: out.ok };
+}
+
+function applyControlState(deviceId, frame) {
+  const said = RemoteRules.cleanControlState(frame);
+  remoteTools.control.set(deviceId, said);
+  if (!said.allowed) endToolCallsOfDevice(deviceId, (name) => `${name} turned off control from home, so that stopped.`, 'control off');
+}
+
+// ---- A pop-up nobody is there to answer ----
+
+// Stop closes a pop-up. And when a laptop started the run, there may be nobody at this machine at
+// all, so it doesn't wait forever. Task 13 shows these on the laptop too.
+function askCanEnd(c, end) {
+  const run = c ? state.runningChats.get(c.id) : null;
+  if (!run) return () => {};
+  run.endAsk = end;
+  const timer = run.startedBy ? setTimeout(() => {
+    run.askUnanswered = true;
+    end();
+  }, remoteTools.askWaitMs) : null;
+  return () => {
+    clearTimeout(timer);
+    if (run.endAsk === end) run.endAsk = null;
+  };
+}
+
+function askWasUnanswered(c) {
+  const run = c ? state.runningChats.get(c.id) : null;
+  if (!run?.askUnanswered) return false;
+  run.askUnanswered = false;
+  return true;
+}
+
+function askIsOver(c) {
+  return !!c && (!state.chats[c.id] || !!state.runningChats.get(c.id)?.abortRequested);
+}
+
+// ---- On the laptop ----
+
+const LAPTOP_TOOLS = new Map([
+  ['read_file', async (a) => {
+    const res = await window.api.fs.readFile(a.path, a.allowlist || []);
+    return res.error ? toolError(res.error) : { result: { path: res.path, content: res.content }, summary: `${(res.size / 1024).toFixed(1)} KB`, ok: true };
+  }],
+  ['list_dir', async (a) => {
+    const res = await window.api.fs.listDir(a.path, a.allowlist || []);
+    if (res.error) return toolError(res.error);
+    const n = (res.entries || []).length;
+    return { result: { path: res.path, entries: res.entries }, summary: `${n} item${n === 1 ? '' : 's'}`, ok: true };
+  }],
+  ['write_file', async (a) => {
+    const res = await window.api.fs.writeFile(a.path, a.content, a.allowlist || []);
+    return res.error ? toolError(res.error) : { result: { path: res.path, bytes: res.bytes }, summary: `${res.bytes} B written`, ok: true };
+  }],
+  ['apply_patch', async (a) => {
+    const res = await window.api.fs.applyPatch(a.path, a.find, a.replace, a.allowlist || []);
+    return res.error ? toolError(res.error) : { result: { path: res.path, before_lines: res.before_lines, after_lines: res.after_lines }, summary: 'patched', ok: true };
+  }],
+  ['glob', async (a) => {
+    const res = await window.api.fs.glob(a.pattern, a.root, a.allowlist || []);
+    if (res.error) return toolError(res.error);
+    const n = res.matches.length;
+    return { result: { root: res.root, matches: res.matches }, summary: `${n} match${n === 1 ? '' : 'es'}`, ok: true };
+  }],
+  ['grep', async (a) => {
+    const res = await window.api.fs.grep(a.pattern, a.root, { glob: a.glob, caseInsensitive: !!a.case_insensitive, allowlist: a.allowlist || [] });
+    if (res.error) return toolError(res.error);
+    const n = res.matches.length;
+    return { result: { matches: res.matches }, summary: `${n} match${n === 1 ? '' : 'es'}`, ok: true };
+  }],
+  ['run_command', async (a, call) => {
+    const res = await window.api.shell.run(a.command, a.cwd, { deviceId: call.deviceId, id: call.id });
+    if (res.error) return toolError(res.error, 'refused');
+    const summary = res.timedOut ? 'timeout' : (res.exitCode === 0 ? `exit 0 · ${res.stdout.length} B` : `exit ${res.exitCode}`);
+    return { result: res, summary, ok: res.exitCode === 0 };
+  }],
+  ['run_command_async', async (a, call) => {
+    const res = await window.api.shell.runAsync(a.command, a.cwd, a.allowlist || [], { deviceId: call.deviceId, id: call.id });
+    if (res.error) return toolError(res.error);
+    return { result: { task_id: res.taskId, command: res.command, cwd: res.cwd, message: `Started in background as ${res.taskId}. Use task_status with the same device to check on it.` }, summary: `${res.taskId} started`, ok: true };
+  }],
+  // A home PC only sees the tasks it started, not this laptop's own.
+  ['task_status', async (a, call) => {
+    const res = await window.api.shell.taskStatus(a.task_id, call.deviceId);
+    return res.error ? toolError(res.error, 'not found') : { result: res, summary: `${res.status} · ${res.runtime_seconds}s`, ok: true };
+  }],
+  ['task_list', async (a, call) => {
+    const res = await window.api.shell.taskList(call.deviceId);
+    const n = res.tasks?.length || 0;
+    return { result: res, summary: `${n} task${n === 1 ? '' : 's'}`, ok: true };
+  }],
+  ['task_kill', async (a, call) => {
+    const res = await window.api.shell.taskKill(a.task_id, call.deviceId);
+    return res.error ? toolError(res.error) : { result: { ok: true }, summary: 'killed', ok: true };
+  }]
+]);
+
+async function runLaptopMcpTool(args, call) {
+  const res = await window.api.mcp.callTool(call.name, args);
+  if (!res.ok) return toolError(res.error);
+  const r = res.result || {};
+  const text = Array.isArray(r.content) ? r.content.map((part) => part?.text ?? '').join('') : '';
+  return { result: r, summary: r.isError ? 'tool error' : (text.length ? `${(text.length / 1024).toFixed(1)} KB` : 'ok'), ok: !r.isError };
+}
+
+function auditLaptopCall(event, deviceId, fields) {
+  window.api.remote.audit({ event, device: deviceId, deviceName: remoteHomeLabel(deviceId), ...fields }).catch(() => {});
+}
+
+function answerHome(deviceId, id, out) {
+  let frame = { type: 'tool-result', id, result: out.result, summary: out.summary, ok: out.ok };
+  if (RemoteRules.overToolLimit(frame)) {
+    frame = { type: 'tool-result', id, result: { error: "That result is too large to send back to the home PC, so it wasn't." }, summary: 'too large', ok: false };
+  }
+  window.api.remote.send(deviceId, frame).catch(() => {});
+}
+
+// Who may ask has been settled in the main process by now. Nothing here puts anything from the
+// frame on the page, because this runs behind the PIN screen too.
+async function runToolCallHere(deviceId, frame) {
+  const mcpNames = new Set((state.mcpTools || []).map((tool) => tool?.function?.name));
+  const check = RemoteRules.checkToolCall(frame, mcpNames);
+  const name = typeof frame?.name === 'string' ? frame.name : '';
+  const chatTitle = typeof frame?.chatTitle === 'string' ? frame.chatTitle : '';
+  const key = `${deviceId}:${check.id}`;
+  const refusal = check.error || (remoteTools.running.has(key) ? 'That call is already running.' : null);
+  if (refusal) {
+    auditLaptopCall('refused', deviceId, { chatTitle, tool: name, args: RemoteRules.auditArgs(name, frame?.args), reason: refusal, ok: false });
+    if (check.id) answerHome(deviceId, check.id, toolError(refusal, 'refused'));
+    return;
+  }
+  const call = { deviceId, id: check.id, name: check.name, args: check.args, chatTitle: check.chatTitle, timer: null };
+  remoteTools.running.set(key, call);
+  call.timer = setTimeout(() => finishToolCallHere(key, toolError("That took too long, so it was stopped.", 'too long')), REMOTE_TOOL_LIMIT_MS);
+  paintLaptopRunning();
+  // Looked up in a closed list, or one of this laptop's own MCP tools, which checkToolCall has seen.
+  const handler = LAPTOP_TOOLS.get(check.name) ?? runLaptopMcpTool;
+  let out;
+  try {
+    out = await handler(check.args, call);
+  } catch (e) {
+    out = toolError(e?.message || 'That failed.', 'error');
+  }
+  finishToolCallHere(key, out);
+}
+
+// Once for each call, whichever ending gets here first. It's what turns the indicator off, so every
+// way a call can end comes through here.
+function finishToolCallHere(key, out) {
+  const call = remoteTools.running.get(key);
+  if (!call) return;
+  remoteTools.running.delete(key);
+  clearTimeout(call.timer);
+  paintLaptopRunning();
+  auditLaptopCall('ran', call.deviceId, {
+    chatTitle: call.chatTitle, tool: call.name, args: RemoteRules.auditArgs(call.name, call.args), summary: String(out.summary ?? ''), ok: out.ok === true
+  });
+  answerHome(call.deviceId, call.id, out);
+}
+
+// Only the home PC that asked can stop it: the key has the device in it.
+function cancelToolCallHere(deviceId, frame) {
+  if (typeof frame.id !== 'string' || !remoteTools.running.has(`${deviceId}:${frame.id}`)) return;
+  window.api.remote.endRun(deviceId, frame.id).catch(() => {});
+  finishToolCallHere(`${deviceId}:${frame.id}`, toolError('Stopped from the home PC.', 'stopped'));
+}
+
+function paintLaptopRunning() {
+  const names = [...new Set([...remoteTools.running.values()].map((call) => remoteHomeLabel(call.deviceId)))];
+  setLaptopRunning(names.length ? names.join(' and ') : null, names.length > 1);
+}
+
+function sendControlState(deviceId) {
+  const allowed = remoteStatusNow().controlAllowed === true;
+  window.api.remote.send(deviceId, {
+    type: 'control-state',
+    allowed,
+    mcpTools: allowed ? RemoteRules.outgoingMcpTools(state.mcpTools) : [],
+    os: window.api.platform,
+    shell: shellNameHere()
+  }).catch(() => {});
+}
+
+function sendControlStateToHomes() {
+  for (const home of remoteHomes()) if (home.connected) sendControlState(home.id);
+}
+
+// ---- When anything changes ----
+
+function noteToolStatus(before, status) {
+  const devices = status.devices || [];
+  const connected = (id) => devices.some((d) => d.id === id && d.connected);
+
+  // At home. What a laptop said only holds for the connection it said it on.
+  for (const [id, call] of [...remoteTools.pending]) {
+    if (!connected(call.deviceId)) giveUpOnToolCall(id, toolError(`${call.deviceName} is offline`, 'offline'));
+  }
+  for (const id of [...remoteTools.control.keys()]) {
+    if (!connected(id)) remoteTools.control.delete(id);
+  }
+
+  // On the laptop. The main process has already ended the processes by the time this hears of it.
+  const switched = before?.controlAllowed !== status.controlAllowed;
+  for (const device of devices) {
+    if (device.role !== 'home') continue;
+    if (!device.connected) remoteTools.homesUp.delete(device.id);
+    else if (switched || !remoteTools.homesUp.has(device.id)) {
+      remoteTools.homesUp.add(device.id);
+      sendControlState(device.id);
+    }
+  }
+  for (const id of [...remoteTools.homesUp]) {
+    if (!connected(id)) remoteTools.homesUp.delete(id);
+  }
+  const off = status.controlAllowed !== true;
+  for (const [key, call] of [...remoteTools.running]) {
+    if (off) finishToolCallHere(key, toolError('Control from home was turned off on this device, so that stopped.', 'control off'));
+    else if (!connected(call.deviceId)) finishToolCallHere(key, toolError('The connection to the home PC dropped, so that stopped.', 'offline'));
+  }
+}
+
+// ---- Asking at pairing ----
+
+function wireRemoteControlQuestion() {
+  $('#remote-control-ask-on')?.addEventListener('click', () => answerControlQuestion(true));
+  $('#remote-control-ask-off')?.addEventListener('click', () => answerControlQuestion(false));
+  $('#remote-control-ask-overlay')?.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape') return;
+    e.stopPropagation();
+    answerControlQuestion(false);
+  });
+}
+
+// The switch stays off unless it's turned on here, or later in Settings.
+function askAboutControl() {
+  if (remoteStatusNow().controlAllowed === true) return;
+  $('#remote-control-ask-overlay').hidden = false;
+  $('#remote-control-ask-off').focus();
+}
+
+async function answerControlQuestion(turnOn) {
+  $('#remote-control-ask-overlay').hidden = true;
+  if (!turnOn) return;
+  const answer = await window.api.remote.setControlAllowed(true).catch(() => ({ ok: false }));
+  if (!answer.ok) showToast(answer.error || "Couldn't turn that on. Try it in Settings > Devices.", 'err');
+  remoteStatusRefresh();
 }
 
 // ============== ACTING FROM A LAPTOP ==============
@@ -7279,10 +7813,11 @@ function remoteSend(deviceId, c, args) {
     queueOnChat(c, text, attachments, deviceId);
     return { ok: true };
   }
-  if (c.modality === 'agent' && !c.projectFolder) return { ok: false, error: 'This project needs a folder first.' };
+  if (c.modality === 'agent' && !chatHasFolder(c)) return { ok: false, error: 'This project needs a folder first.' };
   const problem = chatModelProblem(c);
   if (problem === 'install') return { ok: false, error: "This chat's model isn't installed on the home PC." };
   if (problem === 'key') return { ok: false, error: "This chat's model needs an API key on the home PC." };
+  remoteTools.starters.set(c.id, deviceId);
   submitToChat(c, text, attachments).catch((e) => console.error('A message from a laptop failed:', e?.message));
   return { ok: true };
 }
@@ -7898,7 +8433,9 @@ function mirrorOnStatus(status) {
   if (!status) return;
   // Reading status clears this in the manager, so it's kept for whoever explains it.
   if (status.keysReset) state.remoteKeysReset = true;
+  const statusBefore = state.remoteStatus;
   state.remoteStatus = status;
+  noteToolStatus(statusBefore, status);
   const devices = status.devices || [];
   const firstStatus = !mirror.statusSeen;
   mirror.statusSeen = true;
@@ -7942,6 +8479,18 @@ function mirrorOnFrame(deviceId, frame) {
     if (role === 'laptop') handleRemoteAction(deviceId, frame);
     return;
   }
+  // Matched against the call that was sent to this device, so it needs no more than that.
+  if (frame.type === 'tool-result') { finishToolCall(deviceId, frame); return; }
+  // On a page that has just loaded the role may not be known yet, and a home PC is the one thing
+  // this isn't to be taken from.
+  if (frame.type === 'control-state') {
+    if (role !== 'home') applyControlState(deviceId, frame);
+    return;
+  }
+  // The manager in the main process has already decided this device may ask. The role may not be
+  // known yet on a page that has just loaded, and the call needs an answer either way.
+  if (frame.type === 'tool-call') { runToolCallHere(deviceId, frame); return; }
+  if (frame.type === 'tool-cancel') { cancelToolCallHere(deviceId, frame); return; }
   // Only a device this one treats as its home PC gets to put chats here.
   if (role !== 'home') return;
   if (frame.type === 'action-result') { finishAction(deviceId, frame); return; }
@@ -7961,6 +8510,9 @@ function mirrorOnFrame(deviceId, frame) {
   if (!Number.isSafeInteger(frame.seq) || frame.seq < 1) return;
   const home = mirrorHome(deviceId);
   if (frame.type === 'mirror-snapshot') {
+    // The first a home PC sends after it has lost track of this device, whether by a reload or by
+    // losing sight of it for a moment. It can't go on what it heard before.
+    if (frame.seq === 1) sendControlState(deviceId);
     applyMirrorSnapshot(deviceId, home, frame);
     return;
   }
@@ -8727,7 +9279,7 @@ function paintRemoteComposer() {
   if (!input) return;
   if (!c?.remote) { remoteUi.boxHadFocus = false; return; }
   const reason = homeBlockedReason(c.remote.deviceId);
-  const needsFolder = c.modality === 'agent' && !c.projectFolder;
+  const needsFolder = c.modality === 'agent' && !chatHasFolder(c);
   const blocked = !!reason || needsFolder;
   const wasBlocked = input.disabled;
   if (blocked && document.activeElement === input) remoteUi.boxHadFocus = true;

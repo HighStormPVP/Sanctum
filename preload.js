@@ -194,6 +194,8 @@ contextBridge.exposeInMainWorld('api', {
     removeDevice: (id)        => ipcRenderer.invoke('remote:removeDevice', { id }),
     setControlAllowed: (allowed) => ipcRenderer.invoke('remote:setControlAllowed', { allowed }),
     send:       (deviceId, frame) => ipcRenderer.invoke('remote:send', { deviceId, frame }),
+    audit:      (entry)       => ipcRenderer.invoke('remote:audit', entry),
+    endRun:     (deviceId, id) => ipcRenderer.invoke('remote:endRun', { deviceId, id }),
     onFrame: (cb) => {
       const wrapped = (_e, { deviceId, frame }) => cb(deviceId, frame);
       ipcRenderer.on('remote:frame', wrapped);
@@ -207,11 +209,13 @@ contextBridge.exposeInMainWorld('api', {
   },
 
   shell: {
-    run:        (command, cwd) => ipcRenderer.invoke('shell:run', { command, cwd }),
-    runAsync:   (command, cwd, allowlist) => ipcRenderer.invoke('shell:run_async', { command, cwd, allowlist }),
-    taskStatus: (taskId) => ipcRenderer.invoke('shell:task_status', taskId),
-    taskList:   () => ipcRenderer.invoke('shell:task_list'),
-    taskKill:   (taskId) => ipcRenderer.invoke('shell:task_kill', taskId),
+    // remoteCall ({ deviceId, id }) marks a run as asked for by a home PC. A scope limits the task
+    // calls to what that device started.
+    run:        (command, cwd, remoteCall) => ipcRenderer.invoke('shell:run', { command, cwd, remoteCall }),
+    runAsync:   (command, cwd, allowlist, remoteCall) => ipcRenderer.invoke('shell:run_async', { command, cwd, allowlist, remoteCall }),
+    taskStatus: (taskId, scope) => ipcRenderer.invoke('shell:task_status', taskId, scope),
+    taskList:   (scope) => ipcRenderer.invoke('shell:task_list', scope),
+    taskKill:   (taskId, scope) => ipcRenderer.invoke('shell:task_kill', taskId, scope),
     // Streaming run for the code-block ▷ Run button. onChunk receives:
     //   { kind: 'start', taskId, command }
     //   { kind: 'stdout' | 'stderr', text }
