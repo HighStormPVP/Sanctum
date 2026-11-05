@@ -4023,3 +4023,86 @@ test('nothing gives a fingerprint while the keys are sealed', async (t) => {
   assert.equal(device.manager.status().locked, true);
   assert.strictEqual(device.manager.status().fingerprint, null);
 });
+
+
+// ---- What a locked device can send ----
+
+const ACTION_FRAME = { type: 'action', id: 'a1', kind: 'new-chat', args: { modality: 'chat' } };
+
+test('an idle-locked device sends no action, and the frames that keep a mirror going still go', async (t) => {
+  const world = newWorld(t);
+  const home = await world.device('Home');
+  const laptop = await world.device('Laptop');
+  home.start();
+  laptop.start();
+  const { code } = await home.manager.createCode();
+  world.relay.pump();
+  const pairing = laptop.manager.pair(code, 'Laptop');
+  world.relay.pump();
+  assert.equal((await pairing).ok, true);
+  world.relay.pump();
+
+  assert.equal(laptop.manager.send(home.id, ACTION_FRAME), true, 'unlocked, it goes');
+  world.relay.pump();
+  assert.equal(home.frames.filter((f) => f.frame.type === 'action').length, 1);
+
+  laptop.manager.lock();
+  assert.equal(laptop.manager.status().idleLocked, true);
+  assert.equal(laptop.manager.send(home.id, ACTION_FRAME), false);
+  for (const frame of [{ type: 'mirror-resync-request' }, { type: 'mirror-part-ack', part: 1, transfer: 1 }, { type: 'queued-returned-ack', id: 'q1' }]) {
+    assert.equal(laptop.manager.send(home.id, frame), true, frame.type);
+  }
+  world.relay.pump();
+  assert.equal(home.frames.filter((f) => f.frame.type === 'action').length, 1, 'nothing more reached home');
+  assert.equal(home.frames.filter((f) => f.frame.type === 'mirror-resync-request').length, 1);
+
+  assert.equal((await laptop.manager.unlock(PIN)).ok, true);
+  assert.equal(laptop.manager.send(home.id, ACTION_FRAME), true, 'and after the PIN it goes again');
+});
+
+test('a laptop owing a PIN sends no action, though its keys are open, until the PIN is set', async (t) => {
+  const world = newWorld(t);
+  const home = await world.device('Home');
+  const real = world.keystore();
+  let refuse = true;
+  const keystore = {
+    ...real,
+    setPin: (pin, options) => (refuse && options?.kind === 'user' ? Promise.resolve({ ok: false, error: 'Could not save the PIN.' }) : real.setPin(pin, options))
+  };
+  const device = await world.device('Device', { pin: false, keystore });
+  home.start();
+  device.start();
+  await device.manager.createCode();
+  device.manager.cancelCode();
+  const { code } = await home.manager.createCode();
+  world.relay.pump();
+  const pairing = device.manager.pair(code, 'Device', '424242');
+  world.relay.pump();
+  assert.equal((await pairing).pinError, 'Could not save the PIN.');
+  world.relay.pump();
+
+  const status = device.manager.status();
+  assert.equal(status.needsPin, true);
+  assert.equal(status.locked, false, "the keys are open, so being unlocked can't be the whole check");
+  assert.equal(device.manager.send(home.id, ACTION_FRAME), false);
+  assert.equal(device.manager.send(home.id, { type: 'mirror-resync-request' }), true);
+
+  refuse = false;
+  assert.deepEqual(await device.manager.setPin('424242'), { ok: true });
+  assert.equal(device.manager.send(home.id, ACTION_FRAME), true);
+});
+
+test('a home PC with only laptops still answers them while it has no PIN of its own', async (t) => {
+  const world = newWorld(t);
+  const home = await world.device('Home', { pin: false });
+  const laptop = await world.device('Laptop');
+  home.start();
+  laptop.start();
+  const { code } = await home.manager.createCode();
+  world.relay.pump();
+  const pairing = laptop.manager.pair(code, 'Laptop');
+  world.relay.pump();
+  assert.equal((await pairing).ok, true);
+  world.relay.pump();
+  assert.equal(home.manager.send(laptop.id, { type: 'action-result', id: 'a1', ok: true }), true);
+});

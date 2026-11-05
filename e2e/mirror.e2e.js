@@ -850,7 +850,7 @@ test('a paired home can send anything: only the expected rendering comes of it',
     window.addEventListener('error', (e) => window.__fuzzWarnings.push(String(e.message)));
     window.__fuzz = undefined;
     window.__seq = 0;
-    window.__mirrorStatus = { devices: [{ id: HOME, role: 'home', connected: true }], locked: false, idleLocked: false };
+    window.__mirrorStatus = { devices: [{ id: HOME, role: 'home', connected: true }], enabled: true, locked: false, idleLocked: false };
     mirrorOnStatus(window.__mirrorStatus);
     window.__sendSnapshot = (list, home) => mirrorOnFrame(HOME, { type: 'mirror-snapshot', seq: ++window.__seq, now: Date.now(), home, chats: list });
     window.__sendOps = (chatId, ops) => mirrorOnFrame(HOME, { type: 'mirror-ops', seq: ++window.__seq, chatId, ops });

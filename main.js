@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, dialog, protocol, net, session, shell: electronShell, safeStorage } = require('electron');
+const { app, BrowserWindow, Menu, ipcMain, dialog, protocol, net, session, shell: electronShell, safeStorage } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
@@ -10,6 +10,7 @@ const { safeFetchText, isAppPage } = require('./lib/url-rules');
 const { grepInWorker } = require('./lib/grep-runner');
 const { detectRepetitionLoop, splitOutputLines, quoteWindowsArg, encodePowerShell } = require('./lib/text-rules');
 const { killTree } = require('./lib/kill-tree');
+const { devToolsAllowed, applicationMenuTemplate } = require('./lib/window-rules');
 const { createKeystore, retryTransient } = require('./lib/remote/keystore');
 const { createManager: createRemoteManager } = require('./lib/remote/manager');
 const remoteRelayClient = require('./lib/remote/relay-client');
@@ -400,7 +401,8 @@ function createWindow() {
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
-      nodeIntegration: false
+      nodeIntegration: false,
+      devTools: devToolsAllowed(app.isPackaged)
     }
   });
   mainWindow.setMenuBarVisibility(false);
@@ -459,6 +461,8 @@ function mimeFor(filePath) {
 }
 
 app.whenReady().then(() => {
+  const menu = applicationMenuTemplate(app.isPackaged, process.platform);
+  if (menu) Menu.setApplicationMenu(Menu.buildFromTemplate(menu));
   CACHE_DIR = path.join(app.getPath('userData'), 'media-cache');
   fs.mkdirSync(CACHE_DIR, { recursive: true });
 
@@ -602,6 +606,7 @@ function openRemoteTransport({ onEvent, onGone }) {
       sandbox: true,
       nodeIntegration: false,
       backgroundThrottling: false,
+      devTools: devToolsAllowed(app.isPackaged),
       // Its own session, in memory only, away from the main window's storage, which holds the
       // chats and API keys.
       partition: REMOTE_TRANSPORT_PARTITION
@@ -692,6 +697,11 @@ function startRemoteControl() {
     unprotect,
     isProtectionAvailable: () => safeStorage.isEncryptionAvailable()
   });
+  // So a test can reach a paired laptop owing a PIN, which otherwise takes a failing disk.
+  if (remoteTestFlags.has('fail-user-pin')) {
+    const setPin = keystore.setPin;
+    keystore.setPin = (pin, options) => (options?.kind === 'user' ? Promise.resolve({ ok: false, error: 'Could not save the PIN.' }) : setPin(pin, options));
+  }
   remoteManager = createRemoteManager({
     keystore,
     relay: remoteRelayClient,

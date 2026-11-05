@@ -28,14 +28,16 @@ const textOf = (device, selector) => device.page.evaluate((s) => document.queryS
 const count = (device, selector) => device.page.evaluate((s) => document.querySelectorAll(s).length, selector);
 const click = (device, selector) => device.page.click(selector, { timeout: 10000 });
 const fill = (device, selector, value) => device.page.fill(selector, value, { timeout: 10000 });
-const domHas = (device, text) => device.page.evaluate((t) => document.documentElement.outerHTML.includes(t), text);
+// What's in the page, and what's in its fields, since outerHTML doesn't hold a field's live value.
+const pageText = `document.documentElement.outerHTML + '\\n' + [...document.querySelectorAll('input, textarea')].map((field) => field.value).join('\\n')`;
+const domHas = (device, text) => device.page.evaluate(([t, source]) => (0, eval)(source).includes(t), [text, pageText]);
 // Where in the page some text is, or null, which makes for a failure that says.
 const foundIn = (device, text) =>
-  device.page.evaluate((t) => {
-    const html = document.documentElement.outerHTML;
+  device.page.evaluate(([t, source]) => {
+    const html = (0, eval)(source);
     const at = html.indexOf(t);
     return at < 0 ? null : html.slice(Math.max(0, at - 120), at + t.length + 40);
-  }, text);
+  }, [text, pageText]);
 const status = (device) => device.remote('status');
 const appeared = (device, selector, ms = 5000) => waitFor(`${device.name} to show ${selector}`, () => isVisible(device, selector), ms);
 const gone = (device, selector, ms = 5000) => waitFor(`${device.name} to stop showing ${selector}`, async () => !(await isVisible(device, selector)), ms);
@@ -169,7 +171,30 @@ test('with no address', async (t) => {
 
     await sleep(1500);
     assert.equal(await device.windowCount(), 1, 'no hidden window for connections');
-    assert.equal(recorder.seen(), 0, 'nothing reached the service');
+  });
+
+  await t.test('what the page holds includes what is typed in its fields', async () => {
+    const words = 'SOMETHING-ONLY-IN-A-FIELD-41b7';
+    assert.equal(await domHas(device, words), false);
+    await device.page.evaluate((w) => { document.querySelector('#composer-input').value = w; }, words);
+    assert.equal(await domHas(device, words), true, 'a textarea');
+    assert.match(await foundIn(device, words), new RegExp(words));
+    await device.page.evaluate(() => { document.querySelector('#composer-input').value = ''; });
+    await device.page.evaluate((w) => { document.querySelector('#chat-title').value = w; }, words);
+    assert.equal(await domHas(device, words), true, 'an input');
+    await device.page.evaluate(() => renderActiveChat());
+    assert.equal(await domHas(device, words), false);
+  });
+
+  await t.test('this run can still debug, because it is not a packaged build', async () => {
+    const facts = await device.app.evaluate(({ BrowserWindow, Menu }) => {
+      const roles = [];
+      const walk = (menu) => { for (const item of menu?.items || []) { if (item.role) roles.push(item.role.toLowerCase()); walk(item.submenu); } };
+      walk(Menu.getApplicationMenu());
+      return { roles, devTools: BrowserWindow.getAllWindows().map((w) => w.webContents.getLastWebPreferences().devTools) };
+    });
+    assert.ok(facts.roles.includes('toggledevtools'));
+    assert.ok(facts.devTools.every((on) => on !== false));
   });
 
   await t.test('a bad address is refused where it was typed', async () => {
@@ -178,6 +203,13 @@ test('with no address', async (t) => {
     await click(device, '#remote-address-save');
     await said(device, '#remote-address-note', "That doesn't look like a Remote Control address.");
     assert.equal((await status(device)).enabled, false);
+    await closeSettings(device);
+
+    // It was about that attempt, and closing Settings ends that.
+    await openDevices(device);
+    assert.doesNotMatch(await textOf(device, '#remote-address-note'), /doesn't look like/);
+    assert.equal(await device.page.evaluate(() => document.querySelector('#remote-address-note').classList.contains('remote-note-error')), false);
+    assert.equal(await device.page.evaluate(() => document.querySelector('#remote-address').value), '');
     await closeSettings(device);
   });
 
@@ -188,6 +220,10 @@ test('with no address', async (t) => {
     await appeared(device, '#remote-add-device');
     await appeared(device, '#remote-connect-home');
     assert.equal(await isVisible(device, '#remote-control-wrap'), false, 'no home PC, so no control switch');
+
+    // Knowing the address connects nothing by itself.
+    await sleep(1500);
+    assert.equal(recorder.seen(), 0, 'nothing has reached the service yet');
 
     await click(device, '#remote-add-device');
     await waitFor('the code to reach the service', () => recorder.seen() > 0, 10000);
@@ -424,7 +460,8 @@ test('two devices, through the interface', async (t) => {
     await openDevices(laptop);
     await appeared(laptop, '#remote-control-wrap');
     assert.equal(await textOf(laptop, '#remote-control-switch strong'), 'Let my home PC control this laptop');
-    assert.equal(await laptop.page.evaluate(() => document.querySelector('#remote-control-switch').getAttribute('aria-pressed')), 'false');
+    assert.equal(await laptop.page.evaluate(() => document.querySelector('#remote-control-switch').getAttribute('role')), 'switch');
+    assert.equal(await laptop.page.evaluate(() => document.querySelector('#remote-control-switch').getAttribute('aria-checked')), 'false');
     assert.equal((await status(laptop)).controlAllowed, false);
 
     await openDevices(home);
@@ -442,11 +479,11 @@ test('two devices, through the interface', async (t) => {
     await waitFor('the frames to arrive', async () => (await laptop.frameCount()) > before + 3, 5000);
     await sleep(200);
     assert.equal((await status(laptop)).controlAllowed, false);
-    assert.equal(await laptop.page.evaluate(() => document.querySelector('#remote-control-switch').getAttribute('aria-pressed')), 'false');
+    assert.equal(await laptop.page.evaluate(() => document.querySelector('#remote-control-switch').getAttribute('aria-checked')), 'false');
 
     await click(laptop, '#remote-control-switch');
     await waitFor('the switch to turn on', async () => (await status(laptop)).controlAllowed === true);
-    await waitFor('the switch to show it', () => laptop.page.evaluate(() => document.querySelector('#remote-control-switch').getAttribute('aria-pressed') === 'true'));
+    await waitFor('the switch to show it', () => laptop.page.evaluate(() => document.querySelector('#remote-control-switch').getAttribute('aria-checked') === 'true'));
     await closeSettings(laptop);
   });
 
@@ -500,6 +537,16 @@ test('two devices, through the interface', async (t) => {
     await waitFor('the frames to land out of sight', () =>
       laptop.page.evaluate((id) => state.chats[id].messages.at(-1)?.content === 'Answered during the lock.', rid()), 5000);
     assert.equal(await domHas(laptop, 'Answered during the lock.'), false);
+  });
+
+  await t.test('while idle-locked, the page itself can send the home PC no action, and the rest still goes', async () => {
+    const before = await home.page.evaluate(() => Object.keys(state.chats).length);
+    assert.equal(await laptop.remote('send', homeId, { type: 'action', id: 'a_locked_new', kind: 'new-chat', args: { modality: 'chat' } }), false);
+    assert.equal(await laptop.remote('send', homeId, { type: 'action', id: 'a_locked_send', chatId: sharedId, kind: 'send', args: { text: 'Sent past the lock' } }), false);
+    assert.equal(await laptop.remote('send', homeId, { type: 'mirror-resync-request' }), true);
+    await sleep(1000);
+    assert.equal(await home.page.evaluate(() => Object.keys(state.chats).length), before);
+    assert.equal((await home.page.evaluate((id) => JSON.stringify(state.chats[id].messages), sharedId)).includes('Sent past the lock'), false);
   });
 
   await t.test('a code can be refused, and the dialog says why with no code in it', async () => {
@@ -775,6 +822,209 @@ test('two devices, through the interface', async (t) => {
     await gone(laptop, '#remote-pin-overlay');
   });
 
+  await t.test("a name from a home PC's own snapshot is only ever text", async () => {
+    await home.page.evaluate((name) => { state.remoteStatus = { ...state.remoteStatus, name }; }, HOSTILE);
+    assert.equal(await laptop.remote('send', homeId, { type: 'mirror-resync-request' }), true);
+    await waitFor('the name to arrive', () => laptop.page.evaluate(([id, name]) => mirror.homes.get(id)?.info?.name === name, [homeId, HOSTILE]), 5000);
+    await said(laptop, '#new-remote-chat span', `New chat on ${HOSTILE}`);
+    assert.equal(await count(laptop, 'img[src="x"]'), 0);
+    assert.equal(await laptop.page.evaluate(() => window.__xss), undefined);
+    await home.page.evaluate(async () => mirrorOnStatus(await window.api.remote.status()));
+    assert.equal(await laptop.remote('send', homeId, { type: 'mirror-resync-request' }), true);
+    await waitFor('the name to go back', () => laptop.page.evaluate(([id, name]) => mirror.homes.get(id)?.info?.name !== name, [homeId, HOSTILE]), 5000);
+  });
+
+  const localChat = () => laptop.page.evaluate(() => {
+    const local = state.order.map((id) => state.chats[id]).find((c) => c && !c.remote && chatSpace(c) === state.space);
+    setActive(local.id);
+  });
+  const shareAt = (id, on) => home.page.evaluate(([c, value]) => { state.chats[c].remoteControl = value; markMirrorDirty(); }, [id, on]);
+  const boxOn = () => laptop.page.evaluate(() => document.querySelector('#composer-input').value);
+
+  await t.test('a chat asked for, arriving during a lock, waits behind it and opens on unlock', async () => {
+    await localChat();
+    const title = 'Awaited secret title';
+    const awaited = await home.page.evaluate((name) => {
+      const before = state.activeId;
+      createChat(state.chats[before].model, 'chat', { title: name, titleManual: true, webEnabled: false });
+      const made = state.activeId;
+      setActive(before);
+      return made;
+    }, title);
+    const key = `remote:${homeId}:${awaited}`;
+    await laptop.page.evaluate((k) => { mirror.openOnArrival = k; }, key);
+    await laptop.remote('lock');
+    await appeared(laptop, '#remote-pin-overlay');
+    await shareAt(awaited, true);
+    await waitFor('it to arrive', () => hasChat(laptop, key), 5000);
+    await sleep(200);
+    assert.notEqual(await laptop.page.evaluate(() => state.activeId), key);
+    assert.equal(await foundIn(laptop, title), null);
+
+    await click(laptop, '#remote-pin-later');
+    await gone(laptop, '#remote-pin-overlay');
+    assert.notEqual(await laptop.page.evaluate(() => state.activeId), key);
+    assert.equal(await foundIn(laptop, title), null, 'nor after Not now');
+
+    await click(laptop, '#remote-lock-row button');
+    await fill(laptop, '#remote-pin-input', PIN);
+    await click(laptop, '#remote-pin-submit');
+    await gone(laptop, '#remote-pin-overlay', 15000);
+    await waitFor('it to open', () => laptop.page.evaluate((k) => state.activeId === k, key), 3000);
+    assert.equal(await laptop.page.evaluate(() => mirror.openOnArrival), null);
+    await localChat();
+    await shareAt(awaited, false);
+    await waitFor('it to go', async () => !(await hasChat(laptop, key)), 5000);
+  });
+
+  await t.test('words typed in a chat that stops being shared go to no other chat, and come back with it', async () => {
+    const other = await newChat(home, { modality: 'chat', title: 'Chat B', titleManual: true, webEnabled: false, remoteControl: true });
+    await home.page.evaluate(() => markMirrorDirty());
+    await openChat(home, sharedId);
+    const otherKey = `remote:${homeId}:${other}`;
+    await waitFor('chat B', () => hasChat(laptop, otherKey), 5000);
+    await home.page.evaluate((id) => { state.chats[id].updatedAt = Date.now() + 100000; markMirrorDirty(); }, other);
+
+    await openChat(laptop, rid());
+    await laptop.page.fill('#composer-input', 'Words for the first chat');
+    await laptop.page.evaluate(() => {
+      state.pendingAttachments.push({ kind: 'text', name: 'first.txt', text: 'body', ext: 'txt', size: 4 });
+      renderAttachments();
+    });
+    await shareAt(sharedId, false);
+    await waitFor('it to leave', async () => !(await hasChat(laptop, rid())), 5000);
+
+    assert.equal(await laptop.page.evaluate(() => !!currentChat()?.remote), false, 'landed on a local chat');
+    assert.equal(await boxOn(), '', 'not in the local box');
+    assert.deepEqual(await laptop.page.evaluate(() => state.pendingAttachments), [], 'nor its file');
+    await appeared(laptop, '#remote-gone');
+    assert.match(await textOf(laptop, '#remote-gone span'), /no longer shared/);
+    assert.doesNotMatch(await textOf(laptop, '#remote-gone span'), /still in the message box/);
+    await click(laptop, '#remote-gone button');
+
+    await openChat(laptop, otherKey);
+    assert.equal(await boxOn(), '', 'not in the other chat');
+    assert.deepEqual(await laptop.page.evaluate(() => state.pendingAttachments), []);
+    await localChat();
+
+    await shareAt(sharedId, true);
+    await waitFor('it to come back', () => hasChat(laptop, rid()), 5000);
+    await openChat(laptop, rid());
+    assert.equal(await boxOn(), 'Words for the first chat');
+    assert.deepEqual(await laptop.page.evaluate(() => state.pendingAttachments.map((a) => a.name)), ['first.txt']);
+    await laptop.page.fill('#composer-input', '');
+    await laptop.page.evaluate(() => { state.pendingAttachments = []; renderAttachments(); });
+    await localChat();
+    await shareAt(other, false);
+    await waitFor('chat B to go', async () => !(await hasChat(laptop, otherKey)), 5000);
+  });
+
+  await t.test('what a home PC says during a lock waits behind it too', async () => {
+    await localChat();
+    await waitFor('earlier toasts to clear', async () => (await count(laptop, '.toast')) === 0, 6000);
+    await laptop.remote('lock');
+    await appeared(laptop, '#remote-pin-overlay');
+    assert.equal(await home.remote('send', laptopId, { type: 'queued-returned', id: 'lock_q1', chatId: sharedId, text: 'Handed back during the lock' }), true);
+    assert.equal(await home.remote('send', laptopId, { type: 'mirror-too-large' }), true);
+    await sleep(500);
+    assert.equal(await count(laptop, '.toast'), 0, 'nothing above the PIN screen');
+    assert.equal(await domHas(laptop, 'Handed back during the lock'), false);
+
+    await fill(laptop, '#remote-pin-input', PIN);
+    await click(laptop, '#remote-pin-submit');
+    await gone(laptop, '#remote-pin-overlay', 15000);
+    await waitFor('the toasts to show', async () => {
+      const words = await laptop.page.evaluate(() => [...document.querySelectorAll('.toast')].map((x) => x.textContent).join(' | '));
+      return /queued message/.test(words) && /too large/.test(words);
+    }, 3000);
+
+    // A toast of this machine's own doesn't wait.
+    await laptop.remote('lock');
+    await appeared(laptop, '#remote-pin-overlay');
+    await laptop.page.evaluate(() => showToast('Something local'));
+    assert.match(await laptop.page.evaluate(() => document.querySelector('#toast-host').textContent), /Something local/);
+    await fill(laptop, '#remote-pin-input', PIN);
+    await click(laptop, '#remote-pin-submit');
+    await gone(laptop, '#remote-pin-overlay', 15000);
+    await openChat(laptop, rid());
+    await waitFor('the words in the box', async () => (await boxOn()) === 'Handed back during the lock', 3000);
+    await laptop.page.fill('#composer-input', '');
+    await localChat();
+  });
+
+  await t.test("locking with a home PC's project open, and nothing local in that space, leaves no trace of its models", async () => {
+    const project = await newChat(home, { modality: 'agent', title: 'Project at home', titleManual: true, projectFolder: 'C:\\somewhere', remoteControl: true });
+    await home.page.evaluate(() => markMirrorDirty());
+    await openChat(home, sharedId);
+    const key = `remote:${homeId}:${project}`;
+    await waitFor('the project', () => hasChat(laptop, key), 5000);
+    await openChat(laptop, key);
+    assert.equal(await laptop.page.evaluate(() => state.space), 'code');
+    assert.equal(await laptop.page.evaluate(() => state.order.map((id) => state.chats[id]).filter((c) => c?.modality === 'agent' && !c.remote).length), 0);
+    const model = 'home-only-model:latest';
+    await laptop.page.evaluate(([id, name]) => {
+      mirror.homes.get(id).info.installedModels.push(name);
+      populateModelPicker();
+    }, [homeId, model]);
+    assert.notEqual(await foundIn(laptop, model), null, 'there to begin with');
+
+    await laptop.remote('lock');
+    await appeared(laptop, '#remote-pin-overlay');
+    assert.equal(await laptop.page.evaluate(() => state.activeId), null);
+    assert.equal(await foundIn(laptop, model), null);
+    await fill(laptop, '#remote-pin-input', PIN);
+    await click(laptop, '#remote-pin-submit');
+    await gone(laptop, '#remote-pin-overlay', 15000);
+    await laptop.page.evaluate(() => switchSpace('home'));
+    await localChat();
+    await shareAt(project, false);
+    await waitFor('the project to go', async () => !(await hasChat(laptop, key)), 5000);
+  });
+
+  await t.test('a laptop whose PIN could not be saved reaches nothing at home, and Remove is a real way out', async () => {
+    const owing = await launchDevice('owing', { flags: 'log,no-stun,fail-user-pin', ollamaUrl: laptopOllama.url });
+    try {
+      assert.deepEqual(await owing.remote('setAddress', relay.address), { ok: true });
+      const { code } = await home.remote('createCode');
+      let answer;
+      await waitFor('the pairing', async () => {
+        answer = await owing.remote('pair', code, 'Owing laptop', PIN);
+        if (!answer.ok && !/cancelled/.test(answer.error)) assert.fail(answer.error);
+        return answer.ok;
+      }, 10000);
+      assert.equal(answer.pinError, 'Could not save the PIN.');
+      const st = await status(owing);
+      assert.equal(st.needsPin, true);
+      assert.equal(st.locked, false);
+      await waitFor('its connection', async () => (await status(owing)).devices[0]?.connected, 20000);
+      await appeared(owing, '#remote-pin-overlay');
+      assert.equal(await textOf(owing, '#remote-pin-title'), 'Set a PIN for this device');
+      await waitFor('the chats to arrive out of sight', () => owing.page.evaluate(() => Object.values(state.chats).some((c) => c.remote)), 5000);
+      assert.equal(await domHas(owing, 'Shared plans'), false);
+
+      const chatsAtHome = await home.page.evaluate(() => Object.keys(state.chats).length);
+      assert.equal(await owing.remote('send', homeId, { type: 'action', id: 'a_owing', kind: 'new-chat', args: { modality: 'chat' } }), false);
+      assert.equal(await owing.remote('send', homeId, { type: 'mirror-resync-request' }), true);
+      await sleep(800);
+      assert.equal(await home.page.evaluate(() => Object.keys(state.chats).length), chatsAtHome);
+
+      await fill(owing, '#remote-pin-input', PIN);
+      await fill(owing, '#remote-pin-input2', PIN);
+      await click(owing, '#remote-pin-submit');
+      await said(owing, '#remote-pin-error', 'Could not save the PIN.');
+      assert.equal(await isVisible(owing, '#remote-pin-overlay'), true);
+
+      await click(owing, '#remote-pin-remove');
+      await gone(owing, '#remote-pin-overlay');
+      assert.deepEqual((await status(owing)).devices, []);
+      assert.equal((await status(owing)).needsPin, false);
+      assert.equal(await owing.page.evaluate(() => Object.values(state.chats).some((c) => c.remote)), false);
+      await waitFor('home to drop it', async () => (await status(home)).devices.every((d) => d.name !== 'Owing laptop'), 10000);
+    } finally {
+      await owing.stop();
+    }
+  });
+
   await t.test('Remove takes a second click, and ends it at once', async () => {
     await openDevices(home);
     const visitorRow = '.remote-device[data-name="visitor"]';
@@ -810,6 +1060,7 @@ test('two devices, through the interface', async (t) => {
     assert.equal(locked.devices.length, 0);
     await sleep(1500);
     assert.equal((await status(home)).devices[0].connected, false, 'no connection before the PIN');
+    assert.equal(await laptop.remote('send', homeId, { type: 'action', id: 'a_sealed', kind: 'new-chat', args: { modality: 'chat' } }), false);
     assert.equal(await count(laptop, '.remote-home'), 0);
     assert.equal(await domHas(laptop, 'Shared plans'), false);
 
@@ -819,5 +1070,29 @@ test('two devices, through the interface', async (t) => {
     await waitFor('the connection', async () => (await status(home)).devices[0].connected === true, 30000);
     await waitFor('the group', async () => (await count(laptop, '.remote-home .chat-item')) >= 1, 15000);
     await said(laptop, '.remote-indicator', `Connected to ${homeName}`);
+  });
+
+  await t.test('ten wrong PINs delete the keys, and the screen says so', async () => {
+    await laptop.remote('lock');
+    await appeared(laptop, '#remote-pin-overlay');
+    for (let attempt = 1; attempt <= 10; attempt++) {
+      await waitFor(`try ${attempt} to be allowed`, () => laptop.page.evaluate(() => !document.querySelector('#remote-pin-submit').disabled), 90000);
+      await fill(laptop, '#remote-pin-input', '000000');
+      await click(laptop, '#remote-pin-submit');
+      if (attempt < 10) {
+        await waitFor(`the answer to try ${attempt}`, async () => /PIN/.test((await textOf(laptop, '#remote-pin-error')) ?? ''), 15000);
+      }
+    }
+    await waitFor('the notice', async () => (await textOf(laptop, '#remote-pin-title')) === 'Remote Control keys deleted', 15000);
+    assert.equal(await isVisible(laptop, '#remote-pin-overlay'), true);
+    assert.match(await textOf(laptop, '#remote-pin-lead'), /tenth wrong PIN/);
+    assert.equal(await isVisible(laptop, '#remote-pin-form'), false);
+    const st = await status(laptop);
+    assert.equal(st.hasPin, false);
+    assert.deepEqual(st.devices, []);
+    assert.equal(await domHas(laptop, 'Shared plans'), false);
+    await click(laptop, '#remote-pin-ok');
+    await gone(laptop, '#remote-pin-overlay');
+    assert.equal(await count(laptop, '.remote-home'), 0);
   });
 });

@@ -959,7 +959,7 @@ test('acting from a laptop', async (t) => {
     await waitFor('it to leave the screen', () => laptop.page.evaluate((key) => state.activeId !== key, rid(id)), 2000);
     const sidebar = await laptop.page.evaluate(() => document.querySelector('#chat-list').textContent);
     assert.ok(!sidebar.includes('Going away'));
-    assert.equal(await box(laptop), 'Words I have not sent yet', 'the text is still there');
+    assert.equal(await box(laptop), '', 'the words stay with that chat, and go to no other');
     assert.ok((await laptop.page.evaluate(() => document.querySelector('#remote-gone').textContent)).includes('This chat is no longer shared'));
     assert.equal(await laptop.page.evaluate(() => document.querySelector('#remote-gone').hidden), false);
 
@@ -971,17 +971,15 @@ test('acting from a laptop', async (t) => {
     // It goes when it's been read, and it doesn't come back for the next chat.
     await click(laptop, '#remote-gone button');
     assert.equal(await laptop.page.evaluate(() => document.querySelector('#remote-gone').hidden), true);
-    assert.equal(await box(laptop), 'Words I have not sent yet');
-    await setBox(laptop, '');
+    assert.equal(await box(laptop), '');
 
     // Deleting does the same.
     await openOn(laptop, stay);
     await setBox(laptop, 'More words');
     await home.page.evaluate((c) => deleteChat(c), stay);
     await waitFor('the chat to leave', async () => !(await hasChat(laptop, rid(stay))), 3000);
-    assert.equal(await box(laptop), 'More words');
+    assert.equal(await box(laptop), '');
     assert.equal(await laptop.page.evaluate(() => document.querySelector('#remote-gone').hidden), false);
-    await setBox(laptop, '');
     await click(laptop, '#remote-gone button');
   });
 
@@ -1758,7 +1756,7 @@ test('a laptop asks again only when nothing has arrived, and less and less often
       }
       return realSetTimeout(fn, ms, ...rest);
     };
-    window.__status = { devices: [{ id: HOME, role: 'home', connected: true }], locked: false, idleLocked: false };
+    window.__status = { devices: [{ id: HOME, role: 'home', connected: true }], enabled: true, locked: false, idleLocked: false };
     mirrorOnStatus(window.__status);
     const home = mirrorHome(HOME);
     const out = { waits: [] };
@@ -1816,7 +1814,7 @@ test('parts of a snapshot from a hostile home change nothing they should not', a
   await started(device);
   const result = await page.evaluate(() => {
     const HOME = 'fuzz-home';
-    window.__status = { devices: [{ id: HOME, role: 'home', connected: true }], locked: false, idleLocked: false };
+    window.__status = { devices: [{ id: HOME, role: 'home', connected: true }], enabled: true, locked: false, idleLocked: false };
     mirrorOnStatus(window.__status);
     const chat = (id) => ({ id, title: id, messages: [] });
     const has = (id) => Boolean(state.chats[`remote:${HOME}:${id}`]);

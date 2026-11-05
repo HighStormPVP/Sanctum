@@ -2702,7 +2702,10 @@ function openSettings() {
   $('#setting-instructions').focus();
   renderMcpSettings();
 }
-function closeSettings() { $('#settings-overlay').hidden = true; }
+function closeSettings() {
+  $('#settings-overlay').hidden = true;
+  forgetRemoteAddressAttempt();
+}
 
 // ============== MCP SERVER MANAGEMENT ==============
 function renderMcpSettings() {
@@ -6771,8 +6774,14 @@ async function submitPin() {
   const answer = await (asked === 'set' ? window.api.remote.setPin(pin) : window.api.remote.unlock(pin))
     .catch(() => ({ ok: false, error: "Couldn't check that. Try again." }));
   submit.disabled = false;
-  if (remoteUi.pinMode !== asked) return;
   const said = asked === 'set' ? { ok: !!answer.ok, message: answer.error || '', waitMs: 0, wiped: false } : RemoteRules.pinAnswer(answer);
+  // The status saying the keys are gone comes first, and has already closed this screen.
+  if (said.wiped) {
+    remoteUi.pinNotice = said.message;
+    paintPinScreen();
+    return;
+  }
+  if (remoteUi.pinMode !== asked) return;
   if (said.ok) {
     clearPinFields();
     // The status that says so can be a moment behind this.
@@ -6781,11 +6790,6 @@ async function submitPin() {
   }
   $('#remote-pin-input').value = '';
   $('#remote-pin-input').focus();
-  if (said.wiped) {
-    remoteUi.pinNotice = said.message;
-    paintPinScreen();
-    return;
-  }
   error.textContent = said.message;
   if (said.waitMs > 0) {
     submit.disabled = true;
@@ -6822,6 +6826,13 @@ function wireRemoteDevicesPanel() {
   $('#remote-connect-home')?.addEventListener('click', openConnectDialog);
   $('#remote-panel-unlock')?.addEventListener('click', askForPinAgain);
   $('#remote-control-switch')?.addEventListener('click', toggleLaptopControl);
+}
+
+// A refusal is about that attempt, and what's in the field holds a secret.
+function forgetRemoteAddressAttempt() {
+  $('#remote-address').value = '';
+  $('#remote-address-note').classList.remove('remote-note-error');
+  paintRemoteDevices();
 }
 
 async function saveRemoteAddress() {
@@ -6863,7 +6874,7 @@ function paintRemoteDevices() {
   // mean anything, and the PIN.
   const control = $('#remote-control-wrap');
   control.hidden = !on || !(lockedOut ? status.controlAllowed === true : remoteHomes().length > 0);
-  $('#remote-control-switch').setAttribute('aria-pressed', status.controlAllowed === true ? 'true' : 'false');
+  $('#remote-control-switch').setAttribute('aria-checked', status.controlAllowed === true ? 'true' : 'false');
   if (body.hidden) { $('#remote-device-list').replaceChildren(); return; }
 
   const list = $('#remote-device-list');
@@ -7118,6 +7129,7 @@ const REMOTE_ERROR_MAX = 300;
 const REMOTE_LATE_ANSWER_MS = 10 * 60 * 1000;
 const REMOTE_RETURNED_SEEN_MAX = 1000;
 const REMOTE_UNDELIVERED_MAX_BYTES = 32 * 1024 * 1024;
+const REMOTE_TOASTS_HELD_MAX = 20;
 
 // ---- At home ----
 
@@ -7453,7 +7465,7 @@ function finishAction(deviceId, frame) {
 // here is say so if it didn't happen.
 function askHome(c, kind, args) {
   return actionToHome(c.remote.deviceId, c.remote.chatId, kind, args).then((answer) => {
-    if (!answer.ok) showToast(answer.error);
+    if (!answer.ok) remoteToast(answer.error);
     return answer;
   });
 }
@@ -7494,16 +7506,20 @@ async function sendComposerToHome(c) {
   if (answer.ok) return;
   returnToBox(key, text, attachments);
   // It may yet land, and pressing Send again would start a second run, so this can't say it didn't.
-  showToast(answer.timedOut ? `${answer.error} Your message may still arrive.` : `Your message wasn't sent. ${answer.error}`);
+  remoteToast(answer.timedOut ? `${answer.error} Your message may still arrive.` : `Your message wasn't sent. ${answer.error}`);
 }
 
 // The answer came after all, and the text had already been given back. It's removed only while
 // it's exactly as it came back, because anything else is something the person has since typed.
 function takeBackReturned(key, text, attachments) {
-  showToast('Your message did go through');
+  remoteToast('Your message did go through');
   const c = state.chats[key];
   if (c?._returned?.text === text) {
     delete c._returned;
+    return;
+  }
+  if (mirror.heldForGone.get(key)?.text === text) {
+    mirror.heldForGone.delete(key);
     return;
   }
   const input = $('#composer-input');
@@ -7571,17 +7587,27 @@ function applyQueuedReturned(deviceId, frame) {
   mirror.returnedSeen.add(frame.id);
   if (mirror.returnedSeen.size > REMOTE_RETURNED_SEEN_MAX) mirror.returnedSeen.delete(mirror.returnedSeen.values().next().value);
   returnToBox(remoteChatKey(deviceId, frame.chatId), frame.text);
-  showToast(frame.hadAttachments === true
+  remoteToast(frame.hadAttachments === true
     ? "A queued message wasn't sent. Its words are back in the message box, but its files need attaching again."
     : "A queued message wasn't sent. It's back in the message box.");
 }
 
-function showRemoteGone() {
+// What a home PC or an action has to say. A toast sits above the PIN screen, so while locked these
+// wait for it. Toasts about this machine's own business go straight to showToast.
+function remoteToast(text) {
+  if (!remoteChatsHidden()) { showToast(text); return; }
+  mirror.toastsForUnlock.push(text);
+  if (mirror.toastsForUnlock.length > REMOTE_TOASTS_HELD_MAX) mirror.toastsForUnlock.shift();
+}
+
+function showRemoteGone(keptForIt = false) {
   const notice = $('#remote-gone');
   if (!notice) return;
-  notice.querySelector('span').textContent = $('#composer-input').value.trim()
-    ? 'This chat is no longer shared. What you typed is still in the message box.'
-    : 'This chat is no longer shared.';
+  notice.querySelector('span').textContent = keptForIt
+    ? "This chat is no longer shared. What you typed comes back if it's shared again."
+    : $('#composer-input').value.trim()
+      ? 'This chat is no longer shared. What you typed is still in the message box.'
+      : 'This chat is no longer shared.';
   notice.hidden = false;
 }
 
@@ -7612,14 +7638,15 @@ function paintRemoteChatButton() {
 
 async function newRemoteChat(deviceId) {
   const answer = await actionToHome(deviceId, undefined, 'new-chat', { modality: 'chat' });
-  if (!answer.ok) { showToast(answer.error); return; }
+  if (!answer.ok) { remoteToast(answer.error); return; }
   if (typeof answer.chatId !== 'string') return;
   mirror.openOnArrival = remoteChatKey(deviceId, answer.chatId);
   openIfAwaited(mirror.openOnArrival);
 }
 
+// A home PC decides when the chat arrives, so that can be long after the click. Unlocking looks again.
 function openIfAwaited(key) {
-  if (mirror.openOnArrival !== key || !state.chats[key]) return;
+  if (remoteChatsHidden() || mirror.openOnArrival !== key || !state.chats[key]) return;
   mirror.openOnArrival = null;
   state.space = chatSpace(state.chats[key]);
   applySpaceChrome();
@@ -7696,7 +7723,10 @@ const mirror = {
   hidden: false,             // locked, so remote chats are off the screen
   resumeId: null,            // the remote chat that was open when that happened
   leftFor: null,             // the chat that took its place
-  heldForUnlock: [],         // words whose chat went away during a lock
+  heldForUnlock: [],         // words handed back for a chat already gone, during a lock
+  heldForGone: new Map(),    // chat key -> words typed for a chat that went away, for if it comes back
+  goneNoticeAtUnlock: false, // that happened during a lock, so nobody has been told yet
+  toastsForUnlock: [],
   // Acting.
   actions: new Map(),        // id -> { deviceId, resolve, timer }, waiting for an answer
   lateActions: new Map(),    // id -> { deviceId, onLateOk, timer }, timed out but may still be answered
@@ -7774,12 +7804,12 @@ function mirrorOnFrame(deviceId, frame) {
   if (frame.type === 'queued-returned') { applyQueuedReturned(deviceId, frame); return; }
   if (frame.type === 'mirror-too-large') {
     if (frame.reason === 'stalled') {
-      showToast('Shared chats stopped arriving from the home PC. Asking again.');
+      remoteToast('Shared chats stopped arriving from the home PC. Asking again.');
       const stalled = mirrorHome(deviceId);
       stalled.snapshotWaitMs = MIRROR_SNAPSHOT_WAIT_MS;
       requestMirrorSnapshot(deviceId, stalled);
     } else {
-      showToast('A shared chat is too large to show on this device. Open it on the home PC.');
+      remoteToast('A shared chat is too large to show on this device. Open it on the home PC.');
     }
     return;
   }
@@ -8303,6 +8333,10 @@ function homeDeviceStatus(device, firstStatus) {
 
 function forgetHome(deviceId) {
   for (const c of remoteChatsOf(deviceId)) dropRemoteChat(c.id);
+  // That home PC isn't coming back, so nor are its chats.
+  for (const key of mirror.heldForGone.keys()) {
+    if (key.startsWith(remoteChatKey(deviceId, ''))) mirror.heldForGone.delete(key);
+  }
   clearTimeout(mirror.homes.get(deviceId)?.snapshotTimer);
   mirror.homes.delete(deviceId);
   paintRemoteOffline();
@@ -8312,6 +8346,11 @@ function forgetHome(deviceId) {
 function addRemoteChat(deviceId, chatId) {
   const id = remoteChatKey(deviceId, chatId);
   const c = { id, messages: [], remote: { deviceId, chatId } };
+  const held = mirror.heldForGone.get(id);
+  if (held) {
+    c._returned = held;
+    mirror.heldForGone.delete(id);
+  }
   state.chats[id] = c;
   state.order.push(id);
   return c;
@@ -8430,27 +8469,45 @@ function dropRemoteChat(key) {
   delete state.chats[key];
   state.order = state.order.filter(id => id !== key);
   state.runningChats.delete(key);
-  if (state.activeId === key) {
-    // Everything being typed stays where it is. Leaving would clear what was attached.
-    const attachments = state.pendingAttachments;
+  const wasOpen = state.activeId === key;
+  // What was being typed was meant for this chat, and in the box it would go to whichever chat
+  // is open next. It waits for this one.
+  if (wasOpen) takeDraftOutOfBox(c);
+  const kept = !!c._returned;
+  if (kept) holdForGoneChat(key, c._returned);
+  if (wasOpen) {
     leaveRemoteChat();
-    state.pendingAttachments = attachments;
-    renderAttachments();
     updateSendButton();
-    populateModelPicker();
-    showRemoteGone();
+    showRemoteGone(kept);
   } else {
     renderChatList();
+    if (kept && mirror.hidden) mirror.goneNoticeAtUnlock = true;
+    else if (kept) showRemoteGone(true);
   }
-  if (c._returned) backInBoxFromGoneChat(c._returned.text, c._returned.attachments);
+}
+
+function holdForGoneChat(key, held) {
+  mirror.heldForGone.delete(key);
+  mirror.heldForGone.set(key, held);
+  const size = (h) => h.text.length + h.attachments.reduce((sum, a) => sum + (a.base64?.length || a.text?.length || 0), 0);
+  let total = 0;
+  for (const h of mirror.heldForGone.values()) total += size(h);
+  for (const [oldest, h] of mirror.heldForGone) {
+    if (total <= REMOTE_UNDELIVERED_MAX_BYTES || oldest === key) break;
+    total -= size(h);
+    mirror.heldForGone.delete(oldest);
+  }
 }
 
 // Where to go when the open remote chat has to leave the screen.
 function leaveRemoteChat() {
-  const next = chatsInCurrentSpace().find(c => c.id !== state.activeId);
+  // Another home PC's chat is no place to land: it isn't what anyone was looking at.
+  const next = chatsInCurrentSpace().find(c => !c.remote);
   if (next) setActive(next.id);
   else if (state.space === 'code') { state.activeId = null; renderActiveChat(); renderChatList(); }
   else createChat();
+  // Whichever way it went, the home PC's models leave with its chat.
+  populateModelPicker();
 }
 
 // Newest first. The sidebar groups them under their home PC, above local chats.
@@ -8474,7 +8531,7 @@ function reflectRemoteLock() {
     const c = currentChat();
     if (c?.remote) {
       mirror.resumeId = state.activeId;
-      holdDraftThroughLock(c);
+      takeDraftOutOfBox(c);
       leaveRemoteChat();
       mirror.leftFor = state.activeId;
     } else {
@@ -8485,16 +8542,25 @@ function reflectRemoteLock() {
     mirror.resumeId = null;
     // Someone who has gone on with something else here isn't pulled away from it. What they were
     // typing waits in its chat for when they go back.
-    const undisturbed = state.activeId === mirror.leftFor && !$('#composer-input').value.trim() && !state.pendingAttachments.length;
-    if (resume && state.chats[resume] && undisturbed) setActive(resume);
+    const boxIsFree = () => !$('#composer-input').value.trim() && !state.pendingAttachments.length;
+    if (resume && state.chats[resume] && state.activeId === mirror.leftFor && boxIsFree()) setActive(resume);
     else renderChatList();
+    // Asked for before the lock, and arrived during it. Someone typing here isn't pulled away
+    // from that either: it's in the sidebar for them.
+    if (mirror.openOnArrival && state.chats[mirror.openOnArrival]) {
+      if (boxIsFree()) openIfAwaited(mirror.openOnArrival);
+      else mirror.openOnArrival = null;
+    }
     for (const { text, attachments } of mirror.heldForUnlock.splice(0)) backInBoxFromGoneChat(text, attachments);
+    if (mirror.goneNoticeAtUnlock) showRemoteGone(true);
+    mirror.goneNoticeAtUnlock = false;
+    for (const text of mirror.toastsForUnlock.splice(0)) showToast(text);
   }
 }
 
-// Words typed to a home PC go off the screen with its chat, and come back with it. Emptying the
-// box is what brings waiting words back, so those are put to one side while that happens.
-function holdDraftThroughLock(c) {
+// Words typed to a home PC go with its chat, and come back with it. Emptying the box is what
+// brings waiting words back, so those are put to one side while that happens.
+function takeDraftOutOfBox(c) {
   const input = $('#composer-input');
   const text = input.value;
   const attachments = state.pendingAttachments;

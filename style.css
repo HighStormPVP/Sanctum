@@ -3596,8 +3596,8 @@ textarea:focus-visible, input:focus-visible { outline: none; }
 .remote-home-head { display: flex; align-items: baseline; gap: 8px; padding: 10px 12px 6px; font-size: 12px; font-weight: 600; color: var(--text-2); }
 .remote-home:first-child .remote-home-head { padding-top: 4px; }
 .remote-home-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.remote-home-state { flex-shrink: 0; font-weight: 400; color: var(--text-4); }
-.remote-home-empty { padding: 2px 12px 6px; font-size: 12px; line-height: 1.45; color: var(--text-4); }
+.remote-home-state { flex-shrink: 0; font-weight: 400; color: var(--text-3); }
+.remote-home-empty { padding: 2px 12px 6px; font-size: 12px; line-height: 1.45; color: var(--text-3); }
 .remote-lock-row {
   display: flex;
   align-items: center;
@@ -3709,7 +3709,7 @@ textarea:focus-visible, input:focus-visible { outline: none; }
 .remote-device-name { font-size: 13.5px; font-weight: 600; color: var(--text-1); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .remote-device-facts { display: flex; flex-wrap: wrap; gap: 2px 14px; margin-top: 3px; font-size: 12px; color: var(--text-3); }
 .remote-device-fingerprint { font-family: var(--font-mono); font-size: 11.5px; }
-.remote-device-path { flex-shrink: 0; font-size: 12.5px; color: var(--text-4); }
+.remote-device-path { flex-shrink: 0; font-size: 12.5px; color: var(--text-3); }
 .remote-device-path.up { color: var(--ok); }
 .remote-device-remove {
   flex-shrink: 0;
@@ -3727,6 +3727,8 @@ textarea:focus-visible, input:focus-visible { outline: none; }
 .remote-own-fingerprint { font-size: 13px; color: var(--text-2); margin-bottom: 2px; }
 .remote-device-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
 .remote-control-switch { padding: 12px; border: 1px solid var(--border-1); }
+.remote-control-switch[aria-checked="true"] .tools-menu-switch { background: var(--accent-1); border-color: rgba(var(--accent-rgb),0.55); }
+.remote-control-switch[aria-checked="true"] .tools-menu-switch-dot { left: calc(100% - 14px); background: #fff; }
 .remote-control-switch .tools-menu-label strong { font-size: 13.5px; font-weight: 600; }
 .remote-control-switch .tools-menu-label small { font-size: 12.5px; }
 
