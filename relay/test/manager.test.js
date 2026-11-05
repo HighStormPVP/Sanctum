@@ -128,14 +128,14 @@ test('two managers pair with a code, connect, exchange frames, and removal reach
   assert.equal(home.keystore.listPeers()[0].provisional, undefined);
 
   // Both ways.
-  assert.equal(home.manager.send(laptop.id, { from: 'home' }), true);
-  assert.equal(laptop.manager.send(home.id, { from: 'laptop' }), true);
+  assert.equal(home.manager.send(laptop.id, { type: 'test', from: 'home' }), true);
+  assert.equal(laptop.manager.send(home.id, { type: 'test', from: 'laptop' }), true);
   await waitFor('small frames', () => home.frames.length === 1 && laptop.frames.length === 1);
-  assert.deepEqual(laptop.frames[0], { id: home.id, frame: { from: 'home' } });
-  assert.deepEqual(home.frames[0], { id: laptop.id, frame: { from: 'laptop' } });
+  assert.deepEqual(laptop.frames[0], { id: home.id, frame: { type: 'test', from: 'home' } });
+  assert.deepEqual(home.frames[0], { id: laptop.id, frame: { type: 'test', from: 'laptop' } });
 
   // Bigger than the relay's 1 MiB limit on a single frame, so it has to split.
-  const big = { text: 'x'.repeat(2 * MIB), end: true };
+  const big = { type: 'test', text: 'x'.repeat(2 * MIB), end: true };
   assert.equal(home.manager.send(laptop.id, big), true);
   await waitFor('the 2 MiB frame', () => laptop.frames.length === 2);
   assert.equal(laptop.frames[1].frame.text, big.text);
@@ -143,7 +143,7 @@ test('two managers pair with a code, connect, exchange frames, and removal reach
 
   // More than the relay's 120 a second, which only all arrive if they're paced.
   const burst = 300;
-  for (let i = 0; i < burst; i++) assert.equal(laptop.manager.send(home.id, { i }), true);
+  for (let i = 0; i < burst; i++) assert.equal(laptop.manager.send(home.id, { type: 'test', i }), true);
   await waitFor('the burst', () => home.frames.length === burst + 1, 30000);
   assert.deepEqual(home.frames.slice(1).map((f) => f.frame.i), [...Array(burst).keys()]);
 

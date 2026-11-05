@@ -704,11 +704,14 @@ test('acting from a laptop', async (t) => {
     await home.page.evaluate((c) => deleteChat(c), id);
     await waitFor('the chat to leave', async () => !(await hasChat(laptop, rid(id))), 3000);
     assert.equal(await box(laptop), '', 'not yet');
-    await waitFor('the words to come back', async () => (await box(laptop)) === 'Queued before the delete', 5000);
+    await waitFor('the words to come back', () => laptop.page.evaluate(() => [...mirror.heldForGone.values()].some((h) => h.text === 'Queued before the delete')), 5000);
+    assert.equal(await box(laptop), '', 'and not into the box by themselves');
     assert.equal(await laptop.page.evaluate(() => document.querySelector('#remote-gone').hidden), false);
     await home.page.evaluate(() => { window.restoreQueuedMessages = window.__realRestore; });
-    await setBox(laptop, '');
     await click(laptop, '#remote-gone button');
+    await click(laptop, '#remote-stranded-put');
+    assert.equal(await box(laptop), 'Queued before the delete');
+    await setBox(laptop, '');
   });
 
   await t.test("a laptop's queued words wait at home while it's offline", async () => {
@@ -776,13 +779,14 @@ test('acting from a laptop', async (t) => {
     assert.equal(await box(laptop), '');
     await home.page.evaluate((c) => { state.chats[c].remoteControl = false; markMirrorDirty(); }, id);
     await waitFor('the chat to leave', async () => !(await hasChat(laptop, rid(id))), 3000);
-    await waitFor('the words to come back', async () => (await box(laptop)) === 'Already on its way', 5000);
+    await waitFor('the words to come back', () => laptop.page.evaluate(() => [...mirror.heldForGone.values()].some((h) => h.text === 'Already on its way')), 5000);
+    assert.equal(await box(laptop), '');
     await toastSays(laptop, 'no longer shared');
     assert.equal(await laptop.page.evaluate(() => document.querySelector('#remote-gone').hidden), false);
     assert.ok(!(await readChat(home, id)).includes('Already on its way'));
     await home.page.evaluate(() => { window.handleRemoteAction = window.__realHandle; });
-    await setBox(laptop, '');
     await click(laptop, '#remote-gone button');
+    await click(laptop, '#remote-stranded-discard');
   });
 
   await t.test('a late answer to a send that timed out says it did go through', async () => {
@@ -972,6 +976,7 @@ test('acting from a laptop', async (t) => {
     await click(laptop, '#remote-gone button');
     assert.equal(await laptop.page.evaluate(() => document.querySelector('#remote-gone').hidden), true);
     assert.equal(await box(laptop), '');
+    await click(laptop, '#remote-stranded-discard');
 
     // Deleting does the same.
     await openOn(laptop, stay);
@@ -981,6 +986,7 @@ test('acting from a laptop', async (t) => {
     assert.equal(await box(laptop), '');
     assert.equal(await laptop.page.evaluate(() => document.querySelector('#remote-gone').hidden), false);
     await click(laptop, '#remote-gone button');
+    await click(laptop, '#remote-stranded-discard');
   });
 
   await t.test('no way of failing loses what was typed', async () => {
@@ -1852,14 +1858,15 @@ test('parts of a snapshot from a hostile home change nothing they should not', a
     mirrorOnFrame(HOME, { type: 'action', id: 'x', chatId: `remote:${HOME}:a`, kind: 'rename', args: { title: 'Taken' } });
     mirrorOnFrame('someone-else', { type: 'action', id: 'x', chatId: `remote:${HOME}:a`, kind: 'rename', args: { title: 'Taken' } });
     out.title = state.chats[`remote:${HOME}:a`].title === before;
-    // Words for a chat that has gone end up in the box, with the notice. There's nowhere else.
+    // Words for a chat that has gone wait on the bar, never in the box by themselves.
     mirrorOnFrame(HOME, { type: 'queued-returned', id: 'w4', chatId: 'gone-now', text: 'words for a gone chat' });
-    out.orphan = document.querySelector('#composer-input').value;
-    out.notice = !document.querySelector('#remote-gone').hidden;
+    out.orphanInBox = document.querySelector('#composer-input').value;
+    out.orphan = mirror.heldForGone.get(remoteChatKey(HOME, 'gone-now'))?.text;
+    out.bar = !document.querySelector('#remote-stranded').hidden;
     // Sent again until acknowledged, so a second copy changes nothing.
     mirrorOnFrame(HOME, { type: 'queued-returned', id: 'w4', chatId: 'gone-now', text: 'words for a gone chat' });
-    out.once = document.querySelector('#composer-input').value;
+    out.once = mirror.heldForGone.get(remoteChatKey(HOME, 'gone-now'))?.text;
     return out;
   });
-  assert.deepEqual(result, { whole: true, partOneKeepsB: true, lastPartDropsB: true, outOfOrder: true, nonsense: true, box: '', title: true, orphan: 'words for a gone chat', notice: true, once: 'words for a gone chat' });
+  assert.deepEqual(result, { whole: true, partOneKeepsB: true, lastPartDropsB: true, outOfOrder: true, nonsense: true, box: '', title: true, orphanInBox: '', orphan: 'words for a gone chat', bar: true, once: 'words for a gone chat' });
 });

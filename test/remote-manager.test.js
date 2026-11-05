@@ -280,7 +280,20 @@ function newWorld(t) {
         deviceName: name,
         createDirect: device.createDirect
       });
-      device.manager.onFrame((id, frame) => device.frames.push({ id, frame }));
+      const send = device.manager.send;
+      device.manager.send = (id, frame) => {
+        if (frame === null || typeof frame !== 'object' || 'type' in frame) return send(id, frame);
+        const type = device.entry(id)?.role === 'laptop' ? 'mirror-ops' : 'mirror-resync-request';
+        return send(id, { ...frame, type, testFrame: true });
+      };
+      device.manager.onFrame((id, frame) => {
+        if (frame?.testFrame !== true) {
+          device.frames.push({ id, frame });
+          return;
+        }
+        const { type, testFrame, ...sent } = frame;
+        device.frames.push({ id, frame: sent });
+      });
       device.manager.onStatus((status) => device.statuses.push(status));
       return device;
     };
@@ -1318,9 +1331,9 @@ test('a 2 MiB frame arrives whole through splitting, in pieces the relay accepts
 
 test('a frame of exactly the split size and of one byte over both arrive whole', async (t) => {
   const { world, home, laptop } = await connected(t);
-  const shell = JSON.stringify({ s: '' }).length;
+  const shell = JSON.stringify({ type: 'sized', s: '' }).length;
   for (const size of [256 * 1024, 256 * 1024 + 1, 512 * 1024]) {
-    const frame = { s: 'x'.repeat(size - shell) };
+    const frame = { type: 'sized', s: 'x'.repeat(size - shell) };
     assert.equal(home.manager.send(laptop.id, frame), true);
     world.relay.pump();
     assert.deepEqual(laptop.frames.pop().frame, frame);
@@ -4105,4 +4118,129 @@ test('a home PC with only laptops still answers them while it has no PIN of its 
   assert.equal((await pairing).ok, true);
   world.relay.pump();
   assert.equal(home.manager.send(laptop.id, { type: 'action-result', id: 'a1', ok: true }), true);
+});
+
+
+// ---- Only what a locked device has to send ----
+
+const NEW_CHAT = { id: 'a1', kind: 'new-chat', args: { modality: 'chat' } };
+// None of these is a plain 'action' until something serialises it, or at all.
+const TRICKS = {
+  'a String object': () => ({ ...NEW_CHAT, type: new String('action') }),
+  'another spelling': () => ({ ...NEW_CHAT, type: 'ACTION' }),
+  'an array': () => ({ ...NEW_CHAT, type: ['action'] }),
+  'a nested type': () => ({ ...NEW_CHAT, type: { type: 'action' } }),
+  'an inherited type': () => Object.assign(Object.create({ type: 'action' }), NEW_CHAT),
+  'a toJSON on an allowed type': () => ({ type: 'mirror-part-ack', toJSON: () => ({ ...NEW_CHAT, type: 'action' }) }),
+  'a toJSON that throws': () => ({ type: 'mirror-part-ack', toJSON() { throw new Error('no'); } }),
+  'a plain action': () => ({ ...NEW_CHAT, type: 'action' })
+};
+
+async function pairedForLocking(t) {
+  const world = newWorld(t);
+  const home = await world.device('Home');
+  const laptop = await world.device('Laptop');
+  home.start();
+  laptop.start();
+  const { code } = await home.manager.createCode();
+  world.relay.pump();
+  const pairing = laptop.manager.pair(code, 'Laptop');
+  world.relay.pump();
+  assert.equal((await pairing).ok, true);
+  world.relay.pump();
+  return { world, home, laptop };
+}
+
+const framesAtHome = (home) => home.frames.map((f) => f.frame);
+
+test('an idle-locked laptop sends only its closed set, and the plain copy of it', async (t) => {
+  const { world, home, laptop } = await pairedForLocking(t);
+  laptop.manager.lock();
+  for (const [name, make] of Object.entries(TRICKS)) {
+    assert.equal(laptop.manager.send(home.id, make()), false, name);
+  }
+  assert.equal(laptop.manager.send(home.id, { type: 'mirror-snapshot', seq: 1, chats: [] }), false, 'nothing a laptop has no business sending');
+  assert.equal(laptop.manager.send(home.id, { type: 'answer', id: 'x', allow: true }), false, 'nor anything not thought of yet');
+  assert.equal(laptop.manager.send(home.id, { type: 'mirror-resync-request', padding: 'x'.repeat(70 * 1024) }), false, 'too big to be what it says');
+  world.relay.pump();
+  assert.deepEqual(framesAtHome(home), []);
+
+  const withAString = { type: 'mirror-part-ack', part: 1, transfer: 1, note: new String('kept plain') };
+  for (const frame of [{ type: 'mirror-resync-request' }, withAString, { type: 'queued-returned-ack', id: 'q1' }]) {
+    assert.equal(laptop.manager.send(home.id, frame), true, frame.type);
+  }
+  world.relay.pump();
+  assert.deepEqual(framesAtHome(home).map((f) => f.type), ['mirror-resync-request', 'mirror-part-ack', 'queued-returned-ack']);
+  assert.equal(framesAtHome(home)[1].note, 'kept plain');
+});
+
+test('a laptop owing a PIN sends only that closed set too', async (t) => {
+  const world = newWorld(t);
+  const home = await world.device('Home');
+  const real = world.keystore();
+  const keystore = { ...real, setPin: (pin, options) => (options?.kind === 'user' ? Promise.resolve({ ok: false, error: 'Could not save the PIN.' }) : real.setPin(pin, options)) };
+  const device = await world.device('Device', { pin: false, keystore });
+  home.start();
+  device.start();
+  await device.manager.createCode();
+  device.manager.cancelCode();
+  const { code } = await home.manager.createCode();
+  world.relay.pump();
+  const pairing = device.manager.pair(code, 'Device', '424242');
+  world.relay.pump();
+  assert.equal((await pairing).pinError, 'Could not save the PIN.');
+  world.relay.pump();
+  assert.equal(device.manager.status().needsPin, true);
+  for (const [name, make] of Object.entries(TRICKS)) {
+    assert.equal(device.manager.send(home.id, make()), false, name);
+  }
+  world.relay.pump();
+  assert.deepEqual(framesAtHome(home), []);
+  assert.equal(device.manager.send(home.id, { type: 'mirror-resync-request' }), true);
+
+  // And the control switch can't go on until there's a PIN. Off always works.
+  const on = device.manager.setControlAllowed(true, { fromLocalUi: true });
+  assert.equal(on.ok, false);
+  assert.match(on.error, /PIN/);
+  assert.equal(device.manager.status().controlAllowed, false);
+  assert.deepEqual(device.manager.setControlAllowed(false, { fromLocalUi: true }), { ok: true });
+});
+
+test('at any time, a type that is not a plain string goes nowhere, and a plain action goes when unlocked', async (t) => {
+  const { world, home, laptop } = await pairedForLocking(t);
+  for (const type of [new String('action'), new String('rtc'), ['action'], { type: 'action' }, 7, null, undefined]) {
+    assert.equal(laptop.manager.send(home.id, { ...NEW_CHAT, type }), false, String(type));
+  }
+  assert.equal(laptop.manager.send(home.id, { type: 'rtc' }), false);
+  world.relay.pump();
+  assert.deepEqual(framesAtHome(home), []);
+  assert.equal(laptop.manager.send(home.id, { ...NEW_CHAT, type: 'action' }), true);
+  world.relay.pump();
+  assert.equal(framesAtHome(home).length, 1);
+});
+
+test('a device that is locked as a laptop goes on serving its own laptops', async (t) => {
+  const { world, home: other, laptop: serving } = await pairedForLocking(t);
+  // serving is a laptop of other. Now it's also a home PC to a laptop of its own.
+  const own = await world.device('Own laptop');
+  own.start();
+  const { code } = await serving.manager.createCode();
+  world.relay.pump();
+  const pairing = own.manager.pair(code, 'Own laptop');
+  world.relay.pump();
+  assert.equal((await pairing).ok, true);
+  world.relay.pump();
+  serving.manager.lock();
+  assert.equal(serving.manager.status().idleLocked, true);
+
+  const servingFrames = ['mirror-snapshot', 'mirror-ops', 'mirror-run', 'mirror-remove', 'mirror-too-large', 'mirror-part-fence', 'action-result', 'queued-returned'];
+  for (const type of servingFrames) {
+    assert.equal(serving.manager.send(own.id, { type, seq: 1, big: 'x'.repeat(70 * 1024) }), true, type);
+  }
+  assert.equal(serving.manager.send(own.id, { ...NEW_CHAT, type: 'action' }), false, 'an action is still no business of a locked device');
+  assert.equal(serving.manager.send(own.id, { type: 'something-new' }), false);
+  // To its own home PC, the short list.
+  assert.equal(serving.manager.send(other.id, { type: 'mirror-ops', seq: 1 }), false);
+  world.relay.pump();
+  assert.deepEqual(own.frames.map((f) => f.frame.type), servingFrames);
 });

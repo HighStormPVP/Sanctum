@@ -3822,3 +3822,33 @@ textarea:focus-visible, input:focus-visible { outline: none; }
 .remote-pin-foot { margin-top: 30px; font-size: 12.5px; line-height: 1.5; color: var(--text-3); }
 .remote-pin-remove { display: block; margin-top: 26px; text-align: left; color: var(--text-3); overflow-wrap: anywhere; }
 .approval-approve:disabled { opacity: 0.5; cursor: default; transform: none; }
+
+/* Words whose chat has gone. Quiet, like the offline bar: nothing is wrong, and nothing is live. */
+.remote-stranded {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 0 32px 8px;
+  padding: 8px 8px 8px 14px;
+  background: var(--surface-2);
+  border: 1px solid var(--border-2);
+  border-radius: var(--r);
+  font-size: 13px;
+  color: var(--text-2);
+}
+.remote-stranded-words { flex: 1; min-width: 0; }
+.remote-stranded-text { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; overflow-wrap: anywhere; color: var(--text-1); }
+.remote-stranded-more { display: block; margin-top: 1px; font-size: 12px; color: var(--text-3); }
+.remote-stranded button {
+  flex-shrink: 0;
+  padding: 6px 12px;
+  border-radius: var(--r-sm);
+  font-family: inherit;
+  font-size: 12.5px;
+  font-weight: 500;
+  cursor: pointer;
+}
+#remote-stranded-put { background: var(--surface-3); border: 1px solid var(--border-2); color: var(--text-1); }
+#remote-stranded-put:hover { border-color: var(--border-3); }
+#remote-stranded-discard { background: transparent; border: 0; color: var(--text-3); }
+#remote-stranded-discard:hover { color: var(--text-1); }

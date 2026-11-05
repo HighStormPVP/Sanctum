@@ -50,10 +50,10 @@ test('the preload surface', async (t) => {
     });
     const attempts = [
       { type: 'setControlAllowed', allowed: true },
-      { t: 'setControlAllowed', allowed: true },
-      { setControlAllowed: true },
-      { method: 'setControlAllowed', args: [true] },
-      { channel: 'remote:setControlAllowed', allowed: true }
+      { type: 'probe', t: 'setControlAllowed', allowed: true },
+      { type: 'probe', setControlAllowed: true },
+      { type: 'probe', method: 'setControlAllowed', args: [true] },
+      { type: 'probe', channel: 'remote:setControlAllowed', allowed: true }
     ];
     for (const frame of attempts) assert.equal(await laptop.remote('send', homeId, frame), true);
     await waitFor('the frames', async () => (await home.frameCount()) === attempts.length);

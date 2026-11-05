@@ -33,7 +33,7 @@ const sendNumbers = (device, id, from, to) =>
   device.page.evaluate(
     async ([deviceId, first, last]) => {
       const sends = [];
-      for (let n = first; n < last; n++) sends.push(window.api.remote.send(deviceId, { n }));
+      for (let n = first; n < last; n++) sends.push(window.api.remote.send(deviceId, { type: 'test', n }));
       return (await Promise.all(sends)).every(Boolean);
     },
     [id, from, to]
@@ -107,7 +107,7 @@ test('direct connections', async (t) => {
   await t.test('a frame over the 64 KiB limit crosses in pieces, with no message over it', async () => {
     const before = await laptop.frameCount();
     const text = 'y'.repeat(700 * 1024);
-    assert.equal(await home.remote('send', laptopId, { text }), true);
+    assert.equal(await home.remote('send', laptopId, { type: 'test', text }), true);
     await waitFor('the large frame', async () => (await laptop.frameCount()) === before + 1);
     const got = await laptop.page.evaluate(() => window.__frames.at(-1).text);
     assert.equal(got, text);
@@ -118,7 +118,7 @@ test('direct connections', async (t) => {
   await t.test('the frame log holds only ciphertext', async () => {
     for (const [from, id, to] of [[home, laptopId, laptop], [laptop, homeId, home]]) {
       const start = await to.frameCount();
-      assert.equal(await from.remote('send', id, { text: CANARY, pad: 'p'.repeat(300 * 1024) }), true);
+      assert.equal(await from.remote('send', id, { type: 'test', text: CANARY, pad: 'p'.repeat(300 * 1024) }), true);
       await waitFor('the canary', async () => (await to.frameCount()) === start + 1);
     }
 
@@ -266,8 +266,8 @@ test('with direct blocked, the relay carries everything', async (t) => {
   while (Date.now() < until) {
     assert.equal(await home.path(), 'relay');
     assert.equal(await laptop.path(), 'relay');
-    assert.equal(await home.remote('send', laptopId, { n }), true);
-    assert.equal(await laptop.remote('send', homeId, { n }), true);
+    assert.equal(await home.remote('send', laptopId, { type: 'test', n }), true);
+    assert.equal(await laptop.remote('send', homeId, { type: 'test', n }), true);
     n += 1;
     await sleep(100);
   }

@@ -6475,6 +6475,7 @@ function patchLastMessageContent(msg) {
 // innerHTML is never given anything that came from a status or a frame.
 const REMOTE_IDLE_TICK_MS = 5000;
 const REMOTE_REMOVE_ARMED_MS = 6000;
+const REMOTE_STRANDED_TITLE_MAX = 120;
 const REMOTE_CODE_CANCELLED = 'That code was cancelled. Get a new one.';
 const REMOTE_CODE_EXPIRED = 'That code expired. Get a new one.';
 const REMOTE_CODE_HINT = 'Enter this code on your laptop. It works once and expires in 10 minutes.';
@@ -6777,6 +6778,7 @@ async function submitPin() {
   const said = asked === 'set' ? { ok: !!answer.ok, message: answer.error || '', waitMs: 0, wiped: false } : RemoteRules.pinAnswer(answer);
   // The status saying the keys are gone comes first, and has already closed this screen.
   if (said.wiped) {
+    discardHeldByLock();
     remoteUi.pinNotice = said.message;
     paintPinScreen();
     return;
@@ -6811,6 +6813,58 @@ async function removeHomesInstead() {
   const failed = results.find(r => !r.ok);
   $('#remote-pin-error').textContent = failed ? (failed.error || "Couldn't remove it. Try again.") : '';
   remoteStatusRefresh();
+}
+
+// ---- Words whose chat has gone ----
+
+// One bar, however they came to be here, showing the newest. It stays until someone decides, which
+// is why it isn't a toast. While locked none of it is in the page.
+function paintStrandedBar() {
+  const bar = $('#remote-stranded');
+  if (!bar) return;
+  const held = remoteChatsHidden() ? [] : [...mirror.heldForGone.values()];
+  bar.hidden = !held.length;
+  bar.replaceChildren();
+  if (!held.length) return;
+  const words = remoteEl('div', 'remote-stranded-words');
+  const title = Array.from(held.at(-1).title);
+  const shortTitle = title.length > REMOTE_STRANDED_TITLE_MAX ? `${title.slice(0, REMOTE_STRANDED_TITLE_MAX).join('')}…` : held.at(-1).title;
+  words.appendChild(remoteEl('span', 'remote-stranded-text', `Your message to ${shortTitle} wasn't sent.`));
+  if (held.length > 1) words.appendChild(remoteEl('span', 'remote-stranded-more', `and ${held.length - 1} more`));
+  const put = remoteEl('button', '', 'Put in the message box');
+  put.id = 'remote-stranded-put';
+  put.type = 'button';
+  put.addEventListener('click', putStrandedInBox);
+  const discard = remoteEl('button', '', 'Discard');
+  discard.id = 'remote-stranded-discard';
+  discard.type = 'button';
+  discard.addEventListener('click', discardStranded);
+  bar.append(words, put, discard);
+}
+
+function newestStrandedKey() {
+  return [...mirror.heldForGone.keys()].at(-1);
+}
+
+// Into whichever chat is open, after what's there. Nothing is sent: that's for the person to do.
+function putStrandedInBox() {
+  const key = newestStrandedKey();
+  const held = mirror.heldForGone.get(key);
+  if (!held) return;
+  mirror.heldForGone.delete(key);
+  const input = $('#composer-input');
+  input.value = input.value ? `${input.value}\n${held.text}` : held.text;
+  input.dispatchEvent(new Event('input'));
+  state.pendingAttachments.push(...held.attachments);
+  renderAttachments();
+  updateSendButton();
+  input.focus();
+  paintStrandedBar();
+}
+
+function discardStranded() {
+  mirror.heldForGone.delete(newestStrandedKey());
+  paintStrandedBar();
 }
 
 // ---- Settings > Devices ----
@@ -7130,6 +7184,9 @@ const REMOTE_LATE_ANSWER_MS = 10 * 60 * 1000;
 const REMOTE_RETURNED_SEEN_MAX = 1000;
 const REMOTE_UNDELIVERED_MAX_BYTES = 32 * 1024 * 1024;
 const REMOTE_TOASTS_HELD_MAX = 20;
+const REMOTE_STRANDED_MAX = 20;
+const REMOTE_GONE_TITLES_MAX = 200;
+const REMOTE_AWAITED_MS = 30000;
 
 // ---- At home ----
 
@@ -7263,7 +7320,7 @@ function remoteSetToggle(c, name, value) {
     $('#toggle-think')?.setAttribute('aria-pressed', c.thinkingEnabled === true ? 'true' : 'false');
     $('#toggle-readonly')?.setAttribute('aria-pressed', c.readOnly ? 'true' : 'false');
     $('#toggle-nofetch')?.setAttribute('aria-pressed', c.noFetch ? 'true' : 'false');
-    $('#tools-menu-btn')?.classList.toggle('has-active', !!(c.webEnabled || c.thinkingEnabled));
+    paintToolsMenuActive(c);
   }
   return { ok: true };
 }
@@ -7520,6 +7577,7 @@ function takeBackReturned(key, text, attachments) {
   }
   if (mirror.heldForGone.get(key)?.text === text) {
     mirror.heldForGone.delete(key);
+    paintStrandedBar();
     return;
   }
   const input = $('#composer-input');
@@ -7533,11 +7591,11 @@ function takeBackReturned(key, text, attachments) {
 
 // What didn't get sent goes back where it was typed. If that chat isn't on screen it waits there
 // for when it is, because in this box it would go to whichever chat is open. If that chat has
-// gone, this box is the only place left.
+// gone, it waits for someone to decide, on the bar.
 function returnToBox(key, text, attachments = []) {
   const c = state.chats[key];
   if (!c) {
-    backInBoxFromGoneChat(text, attachments);
+    strandWords(key, { text, attachments });
   } else if (currentChat() === c) {
     putInBox(text, attachments);
   } else {
@@ -7545,11 +7603,35 @@ function returnToBox(key, text, attachments = []) {
   }
 }
 
-// Those words were meant for a home PC, so while that's locked away they wait as well.
-function backInBoxFromGoneChat(text, attachments = []) {
-  if (mirror.hidden) { mirror.heldForUnlock.push({ text, attachments }); return; }
-  putInBox(text, attachments);
-  showRemoteGone();
+// Words whose chat has gone are never lost, and never land ready to send in another chat by
+// themselves. They're held here in memory, and the bar lets someone decide. If the chat comes back
+// first, they go back to it. Newest last, so a full list loses its oldest.
+function strandWords(key, words, title) {
+  const earlier = mirror.heldForGone.get(key);
+  mirror.heldForGone.delete(key);
+  mirror.heldForGone.set(key, {
+    text: earlier?.text ? `${earlier.text}\n\n${words.text}` : words.text,
+    attachments: [...(earlier?.attachments || []), ...words.attachments],
+    title: title || earlier?.title || mirror.goneTitles.get(key) || 'a shared chat'
+  });
+  const size = (held) => held.text.length + held.attachments.reduce((sum, a) => sum + (a.base64?.length || a.text?.length || 0), 0);
+  let total = 0;
+  for (const held of mirror.heldForGone.values()) total += size(held);
+  let dropped = false;
+  for (const [oldest, held] of mirror.heldForGone) {
+    if (oldest === key || (mirror.heldForGone.size <= REMOTE_STRANDED_MAX && total <= REMOTE_UNDELIVERED_MAX_BYTES)) break;
+    total -= size(held);
+    mirror.heldForGone.delete(oldest);
+    dropped = true;
+  }
+  if (dropped) remoteToast('An older unsent message was dropped to make room.');
+  paintStrandedBar();
+}
+
+function rememberGoneTitle(key, title) {
+  mirror.goneTitles.delete(key);
+  mirror.goneTitles.set(key, title || 'New chat');
+  if (mirror.goneTitles.size > REMOTE_GONE_TITLES_MAX) mirror.goneTitles.delete(mirror.goneTitles.keys().next().value);
 }
 
 function holdReturned(c, text, attachments = []) {
@@ -7586,8 +7668,9 @@ function applyQueuedReturned(deviceId, frame) {
   if (mirror.returnedSeen.has(frame.id)) return;
   mirror.returnedSeen.add(frame.id);
   if (mirror.returnedSeen.size > REMOTE_RETURNED_SEEN_MAX) mirror.returnedSeen.delete(mirror.returnedSeen.values().next().value);
-  returnToBox(remoteChatKey(deviceId, frame.chatId), frame.text);
-  remoteToast(frame.hadAttachments === true
+  const key = remoteChatKey(deviceId, frame.chatId);
+  returnToBox(key, frame.text);
+  if (state.chats[key]) remoteToast(frame.hadAttachments === true
     ? "A queued message wasn't sent. Its words are back in the message box, but its files need attaching again."
     : "A queued message wasn't sent. It's back in the message box.");
 }
@@ -7600,14 +7683,10 @@ function remoteToast(text) {
   if (mirror.toastsForUnlock.length > REMOTE_TOASTS_HELD_MAX) mirror.toastsForUnlock.shift();
 }
 
-function showRemoteGone(keptForIt = false) {
+function showRemoteGone() {
   const notice = $('#remote-gone');
   if (!notice) return;
-  notice.querySelector('span').textContent = keptForIt
-    ? "This chat is no longer shared. What you typed comes back if it's shared again."
-    : $('#composer-input').value.trim()
-      ? 'This chat is no longer shared. What you typed is still in the message box.'
-      : 'This chat is no longer shared.';
+  notice.querySelector('span').textContent = 'This chat is no longer shared.';
   notice.hidden = false;
 }
 
@@ -7637,17 +7716,34 @@ function paintRemoteChatButton() {
 }
 
 async function newRemoteChat(deviceId) {
+  const clickedOn = state.activeId;
+  const clickedAt = Date.now();
   const answer = await actionToHome(deviceId, undefined, 'new-chat', { modality: 'chat' });
   if (!answer.ok) { remoteToast(answer.error); return; }
   if (typeof answer.chatId !== 'string') return;
-  mirror.openOnArrival = remoteChatKey(deviceId, answer.chatId);
-  openIfAwaited(mirror.openOnArrival);
+  armAwaitedChat(remoteChatKey(deviceId, answer.chatId), clickedOn, clickedAt);
 }
 
-// A home PC decides when the chat arrives, so that can be long after the click. Unlocking looks again.
+function armAwaitedChat(key, clickedOn, clickedAt) {
+  mirror.awaited = { key, clickedOn, until: clickedAt + REMOTE_AWAITED_MS };
+  openIfAwaited(key);
+}
+
+function boxIsFree() {
+  return !$('#composer-input').value.trim() && !state.pendingAttachments.length;
+}
+
+// A home PC decides when the chat arrives, so that can be long after the click, and it may choose
+// the moment to pull someone's typing into it. It only opens if nothing here has changed since the
+// click. Otherwise it's in the sidebar, and a toast says so. Unlocking looks again.
 function openIfAwaited(key) {
-  if (remoteChatsHidden() || mirror.openOnArrival !== key || !state.chats[key]) return;
-  mirror.openOnArrival = null;
+  const awaited = mirror.awaited;
+  if (remoteChatsHidden() || awaited?.key !== key || !state.chats[key]) return;
+  mirror.awaited = null;
+  if (Date.now() > awaited.until || state.activeId !== awaited.clickedOn || !boxIsFree()) {
+    remoteToast(`${state.chats[key].title || 'New chat'} is ready in the sidebar.`);
+    return;
+  }
   state.space = chatSpace(state.chats[key]);
   applySpaceChrome();
   setActive(key);
@@ -7723,15 +7819,14 @@ const mirror = {
   hidden: false,             // locked, so remote chats are off the screen
   resumeId: null,            // the remote chat that was open when that happened
   leftFor: null,             // the chat that took its place
-  heldForUnlock: [],         // words handed back for a chat already gone, during a lock
-  heldForGone: new Map(),    // chat key -> words typed for a chat that went away, for if it comes back
-  goneNoticeAtUnlock: false, // that happened during a lock, so nobody has been told yet
+  heldForGone: new Map(),    // chat key -> { text, attachments, title }, words whose chat has gone. Never saved.
+  goneTitles: new Map(),     // chat key -> its last title, for words that come back after it has gone
   toastsForUnlock: [],
   // Acting.
   actions: new Map(),        // id -> { deviceId, resolve, timer }, waiting for an answer
   lateActions: new Map(),    // id -> { deviceId, onLateOk, timer }, timed out but may still be answered
   returnedSeen: new Set(),   // ids of queued-returned frames already put back in the box
-  openOnArrival: null,       // a chat made here, to open when it gets here
+  awaited: null,             // { key, clickedOn, until }, a chat made here, to open when it gets here
   folderTurns: new Map()     // chatId -> the latest set-folder to arrive, so a slow check can't undo a later one
 };
 
@@ -8333,10 +8428,6 @@ function homeDeviceStatus(device, firstStatus) {
 
 function forgetHome(deviceId) {
   for (const c of remoteChatsOf(deviceId)) dropRemoteChat(c.id);
-  // That home PC isn't coming back, so nor are its chats.
-  for (const key of mirror.heldForGone.keys()) {
-    if (key.startsWith(remoteChatKey(deviceId, ''))) mirror.heldForGone.delete(key);
-  }
   clearTimeout(mirror.homes.get(deviceId)?.snapshotTimer);
   mirror.homes.delete(deviceId);
   paintRemoteOffline();
@@ -8348,8 +8439,9 @@ function addRemoteChat(deviceId, chatId) {
   const c = { id, messages: [], remote: { deviceId, chatId } };
   const held = mirror.heldForGone.get(id);
   if (held) {
-    c._returned = held;
+    c._returned = { text: held.text, attachments: held.attachments };
     mirror.heldForGone.delete(id);
+    paintStrandedBar();
   }
   state.chats[id] = c;
   state.order.push(id);
@@ -8450,7 +8542,7 @@ function applyMirrorSnapshot(deviceId, home, frame) {
   paintRemoteClocks();
   paintRemoteChatButton();
   if (currentChat()?.remote?.deviceId === deviceId) populateModelPicker();
-  if (mirror.openOnArrival) openIfAwaited(mirror.openOnArrival);
+  if (mirror.awaited) openIfAwaited(mirror.awaited.key);
 }
 
 function applyMirrorRun(key, running) {
@@ -8470,32 +8562,17 @@ function dropRemoteChat(key) {
   state.order = state.order.filter(id => id !== key);
   state.runningChats.delete(key);
   const wasOpen = state.activeId === key;
+  rememberGoneTitle(key, c.title);
   // What was being typed was meant for this chat, and in the box it would go to whichever chat
-  // is open next. It waits for this one.
+  // is open next.
   if (wasOpen) takeDraftOutOfBox(c);
-  const kept = !!c._returned;
-  if (kept) holdForGoneChat(key, c._returned);
+  if (c._returned) strandWords(key, c._returned, c.title || 'New chat');
   if (wasOpen) {
     leaveRemoteChat();
     updateSendButton();
-    showRemoteGone(kept);
+    showRemoteGone();
   } else {
     renderChatList();
-    if (kept && mirror.hidden) mirror.goneNoticeAtUnlock = true;
-    else if (kept) showRemoteGone(true);
-  }
-}
-
-function holdForGoneChat(key, held) {
-  mirror.heldForGone.delete(key);
-  mirror.heldForGone.set(key, held);
-  const size = (h) => h.text.length + h.attachments.reduce((sum, a) => sum + (a.base64?.length || a.text?.length || 0), 0);
-  let total = 0;
-  for (const h of mirror.heldForGone.values()) total += size(h);
-  for (const [oldest, h] of mirror.heldForGone) {
-    if (total <= REMOTE_UNDELIVERED_MAX_BYTES || oldest === key) break;
-    total -= size(h);
-    mirror.heldForGone.delete(oldest);
   }
 }
 
@@ -8538,24 +8615,29 @@ function reflectRemoteLock() {
       renderChatList();
     }
   } else {
+    // A lock also lifts when ten wrong PINs delete the keys and a new code follows, or when the
+    // home PC behind an owed PIN is removed. Neither proves anything, so what it held is discarded.
+    if (state.remoteStatus?.hasPin !== true) discardHeldByLock();
     const resume = mirror.resumeId;
     mirror.resumeId = null;
     // Someone who has gone on with something else here isn't pulled away from it. What they were
     // typing waits in its chat for when they go back.
-    const boxIsFree = () => !$('#composer-input').value.trim() && !state.pendingAttachments.length;
     if (resume && state.chats[resume] && state.activeId === mirror.leftFor && boxIsFree()) setActive(resume);
     else renderChatList();
-    // Asked for before the lock, and arrived during it. Someone typing here isn't pulled away
-    // from that either: it's in the sidebar for them.
-    if (mirror.openOnArrival && state.chats[mirror.openOnArrival]) {
-      if (boxIsFree()) openIfAwaited(mirror.openOnArrival);
-      else mirror.openOnArrival = null;
-    }
-    for (const { text, attachments } of mirror.heldForUnlock.splice(0)) backInBoxFromGoneChat(text, attachments);
-    if (mirror.goneNoticeAtUnlock) showRemoteGone(true);
-    mirror.goneNoticeAtUnlock = false;
+    if (mirror.awaited) openIfAwaited(mirror.awaited.key);
     for (const text of mirror.toastsForUnlock.splice(0)) showToast(text);
   }
+  paintStrandedBar();
+}
+
+function discardHeldByLock() {
+  mirror.heldForGone.clear();
+  mirror.goneTitles.clear();
+  mirror.toastsForUnlock.length = 0;
+  mirror.awaited = null;
+  mirror.resumeId = null;
+  for (const c of Object.values(state.chats)) if (c.remote) delete c._returned;
+  paintStrandedBar();
 }
 
 // Words typed to a home PC go with its chat, and come back with it. Emptying the box is what
