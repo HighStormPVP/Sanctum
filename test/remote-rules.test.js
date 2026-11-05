@@ -746,6 +746,22 @@ test('laptopToolDefs names each tool for its device, and home tools win a collis
   assert.deepEqual(entries[0].def.function.parameters, mcpDef('x').function.parameters);
 });
 
+test('how often left-out tools are told: a count that goes to none and comes back is news again, within the limit', () => {
+  const at = (minutes) => minutes * 60 * 1000;
+  const told = new Map();
+  assert.equal(RemoteRules.tellToolsLeftOut(told, 'd1', 3, at(0)), true);
+  assert.equal(RemoteRules.tellToolsLeftOut(told, 'd1', 0, at(1)), false);
+  assert.equal(RemoteRules.tellToolsLeftOut(told, 'd1', 3, at(2)), false, 'too soon, by the same limit as any other change');
+  assert.equal(RemoteRules.tellToolsLeftOut(told, 'd1', 0, at(20)), false);
+  assert.equal(RemoteRules.tellToolsLeftOut(told, 'd1', 3, at(21)), true, 'long enough after, the same count is told again');
+
+  const flapped = new Map();
+  let tells = 0;
+  for (let i = 0; i < 300; i++) if (RemoteRules.tellToolsLeftOut(flapped, 'd1', i % 2 === 0 ? 3 : 0, at(0))) tells += 1;
+  assert.equal(tells, 1, 'going to none and back as fast as a laptop likes can\'t get around the limit');
+  assert.equal(RemoteRules.tellToolsLeftOut(new Map(), 'd1', 0, at(0)), false, 'never told and nothing to tell');
+});
+
 test('an audit line is one line of JSON, whatever a title says', () => {
   const line = auditLine({ ts: 't', event: 'ran', device: 'aaaa', chatTitle: 'x\n{"forged":true}\r\n', tool: 'read_file', args: { path: '/a' }, summary: 's', ok: true });
   assert.ok(!/[\r\n]/.test(line));
@@ -919,7 +935,10 @@ function throughCloudTools(frame) {
   const state = cleanControlState(frame);
   const gemini = toGeminiTools(state.mcpTools);
   const anthropic = toAnthropicTools(state.mcpTools);
-  for (const tool of gemini?.[0].functionDeclarations ?? []) assert.deepEqual(geminiSchemaProblems(tool.parameters), [], tool.name);
+  for (const tool of gemini?.[0].functionDeclarations ?? []) {
+    assert.equal(tool.parameters.type, 'object', `${tool.name}: a function's parameters have to be an object`);
+    assert.deepEqual(geminiSchemaProblems(tool.parameters), [], tool.name);
+  }
   for (const tool of anthropic ?? []) {
     assert.equal(tool.input_schema.type, 'object', tool.name);
     assert.match(tool.name, /^[a-zA-Z0-9_-]{1,128}$/);
@@ -976,6 +995,35 @@ test('run through the real toGeminiTools and toAnthropicTools, a schema that can
   const honest = throughCloudTools({ allowed: true, mcpTools: [mcpDef('mcp__a__any', { parameters: { type: 'object', properties: { x: {} } } }), mcpDef('mcp__a__fine')] });
   assert.deepEqual(honest.declarations.map((d) => d.name), ['mcp__a__fine'], 'one tool going leaves the others');
   assert.equal(honest.state.dropped, 1);
+});
+
+test('run through the real toGeminiTools and toAnthropicTools, flattening at the root can\'t turn parameters into anything but an object', () => {
+  const asParameters = (parameters) => ({ allowed: true, mcpTools: [mcpDef('mcp__a__b', { parameters })] });
+  const dropped = [
+    ['a root anyOf with a string', { type: 'object', anyOf: [{ type: 'string' }] }],
+    ['a root oneOf with an array', { type: 'object', oneOf: [{ type: 'array', items: { type: 'string' } }] }],
+    ['a root anyOf with only null', { type: 'object', anyOf: [{ type: 'null' }] }],
+    ['a root anyOf whose branch flattens to a string', { type: 'object', anyOf: [{ anyOf: [{ type: 'string' }] }] }]
+  ];
+  for (const [what, parameters] of dropped) {
+    const { state, declarations } = throughCloudTools(asParameters(parameters));
+    assert.deepEqual(declarations, [], what);
+    assert.equal(state.dropped, 1, what);
+  }
+
+  const kept = throughCloudTools(asParameters({ type: 'object', anyOf: [{ type: 'object', properties: { q: { type: 'string' } } }] }));
+  assert.equal(kept.state.dropped, 0);
+  assert.deepEqual(kept.declarations[0].parameters, { type: 'object', properties: { q: { type: 'string' } } }, 'an object branch still works through the flattening');
+  const afterNull = throughCloudTools(asParameters({ type: 'object', oneOf: [{ type: 'null' }, { type: 'object', properties: { q: { type: 'integer' } } }] }));
+  assert.equal(afterNull.declarations[0].parameters.properties.q.type, 'integer');
+});
+
+test('an enum keeps no empty value and no duplicate, and with none left it goes and the type stays', () => {
+  const enumOf = (values) => throughCloudTools(withProperty({ type: 'string', enum: values })).declarations[0].parameters.properties.x;
+  assert.deepEqual(enumOf(['\n', '']), { type: 'string' });
+  assert.deepEqual(enumOf(['a', '', 'b', '\n']), { type: 'string', enum: ['a', 'b'] });
+  assert.deepEqual(enumOf(['a', 'a', ' a ', 'a\n']), { type: 'string', enum: ['a'] }, 'cleaning can make two the same');
+  assert.deepEqual(enumOf([`${'x'.repeat(400)}1`, `${'x'.repeat(400)}2`]), { type: 'string', enum: ['x'.repeat(300)] }, 'so can the length limit');
 });
 
 test('run through the real toGeminiTools and toAnthropicTools: the re-review\'s hostile frame', () => {

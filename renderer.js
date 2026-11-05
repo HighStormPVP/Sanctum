@@ -7480,7 +7480,7 @@ function applyControlState(deviceId, frame) {
 function noteToolsLeftOut(deviceId, count) {
   window.api.audit.log({ ts: new Date().toISOString(), source: 'remote-tools', kind: 'mcp-tools-left-out', device: deviceId, count, ok: false }).catch(() => {});
   const name = pairedToolDevices().find((d) => d.id === deviceId)?.name || 'A laptop';
-  remoteToast(`${name} has more MCP tools than can be offered here, so ${count} ${count === 1 ? 'was' : 'were'} left out.`);
+  remoteToast(`Some MCP tools on ${name} can't be offered here.`);
 }
 
 // ---- A pop-up nobody is there to answer ----

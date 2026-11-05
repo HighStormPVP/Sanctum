@@ -421,7 +421,7 @@ test('a walk past its time gives what it has and says so, and past its limit giv
 
 // ---- Ending a process, I3 and I4 ----
 
-const { killTree, startInOwnGroup, runShellCommand } = lib('kill-tree.js');
+const { killTree, startInOwnGroup, runShellCommand, KILL_SETTLES_WITHIN_MS } = lib('kill-tree.js');
 const { spawn: realSpawn } = require('node:child_process');
 
 const pidAlive = (pid) => {
@@ -494,6 +494,32 @@ test('a kill settles whatever happens, and nothing to kill is nothing to wait fo
   await promise;
   assert.equal(fellBack, true);
   await killTree({ pid: 7, kill: () => {} }, { platform: 'win32', spawnImpl: () => { throw new Error('cannot spawn'); } });
+});
+
+test('a kill settles even if taskkill never exits, after 5 s by default', async () => {
+  const { EventEmitter } = require('node:events');
+  assert.equal(KILL_SETTLES_WITHIN_MS, 5000);
+  const started = Date.now();
+  await killTree({ pid: 7 }, { platform: 'win32', spawnImpl: () => new EventEmitter(), settlesWithinMs: 100 });
+  assert.ok(Date.now() - started < 1000, `took ${Date.now() - started} ms`);
+
+  // And that default is what's used. This waits out the real limit.
+  const byDefault = Date.now();
+  await killTree({ pid: 7 }, { platform: 'win32', spawnImpl: () => new EventEmitter() });
+  const took = Date.now() - byDefault;
+  assert.ok(took >= 4900 && took < 6000, `took ${took} ms`);
+});
+
+test('a kill that finishes leaves no timer behind', async () => {
+  const { EventEmitter } = require('node:events');
+  const timers = () => process.getActiveResourcesInfo().filter((kind) => kind === 'Timeout').length;
+  const before = timers();
+  const killer = new EventEmitter();
+  const promise = killTree({ pid: 7 }, { platform: 'win32', spawnImpl: () => killer, settlesWithinMs: 60000 });
+  assert.equal(timers(), before + 1, 'the limit is running');
+  killer.emit('exit', 0);
+  await promise;
+  assert.equal(timers(), before, 'and it stops when the kill is done');
 });
 
 test('a real process tree: a kill ends the children too', { skip: process.platform === 'win32' ? 'POSIX only, for Task 15 to run on a Mac' : false }, async (t) => {

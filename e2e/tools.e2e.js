@@ -1025,7 +1025,7 @@ test('tools on a laptop', async (t) => {
     await stopped(id);
 
     // A person at home gets told, and the log has how many.
-    await waitFor('the note', async () => (await home.page.evaluate(() => [...document.querySelectorAll('#toast-host .toast')].map((el) => el.textContent).join(' '))).includes('left out'), 5000);
+    await waitFor('the note', async () => (await home.page.evaluate(() => [...document.querySelectorAll('#toast-host .toast')].map((el) => el.textContent).join(' '))).includes(`Some MCP tools on ${LAPTOP} can't be offered here.`), 5000);
     const logged = readAudit(home, 'agent-audit.log').filter((e) => e.kind === 'mcp-tools-left-out').at(-1);
     assert.equal(logged.device, laptopId);
     assert.ok(logged.count > 0);
@@ -1253,7 +1253,7 @@ test('tools on a laptop', async (t) => {
     await sleep(300);
     const lines = readAudit(home, 'agent-audit.log').filter((e) => e.kind === 'mcp-tools-left-out').length - before;
     assert.equal(lines, 1, `${lines} audit lines from 300 frames`);
-    const toasts = await home.page.evaluate(() => [...document.querySelectorAll('#toast-host .toast')].filter((el) => el.textContent.includes('left out')).length);
+    const toasts = await home.page.evaluate(() => [...document.querySelectorAll('#toast-host .toast')].filter((el) => el.textContent.includes("can't be offered")).length);
     assert.equal(toasts, 1);
     await laptop.page.evaluate(() => sendControlStateToHomes());
     await waitFor('the honest list back', () => home.page.evaluate((d) => remoteTools.control.get(d)?.dropped === 0, laptopId), 5000);
