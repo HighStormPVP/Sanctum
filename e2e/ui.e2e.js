@@ -1061,7 +1061,7 @@ test('two devices, through the interface', async (t) => {
     assert.equal((await barSays(laptop)).text, "Your message to Chat 21 wasn't sent.");
     assert.equal((await barSays(laptop)).more, 'and 19 more');
     assert.ok(await laptop.page.evaluate(() => !mirror.heldForGone.has('remote:x:0') && !mirror.heldForGone.has('remote:x:1')));
-    await waitFor('the toast', () => laptop.page.evaluate(() => [...document.querySelectorAll('.toast')].some((x) => /older unsent message/.test(x.textContent))), 2000);
+    await waitFor('the toast', () => laptop.page.evaluate(() => [...document.querySelectorAll('.toast')].some((x) => /no room/.test(x.textContent))), 2000);
     await laptop.page.evaluate(() => {
       mirror.heldForGone.clear();
       strandWords('remote:x:big1', { text: 'x'.repeat(20 * 1024 * 1024), attachments: [] }, 'One');
@@ -1213,6 +1213,112 @@ test('two devices, through the interface', async (t) => {
     await toastNamed('Awaited, too late');
     await leave(late);
     await laptop.page.evaluate((id) => setActive(id), here);
+  });
+
+  await t.test('a home PC can only send back so many words, and what was already held stays', async () => {
+    const MIB = 1024 * 1024;
+    const CAP = 32 * MIB;
+    let sent = 0;
+    // Built at home, and sent as a real frame with an id of its own each time.
+    const sendBack = async (chatId, letter, size, extra = {}) => {
+      const id = `cap_${sent++}`;
+      assert.equal(await home.page.evaluate(([to, frame, ch, n]) => window.api.remote.send(to, { ...frame, text: ch.repeat(n) }), [laptopId, { type: 'queued-returned', id, chatId, ...extra }, letter, size]), true);
+      await waitFor(`${id} to land`, () => laptop.page.evaluate((i) => mirror.returnedSeen.has(i), id), 20000);
+    };
+    await laptop.page.evaluate(() => {
+      window.__raised = [];
+      window.__realShowToast = window.showToast;
+      window.showToast = (text, tone) => { window.__raised.push(text); window.__realShowToast(text, tone); };
+    });
+    const noRoomToasts = () => laptop.page.evaluate(() => window.__raised.filter((x) => /no room/.test(x)).length);
+    const clearToasts = () => laptop.page.evaluate(() => { window.__raised = []; });
+    const heldFor = (key) => laptop.page.evaluate((k) => {
+      const held = mirror.heldForGone.get(k);
+      return held ? { length: held.text.length, first: held.text[0], letters: [...new Set(held.text.replace(/\n/g, ''))].join('') } : null;
+    }, key);
+    const goneKey = (name) => `remote:${homeId}:${name}`;
+    await localChat();
+    await clearToasts();
+
+    // A chat that has gone: one key, unique ids, 10 MiB at a time.
+    for (const letter of 'abcde') await sendBack('capped-gone', letter, 10 * MIB);
+    const one = await heldFor(goneKey('capped-gone'));
+    assert.ok(one.length <= CAP, `held ${one.length}`);
+    assert.equal(one.letters, 'abc', 'the first ones are kept, and the rest refused');
+    assert.equal(one.first, 'a');
+    assert.equal(await noRoomToasts(), 1, 'one toast for all of it');
+    await click(laptop, '#remote-stranded-discard');
+    await clearToasts();
+
+    // That cap is the device's: a second gone chat can't take it past.
+    await sendBack('capped-one', 'f', 17 * MIB);
+    await sendBack('capped-two', 'g', 17 * MIB);
+    assert.equal(await heldFor(goneKey('capped-two')), null);
+    assert.equal((await heldFor(goneKey('capped-one'))).length, 17 * MIB);
+    await click(laptop, '#remote-stranded-discard');
+    await clearToasts();
+
+    // A shared chat that's there, not open. Nothing bigger goes on when it leaves.
+    const made = await newChat(home, { modality: 'chat', title: 'Capped but here', titleManual: true, webEnabled: false, remoteControl: true });
+    await home.page.evaluate(() => markMirrorDirty());
+    await openChat(home, sharedId);
+    const key = goneKey(made);
+    await waitFor('it to arrive', () => hasChat(laptop, key), 5000);
+    for (const letter of 'hij') await sendBack(made, letter, 15 * MIB);
+    const waiting = await laptop.page.evaluate((k) => {
+      const held = state.chats[k]._returned;
+      return { length: held.text.length, letters: [...new Set(held.text.replace(/\n/g, ''))].join('') };
+    }, key);
+    assert.ok(waiting.length <= CAP, `held ${waiting.length}`);
+    assert.equal(waiting.letters, 'hi');
+    assert.equal(await noRoomToasts(), 1);
+    await shareAt(made, false);
+    await waitFor('it to leave', async () => !(await hasChat(laptop, key)), 5000);
+    const left = await heldFor(key);
+    assert.ok(left.length <= CAP, `held ${left.length}`);
+    assert.equal(left.letters, 'hi');
+    await click(laptop, '#remote-stranded-discard');
+    await clearToasts();
+
+    // Into the box of the chat that's open.
+    await openChat(laptop, rid());
+    await sendBack(sharedId, 'k', 17 * MIB);
+    await sendBack(sharedId, 'm', 17 * MIB);
+    assert.equal(await boxOn().then((v) => v.length), 17 * MIB);
+    assert.equal(await noRoomToasts(), 1);
+    await laptop.page.fill('#composer-input', '');
+    await localChat();
+    await clearToasts();
+
+    // During an idle lock, with the toast waiting, once, for after the PIN.
+    await laptop.remote('lock');
+    await appeared(laptop, '#remote-pin-overlay');
+    for (const letter of 'npq') await sendBack('capped-locked', letter, 15 * MIB);
+    const locked = await heldFor(goneKey('capped-locked'));
+    assert.ok(locked.length <= CAP, `held ${locked.length}`);
+    assert.equal(locked.letters, 'np');
+    assert.equal(await laptop.page.evaluate(() => mirror.toastsForUnlock.filter((x) => /no room/.test(x)).length), 1);
+    await fill(laptop, '#remote-pin-input', PIN);
+    await click(laptop, '#remote-pin-submit');
+    await gone(laptop, '#remote-pin-overlay', 15000);
+    await click(laptop, '#remote-stranded-discard');
+    await clearToasts();
+
+    // With room again, the next one is taken.
+    await sendBack('capped-after', 'r', 1024);
+    assert.equal((await heldFor(goneKey('capped-after'))).length, 1024);
+    assert.equal(await noRoomToasts(), 0);
+    await click(laptop, '#remote-stranded-discard');
+
+    // Files a frame couldn't carry back are mentioned on the bar, and again on Put.
+    await sendBack('had-files', 's', 8, { hadAttachments: true });
+    const bar = await barSays(laptop);
+    assert.equal(bar.text, "Your message to a shared chat wasn't sent. Its files need attaching again.");
+    await click(laptop, '#remote-stranded-put');
+    assert.equal(await boxOn(), 'ssssssss');
+    await waitFor('the toast about files', () => laptop.page.evaluate(() => [...document.querySelectorAll('.toast')].some((x) => /files need attaching again/.test(x.textContent))), 2000);
+    await laptop.page.fill('#composer-input', '');
+    await laptop.page.evaluate(() => { window.showToast = window.__realShowToast; });
   });
 
   await t.test('what a home PC says during a lock waits behind it too', async () => {
@@ -1402,7 +1508,7 @@ test('two devices, through the interface', async (t) => {
     await waitFor('the notice', async () => (await textOf(laptop, '#remote-pin-title')) === 'Remote Control keys deleted', 15000);
     assert.equal(await isVisible(laptop, '#remote-pin-overlay'), true);
     assert.match(await textOf(laptop, '#remote-pin-lead'), /tenth wrong PIN/);
-    assert.match(await textOf(laptop, '#remote-pin-lead'), /waiting/);
+    assert.match(await textOf(laptop, '#remote-pin-lead'), /messages you hadn't sent are gone/);
     assert.equal(await isVisible(laptop, '#remote-pin-form'), false);
     const st = await status(laptop);
     assert.equal(st.hasPin, false);

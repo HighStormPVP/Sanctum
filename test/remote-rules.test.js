@@ -397,5 +397,6 @@ test('what a PIN attempt came to is said plainly', () => {
   const wiped = pinAnswer({ ok: false, wiped: true });
   assert.equal(wiped.wiped, true);
   assert.match(wiped.message, /deleted/);
+  assert.match(wiped.message, /messages you hadn't sent are gone/);
   assert.match(wiped.message, /new code/);
 });

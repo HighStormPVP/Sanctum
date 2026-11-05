@@ -6829,7 +6829,8 @@ function paintStrandedBar() {
   const words = remoteEl('div', 'remote-stranded-words');
   const title = Array.from(held.at(-1).title);
   const shortTitle = title.length > REMOTE_STRANDED_TITLE_MAX ? `${title.slice(0, REMOTE_STRANDED_TITLE_MAX).join('')}…` : held.at(-1).title;
-  words.appendChild(remoteEl('span', 'remote-stranded-text', `Your message to ${shortTitle} wasn't sent.`));
+  const files = held.at(-1).filesStayed ? ` ${REMOTE_FILES_STAYED}` : '';
+  words.appendChild(remoteEl('span', 'remote-stranded-text', `Your message to ${shortTitle} wasn't sent.${files}`));
   if (held.length > 1) words.appendChild(remoteEl('span', 'remote-stranded-more', `and ${held.length - 1} more`));
   const put = remoteEl('button', '', 'Put in the message box');
   put.id = 'remote-stranded-put';
@@ -6860,6 +6861,7 @@ function putStrandedInBox() {
   updateSendButton();
   input.focus();
   paintStrandedBar();
+  if (held.filesStayed) showToast(REMOTE_FILES_STAYED);
 }
 
 function discardStranded() {
@@ -7185,6 +7187,8 @@ const REMOTE_RETURNED_SEEN_MAX = 1000;
 const REMOTE_UNDELIVERED_MAX_BYTES = 32 * 1024 * 1024;
 const REMOTE_TOASTS_HELD_MAX = 20;
 const REMOTE_STRANDED_MAX = 20;
+const REMOTE_NO_ROOM = 'An unsent message was dropped because there was no room to hold it.';
+const REMOTE_FILES_STAYED = 'Its files need attaching again.';
 const REMOTE_GONE_TITLES_MAX = 200;
 const REMOTE_AWAITED_MS = 30000;
 
@@ -7608,13 +7612,19 @@ function returnToBox(key, text, attachments = []) {
 // first, they go back to it. Newest last, so a full list loses its oldest.
 function strandWords(key, words, title) {
   const earlier = mirror.heldForGone.get(key);
+  // One entry is never trimmed to fit: older words stay whole, and new ones don't go on.
+  if (earlier && heldWordsSize(earlier) + heldWordsSize(words) > REMOTE_UNDELIVERED_MAX_BYTES) {
+    sayNoRoomOnce();
+    return;
+  }
   mirror.heldForGone.delete(key);
   mirror.heldForGone.set(key, {
     text: earlier?.text ? `${earlier.text}\n\n${words.text}` : words.text,
     attachments: [...(earlier?.attachments || []), ...words.attachments],
-    title: title || earlier?.title || mirror.goneTitles.get(key) || 'a shared chat'
+    title: title || earlier?.title || mirror.goneTitles.get(key) || 'a shared chat',
+    filesStayed: !!(earlier?.filesStayed || words.filesStayed)
   });
-  const size = (held) => held.text.length + held.attachments.reduce((sum, a) => sum + (a.base64?.length || a.text?.length || 0), 0);
+  const size = heldWordsSize;
   let total = 0;
   for (const held of mirror.heldForGone.values()) total += size(held);
   let dropped = false;
@@ -7624,8 +7634,34 @@ function strandWords(key, words, title) {
     mirror.heldForGone.delete(oldest);
     dropped = true;
   }
-  if (dropped) remoteToast('An older unsent message was dropped to make room.');
+  if (dropped) remoteToast(REMOTE_NO_ROOM);
   paintStrandedBar();
+}
+
+function heldWordsSize(held) {
+  return held.text.length + (held.attachments || []).reduce((sum, a) => sum + (a.base64?.length || a.text?.length || 0), 0);
+}
+
+// Toasts once until there's room again, or a home PC could keep the message up by trying.
+function sayNoRoomOnce() {
+  if (mirror.noRoomSaid) return;
+  mirror.noRoomSaid = true;
+  remoteToast(REMOTE_NO_ROOM);
+}
+
+// A paired home PC can send words back with a new id as often as it likes, and they all stay in
+// this device's memory until someone decides about them. So what it can have waiting here is
+// limited, across every chat of its own, and what's already held is never given up for more.
+function roomForHandedBack(deviceId, key, text) {
+  let total = text.length;
+  for (const [held, words] of mirror.heldForGone) {
+    if (held.startsWith(remoteChatKey(deviceId, ''))) total += heldWordsSize(words);
+  }
+  for (const c of remoteChatsOf(deviceId)) {
+    if (c._returned) total += heldWordsSize(c._returned);
+  }
+  if (currentChat()?.id === key) total += $('#composer-input').value.length;
+  return total <= REMOTE_UNDELIVERED_MAX_BYTES;
 }
 
 function rememberGoneTitle(key, title) {
@@ -7637,7 +7673,8 @@ function rememberGoneTitle(key, title) {
 function holdReturned(c, text, attachments = []) {
   c._returned = {
     text: c._returned?.text ? `${c._returned.text}\n\n${text}` : text,
-    attachments: [...(c._returned?.attachments || []), ...attachments]
+    attachments: [...(c._returned?.attachments || []), ...attachments],
+    filesStayed: c._returned?.filesStayed
   };
 }
 
@@ -7655,9 +7692,10 @@ function putInBox(text, attachments = []) {
 // this runs again whenever the box empties.
 function takeReturnedDraft(c) {
   if (!c?._returned || currentChat() !== c || $('#composer-input').value.trim()) return;
-  const { text, attachments } = c._returned;
+  const { text, attachments, filesStayed } = c._returned;
   delete c._returned;
   putInBox(text, attachments);
+  if (filesStayed) remoteToast(REMOTE_FILES_STAYED);
 }
 
 function applyQueuedReturned(deviceId, frame) {
@@ -7669,7 +7707,18 @@ function applyQueuedReturned(deviceId, frame) {
   mirror.returnedSeen.add(frame.id);
   if (mirror.returnedSeen.size > REMOTE_RETURNED_SEEN_MAX) mirror.returnedSeen.delete(mirror.returnedSeen.values().next().value);
   const key = remoteChatKey(deviceId, frame.chatId);
+  // Acknowledged above either way, because sending it again wouldn't make room.
+  if (!roomForHandedBack(deviceId, key, frame.text)) {
+    sayNoRoomOnce();
+    return;
+  }
+  mirror.noRoomSaid = false;
   returnToBox(key, frame.text);
+  const stranded = mirror.heldForGone.get(key);
+  if (stranded && frame.hadAttachments === true) {
+    stranded.filesStayed = true;
+    paintStrandedBar();
+  }
   if (state.chats[key]) remoteToast(frame.hadAttachments === true
     ? "A queued message wasn't sent. Its words are back in the message box, but its files need attaching again."
     : "A queued message wasn't sent. It's back in the message box.");
@@ -7822,6 +7871,7 @@ const mirror = {
   heldForGone: new Map(),    // chat key -> { text, attachments, title }, words whose chat has gone. Never saved.
   goneTitles: new Map(),     // chat key -> its last title, for words that come back after it has gone
   toastsForUnlock: [],
+  noRoomSaid: false,         // the no-room toast is up, or waiting, for what's being refused now
   // Acting.
   actions: new Map(),        // id -> { deviceId, resolve, timer }, waiting for an answer
   lateActions: new Map(),    // id -> { deviceId, onLateOk, timer }, timed out but may still be answered
@@ -8439,7 +8489,7 @@ function addRemoteChat(deviceId, chatId) {
   const c = { id, messages: [], remote: { deviceId, chatId } };
   const held = mirror.heldForGone.get(id);
   if (held) {
-    c._returned = { text: held.text, attachments: held.attachments };
+    c._returned = { text: held.text, attachments: held.attachments, filesStayed: held.filesStayed };
     mirror.heldForGone.delete(id);
     paintStrandedBar();
   }
@@ -8634,6 +8684,7 @@ function discardHeldByLock() {
   mirror.heldForGone.clear();
   mirror.goneTitles.clear();
   mirror.toastsForUnlock.length = 0;
+  mirror.noRoomSaid = false;
   mirror.awaited = null;
   mirror.resumeId = null;
   for (const c of Object.values(state.chats)) if (c.remote) delete c._returned;
