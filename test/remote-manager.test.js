@@ -3988,3 +3988,38 @@ test('status names this device, so a home PC can tell its laptops what it is cal
   device.start();
   assert.equal(device.manager.status().name, 'Study PC');
 });
+
+// ---- This device's fingerprint ----
+
+test('status gives this device its own fingerprint, the same one the other end shows for it', async (t) => {
+  const world = newWorld(t);
+  const home = await world.device('Home');
+  const laptop = await world.device('Laptop');
+  home.start();
+  laptop.start();
+
+  const created = await home.manager.createCode();
+  world.relay.pump();
+  const pairing = laptop.manager.pair(created.code, 'Laptop');
+  world.relay.pump();
+  assert.equal((await pairing).ok, true);
+  world.relay.pump();
+
+  assert.equal(laptop.manager.status().fingerprint, home.entry(laptop.id).fingerprint);
+  assert.equal(home.manager.status().fingerprint, laptop.entry(home.id).fingerprint);
+  assert.equal(laptop.manager.status().fingerprint, fingerprintOf(laptop.id));
+
+  // An idle lock leaves the connection up, so this device is still the one it was.
+  laptop.manager.lock();
+  assert.equal(laptop.manager.status().idleLocked, true);
+  assert.equal(laptop.manager.status().fingerprint, fingerprintOf(laptop.id));
+});
+
+test('nothing gives a fingerprint while the keys are sealed', async (t) => {
+  const world = newWorld(t);
+  const device = await world.device('Device');
+  device.keystore.lock();
+  device.start();
+  assert.equal(device.manager.status().locked, true);
+  assert.strictEqual(device.manager.status().fingerprint, null);
+});

@@ -102,6 +102,7 @@ const state = {
   wireAgentOpts();
   wireInstallBanner();
   renderChatList();
+  wireRemoteUi();
   wireChatMirror();
 })();
 
@@ -378,7 +379,8 @@ function deleteChat(id) {
     // Activate the next chat in this workspace. If that was the LAST one,
     // don't leave an empty view — refresh with a fresh chat of the same kind
     // (a normal chat in Home, a project in Code).
-    const next = chatsInCurrentSpace()[0];
+    // Remote chats list first, and can't be what deleting a chat of this machine's lands on.
+    const next = chatsInCurrentSpace().find(other => !other.remote);
     if (next) setActive(next.id);
     else if (state.space === 'code') createAgenticChat();
     else createChat();
@@ -1935,7 +1937,7 @@ function switchSpace(space) {
   const inSpace = chatsInCurrentSpace();
   const active = currentChat();
   if (!active || chatSpace(active) !== space) {
-    state.activeId = inSpace[0]?.id || null;
+    state.activeId = inSpace.find(c => !c.remote)?.id || null;
   }
   // Carry your model across the switch. If the now-active chat is a fresh one
   // (no messages yet), adopt the model you were just using — switching
@@ -1977,32 +1979,37 @@ function renderChatList() {
   const list = $('#chat-list');
   if (!list) return;
   list.innerHTML = '';
-  const groups = groupChatsByDate(chatsInCurrentSpace());
+  renderRemoteGroups(list);
+  const groups = groupChatsByDate(chatsInCurrentSpace().filter(c => !c.remote));
   for (const [label, chats] of groups) {
     const header = document.createElement('div');
     header.className = 'list-header';
     header.textContent = label;
     list.appendChild(header);
-    for (const c of chats) {
-      const item = document.createElement('button');
-      item.className = 'chat-item' + (c.id === state.activeId ? ' active' : '');
-      const modalityBadge = (c.modality && c.modality !== 'chat' && c.modality !== 'vision') ? `<span class="chat-modality">${escapeHtml(shortModality(c.modality))}</span>` : '';
-      item.innerHTML = `
-        <span class="chat-title">${escapeHtml(c.title || 'New chat')}</span>
-        ${modalityBadge}
-        <span class="chat-del" title="Delete">×</span>
-      `;
-      item.addEventListener('click', (e) => {
-        if (e.target.classList.contains('chat-del')) {
-          e.stopPropagation();
-          deleteChat(c.id);
-        } else {
-          setActive(c.id);
-        }
-      });
-      list.appendChild(item);
-    }
+    for (const c of chats) list.appendChild(renderChatItem(c));
   }
+}
+
+function renderChatItem(c) {
+  const item = document.createElement('button');
+  item.className = 'chat-item' + (c.id === state.activeId ? ' active' : '');
+  const modalityBadge = (c.modality && c.modality !== 'chat' && c.modality !== 'vision') ? `<span class="chat-modality">${escapeHtml(shortModality(c.modality))}</span>` : '';
+  const shared = c.remoteControl === true && !c.remote && remoteStatusNow().enabled === true;
+  item.innerHTML = `
+    <span class="chat-title">${escapeHtml(c.title || 'New chat')}</span>
+    ${shared ? '<span class="chat-shared-dot" title="Shared with Remote Control"></span>' : ''}
+    ${modalityBadge}
+    <span class="chat-del" title="Delete">×</span>
+  `;
+  item.addEventListener('click', (e) => {
+    if (e.target.classList.contains('chat-del')) {
+      e.stopPropagation();
+      deleteChat(c.id);
+    } else {
+      setActive(c.id);
+    }
+  });
+  return item;
 }
 
 function groupChatsByDate(chats) {
@@ -2685,6 +2692,7 @@ function wireSettingsNav() {
       if (!state.downloadCatalog) window.api.downloadCatalog().then(c => { state.downloadCatalog = c; done(); });
       done();
     }
+    if (panel === 'devices') paintRemoteDevices();
   });
 }
 
@@ -3330,6 +3338,7 @@ function renderActiveChat() {
   const c = currentChat();
   // No active chat (e.g. an empty workspace) — show that space's empty state
   // and hide the chat chrome, rather than leaving stale content on screen.
+  paintRemoteSwitch(c);
   if (!c) {
     renderThread();
     $('#agent-bar')?.setAttribute('hidden', '');
@@ -3443,7 +3452,7 @@ function renderActiveChat() {
   const menuBtn = $('#tools-menu-btn');
   if (menuBtn) {
     menuBtn.hidden = !textLike;
-    menuBtn.classList.toggle('has-active', !!(c.webEnabled || c.thinkingEnabled));
+    paintToolsMenuActive(c);
   }
 
   renderThread();
@@ -3462,7 +3471,7 @@ function wireWebToggle() {
     // it's never disabled — no support gate here.
     c.webEnabled = !c.webEnabled;
     btn.setAttribute('aria-pressed', c.webEnabled ? 'true' : 'false');
-    $('#tools-menu-btn')?.classList.toggle('has-active', !!(c.webEnabled || c.thinkingEnabled));
+    paintToolsMenuActive(c);
     saveToStorage();
   });
 }
@@ -3477,7 +3486,7 @@ function wireThinkToggle() {
     if (btn.classList.contains('disabled') || !modelSupportsThinking(c.model)) return;
     c.thinkingEnabled = !c.thinkingEnabled;
     btn.setAttribute('aria-pressed', c.thinkingEnabled ? 'true' : 'false');
-    $('#tools-menu-btn')?.classList.toggle('has-active', !!(c.webEnabled || c.thinkingEnabled));
+    paintToolsMenuActive(c);
     saveToStorage();
   });
 }
@@ -6457,6 +6466,638 @@ function patchLastMessageContent(msg) {
   if (nearBottom) list.scrollTop = list.scrollHeight;
 }
 
+// ============== REMOTE CONTROL'S INTERFACE ==============
+// Device names, chat titles, and a home PC's name all come from another machine, so they're
+// hostile until drawn: everything here goes on screen as textContent or as a property, and
+// innerHTML is never given anything that came from a status or a frame.
+const REMOTE_IDLE_TICK_MS = 5000;
+const REMOTE_REMOVE_ARMED_MS = 6000;
+const REMOTE_CODE_CANCELLED = 'That code was cancelled. Get a new one.';
+const REMOTE_CODE_EXPIRED = 'That code expired. Get a new one.';
+const REMOTE_CODE_HINT = 'Enter this code on your laptop. It works once and expires in 10 minutes.';
+
+const remoteUi = {
+  lastInputAt: 0,
+  pinDismissed: false,       // "Not now": local chats are usable, and the home PC stays locked away
+  pinNotice: null,           // something the PIN screen has to say even though it's done asking
+  pinMode: null,
+  pinWaitTimer: null,
+  code: null,                // what the code dialog is showing, or null while it's closed
+  connecting: null,          // the pairing the connect dialog is waiting on
+  pairing: false,            // one is under way, dialog or no dialog
+  resetExplained: false,
+  removing: null,            // the device whose Remove has had its first click
+  removeTimer: null,
+  listShape: '',
+  boxHadFocus: false
+};
+
+function remoteStatusNow() {
+  return state.remoteStatus || {};
+}
+
+function remoteDevices() {
+  return remoteStatusNow().devices || [];
+}
+
+function remoteHomes() {
+  return remoteDevices().filter(d => d.role === 'home');
+}
+
+// The name given at pairing, which is there offline, before anything has been mirrored.
+function remoteHomeLabel(deviceId) {
+  return remoteHomes().find(d => d.id === deviceId)?.name || 'Home PC';
+}
+
+function remoteEl(tag, className, text) {
+  const el = document.createElement(tag);
+  if (className) el.className = className;
+  if (text !== undefined) el.textContent = text;
+  return el;
+}
+
+function wireRemoteUi() {
+  remoteUi.lastInputAt = Date.now();
+  $('#toggle-remote')?.addEventListener('click', () => {
+    const c = currentChat();
+    if (c && !c.remote && remoteStatusNow().enabled === true) setChatShared(c, c.remoteControl !== true);
+  });
+  wireRemoteIdle();
+  wireRemoteDevicesPanel();
+  wireRemoteCodeDialog();
+  wireRemoteConnectDialog();
+  wireRemotePinScreen();
+  $('#remote-running-off')?.addEventListener('click', turnOffLaptopControl);
+  $('#remote-reset-ok')?.addEventListener('click', () => { $('#remote-reset-overlay').hidden = true; });
+  $('#remote-reset-devices')?.addEventListener('click', () => {
+    $('#remote-reset-overlay').hidden = true;
+    openDevicesSettings();
+  });
+}
+
+function paintRemoteUi() {
+  paintRemoteSwitch(currentChat());
+  paintPinScreen();
+  paintRemoteIndicators();
+  paintRemoteDevices();
+  noteCodeDialogStatus();
+  explainKeysReset();
+  // Most statuses change none of what's in the list.
+  const shape = JSON.stringify([remoteStatusNow().enabled === true, remoteChatsHidden(), remoteHomes().map(d => [d.id, d.name, d.connected])]);
+  if (shape !== remoteUi.listShape) {
+    remoteUi.listShape = shape;
+    renderChatList();
+  }
+}
+
+// ---- Sharing a chat ----
+
+function paintRemoteSwitch(c) {
+  const on = remoteStatusNow().enabled === true;
+  const shared = !!c && !c.remote && c.remoteControl === true;
+  const btn = $('#toggle-remote');
+  if (btn) {
+    btn.hidden = !on || !c || !!c.remote || !['chat', 'code', 'agent', 'vision'].includes(c.modality);
+    btn.setAttribute('aria-pressed', shared ? 'true' : 'false');
+  }
+  const marker = $('#chat-shared-marker');
+  if (marker) marker.hidden = !(on && shared);
+}
+
+function setChatShared(c, shared) {
+  c.remoteControl = shared;
+  saveToStorage(); // which is also what tells the mirror
+  paintRemoteSwitch(c);
+  paintToolsMenuActive(c);
+  renderChatList();
+  if (shared && !remoteDevices().some(d => d.role === 'laptop')) openCodeDialog('Connect a device');
+}
+
+function paintToolsMenuActive(c) {
+  $('#tools-menu-btn')?.classList.toggle('has-active', !!(c.webEnabled || c.thinkingEnabled || (!c.remote && c.remoteControl === true)));
+}
+
+// ---- The sidebar ----
+
+// Each home PC's chats, under its name, above everything else on this machine. While locked, none
+// of it is there at all, only the way back in.
+function renderRemoteGroups(list) {
+  if (remoteStatusNow().enabled !== true) return;
+  if (RemoteRules.pinPrompt(remoteStatusNow()) === 'enter') {
+    list.appendChild(renderRemoteLockRow());
+    return;
+  }
+  if (remoteChatsHidden()) return;
+  const all = Object.values(state.chats).filter(c => c.remote);
+  const inSpace = chatsInCurrentSpace().filter(c => c.remote);
+  for (const home of remoteHomes()) {
+    const chats = inSpace.filter(c => c.remote.deviceId === home.id);
+    const nothingShared = !all.some(c => c.remote.deviceId === home.id);
+    if (!chats.length && !(nothingShared && state.space === 'home')) continue;
+    const group = remoteEl('div', 'remote-home');
+    const head = remoteEl('div', 'remote-home-head');
+    head.appendChild(remoteEl('span', 'remote-home-name', home.name || 'Home PC'));
+    if (!home.connected) head.appendChild(remoteEl('span', 'remote-home-state', 'Offline'));
+    group.appendChild(head);
+    for (const c of chats) group.appendChild(renderChatItem(c));
+    if (!chats.length) group.appendChild(remoteEl('div', 'remote-home-empty', home.connected ? 'Nothing shared yet. Turn on Remote Control in a chat at home.' : 'Nothing here until it reconnects.'));
+    list.appendChild(group);
+  }
+}
+
+function renderRemoteLockRow() {
+  const row = remoteEl('div', 'remote-lock-row');
+  row.id = 'remote-lock-row';
+  row.appendChild(remoteEl('span', '', 'Remote Control is locked.'));
+  const btn = remoteEl('button', '', 'Enter PIN');
+  btn.type = 'button';
+  btn.addEventListener('click', askForPinAgain);
+  row.appendChild(btn);
+  return row;
+}
+
+// One row for each home PC. The stronger one, for a command running here, is setLaptopRunning.
+function paintRemoteIndicators() {
+  const box = $('#remote-indicators');
+  if (!box) return;
+  box.replaceChildren();
+  if (remoteStatusNow().enabled !== true || remoteChatsHidden()) return;
+  for (const home of remoteHomes()) {
+    const row = remoteEl('div', 'remote-indicator-row' + (home.connected ? ' up' : ''));
+    row.appendChild(remoteEl('span', 'remote-indicator-dot'));
+    const name = home.name || 'Home PC';
+    row.appendChild(remoteEl('span', 'remote-indicator', home.connected ? `Connected to ${name}` : `${name} is offline`));
+    box.appendChild(row);
+  }
+}
+
+// The strong indicator. Task 12 drives this: a home PC's name while it's running something on
+// this laptop, null when it stops. It floats above everything, the PIN screen too, because a
+// locked laptop can still take commands, and turning that off must never wait for the PIN.
+function setLaptopRunning(homeLabel) {
+  const box = $('#remote-running');
+  if (!box) return;
+  box.hidden = !homeLabel;
+  $('#remote-running-text').textContent = homeLabel ? `${homeLabel} is running a command on this laptop` : '';
+  document.querySelector('.app')?.classList.toggle('laptop-running', !!homeLabel);
+}
+
+async function turnOffLaptopControl() {
+  const answer = await window.api.remote.setControlAllowed(false).catch(() => ({ ok: false }));
+  if (!answer.ok) { showToast(answer.error || "Couldn't turn that off. Try again.", 'err'); return; }
+  setLaptopRunning(null);
+  showToast('Your home PC can no longer control this laptop.', 'ok');
+}
+
+// ---- Offline ----
+
+function paintRemoteOfflineBanner(c) {
+  const banner = $('#remote-offline');
+  if (!banner) return;
+  const offline = !!c?.remote && !remoteChatsHidden() && !mirror.homes.get(c.remote.deviceId)?.connected;
+  banner.hidden = !offline;
+  if (offline) banner.querySelector('span').textContent = `${remoteHomeLabel(c.remote.deviceId)} is offline. Reconnecting…`;
+}
+
+// ---- The idle lock ----
+
+function wireRemoteIdle() {
+  for (const type of ['keydown', 'pointerdown', 'pointermove', 'wheel']) {
+    window.addEventListener(type, noteRemoteActivity, { capture: true, passive: true });
+  }
+  setInterval(checkRemoteIdle, REMOTE_IDLE_TICK_MS);
+}
+
+// Checks first: the first touch after a laptop has slept all night finds it should have locked.
+function noteRemoteActivity() {
+  checkRemoteIdle();
+  remoteUi.lastInputAt = Date.now();
+}
+
+function checkRemoteIdle() {
+  if (!RemoteRules.shouldIdleLock(remoteStatusNow(), Date.now() - remoteUi.lastInputAt)) return;
+  remoteUi.lastInputAt = Date.now();
+  window.api.remote.lock().catch(() => {});
+}
+
+// ---- The PIN screen ----
+
+function wireRemotePinScreen() {
+  $('#remote-pin-form')?.addEventListener('submit', (e) => { e.preventDefault(); submitPin(); });
+  $('#remote-pin-later')?.addEventListener('click', () => {
+    remoteUi.pinDismissed = true;
+    paintPinScreen();
+  });
+  $('#remote-pin-ok')?.addEventListener('click', () => {
+    remoteUi.pinNotice = null;
+    paintPinScreen();
+  });
+  $('#remote-pin-remove')?.addEventListener('click', removeHomesInstead);
+}
+
+function askForPinAgain() {
+  remoteUi.pinDismissed = false;
+  paintPinScreen();
+}
+
+function paintPinScreen() {
+  const overlay = $('#remote-pin-overlay');
+  if (!overlay) return;
+  const prompt = RemoteRules.pinPrompt(remoteStatusNow());
+  if (prompt !== 'enter') remoteUi.pinDismissed = false;
+  // A pairing gets its home PC a moment before it sets the PIN it was given, and that moment
+  // isn't owing one. If setting it fails, the status after the pairing says so.
+  const settingPin = prompt === 'set' && remoteUi.pairing;
+  const mode = remoteUi.pinNotice ? 'notice' : (remoteUi.pinDismissed || settingPin ? null : prompt);
+  const changed = mode !== remoteUi.pinMode;
+  remoteUi.pinMode = mode;
+  overlay.hidden = !mode;
+  if (!mode) $('#remote-pin-remove').textContent = '';
+  // Nothing behind this can be reached by keyboard. The strong indicator can, since that has to
+  // work while locked.
+  for (const el of document.body.children) el.inert = !!mode && el !== overlay && el.id !== 'remote-running';
+  if (!changed) { if (mode === 'set') paintPinRemoveLabel(); return; }
+  clearPinFields();
+  if (!mode) return;
+  // Pairing needs the keys, and a PIN typed there shouldn't wait behind this one.
+  if (mode === 'enter') closeConnectDialog();
+
+  const set = mode === 'set';
+  const notice = mode === 'notice';
+  $('#remote-pin-title').textContent = notice ? 'Remote Control keys deleted' : set ? 'Set a PIN for this device' : 'Enter your PIN';
+  $('#remote-pin-lead').textContent = notice
+    ? remoteUi.pinNotice
+    : set
+      ? 'This laptop can reach your home PC, so it needs a PIN first. Use at least 6 digits. Sanctum asks for it when it starts, and after 15 minutes idle.'
+      : 'Remote Control is locked. Your chats at home stay out of sight until you enter it.';
+  $('#remote-pin-form').hidden = notice;
+  $('#remote-pin-confirm').hidden = !set;
+  $('#remote-pin-submit').textContent = set ? 'Set PIN' : 'Unlock';
+  $('#remote-pin-later').hidden = mode !== 'enter';
+  $('#remote-pin-ok').hidden = !notice;
+  $('#remote-pin-forgot').hidden = mode !== 'enter';
+  $('#remote-pin-remove').hidden = !set;
+  // A home PC's name, which has no place in the page after this.
+  if (set) paintPinRemoveLabel();
+  else $('#remote-pin-remove').textContent = '';
+  if (!notice) $('#remote-pin-input').focus();
+}
+
+function paintPinRemoveLabel() {
+  const homes = remoteHomes();
+  $('#remote-pin-remove').textContent = homes.length === 1 ? `Remove ${homes[0].name} instead` : 'Remove these home PCs instead';
+}
+
+function clearPinFields() {
+  clearTimeout(remoteUi.pinWaitTimer);
+  $('#remote-pin-input').value = '';
+  $('#remote-pin-input2').value = '';
+  $('#remote-pin-error').textContent = '';
+  $('#remote-pin-submit').disabled = false;
+}
+
+async function submitPin() {
+  const pin = $('#remote-pin-input').value;
+  const error = $('#remote-pin-error');
+  const submit = $('#remote-pin-submit');
+  if (submit.disabled) return;
+  error.textContent = '';
+  if (remoteUi.pinMode === 'set' && pin !== $('#remote-pin-input2').value) {
+    error.textContent = "Those PINs don't match.";
+    return;
+  }
+  submit.disabled = true;
+  const asked = remoteUi.pinMode;
+  const answer = await (asked === 'set' ? window.api.remote.setPin(pin) : window.api.remote.unlock(pin))
+    .catch(() => ({ ok: false, error: "Couldn't check that. Try again." }));
+  submit.disabled = false;
+  if (remoteUi.pinMode !== asked) return;
+  const said = asked === 'set' ? { ok: !!answer.ok, message: answer.error || '', waitMs: 0, wiped: false } : RemoteRules.pinAnswer(answer);
+  if (said.ok) {
+    clearPinFields();
+    // The status that says so can be a moment behind this.
+    remoteStatusRefresh();
+    return;
+  }
+  $('#remote-pin-input').value = '';
+  $('#remote-pin-input').focus();
+  if (said.wiped) {
+    remoteUi.pinNotice = said.message;
+    paintPinScreen();
+    return;
+  }
+  error.textContent = said.message;
+  if (said.waitMs > 0) {
+    submit.disabled = true;
+    clearTimeout(remoteUi.pinWaitTimer);
+    remoteUi.pinWaitTimer = setTimeout(() => {
+      submit.disabled = false;
+      error.textContent = '';
+    }, said.waitMs);
+  }
+}
+
+function remoteStatusRefresh() {
+  window.api.remote.status().then(mirrorOnStatus).catch(() => {});
+}
+
+// The one other way out of owing a PIN: stop being able to reach home at all.
+async function removeHomesInstead() {
+  const results = await Promise.all(remoteHomes().map(d => window.api.remote.removeDevice(d.id).catch(() => ({ ok: false }))));
+  const failed = results.find(r => !r.ok);
+  $('#remote-pin-error').textContent = failed ? (failed.error || "Couldn't remove it. Try again.") : '';
+  remoteStatusRefresh();
+}
+
+// ---- Settings > Devices ----
+
+function openDevicesSettings() {
+  openSettings();
+  $('.set-nav-btn[data-panel="devices"]')?.click();
+}
+
+function wireRemoteDevicesPanel() {
+  $('#remote-address-form')?.addEventListener('submit', (e) => { e.preventDefault(); saveRemoteAddress(); });
+  $('#remote-add-device')?.addEventListener('click', () => openCodeDialog('Add a device'));
+  $('#remote-connect-home')?.addEventListener('click', openConnectDialog);
+  $('#remote-panel-unlock')?.addEventListener('click', askForPinAgain);
+  $('#remote-control-switch')?.addEventListener('click', toggleLaptopControl);
+}
+
+async function saveRemoteAddress() {
+  const input = $('#remote-address');
+  const note = $('#remote-address-note');
+  const value = input.value.trim();
+  if (!value) { note.textContent = 'Paste the address first.'; return; }
+  const answer = await window.api.remote.setAddress(value).catch(() => ({ ok: false }));
+  if (!answer.ok) {
+    note.textContent = answer.error || "Couldn't save the address.";
+    note.classList.add('remote-note-error');
+    return;
+  }
+  // It holds a secret, so it doesn't stay on screen.
+  input.value = '';
+  note.classList.remove('remote-note-error');
+  remoteStatusRefresh();
+  paintRemoteDevices();
+}
+
+function paintRemoteDevices() {
+  const body = $('#remote-devices');
+  if (!body) return;
+  const status = remoteStatusNow();
+  const on = status.enabled === true;
+  const lockedOut = RemoteRules.pinPrompt(status) === 'enter' || (!on && status.locked === true && status.hasPin === true);
+  const note = $('#remote-address-note');
+  if (!note.classList.contains('remote-note-error')) {
+    note.textContent = on
+      ? 'Remote Control is set up on this device. Paste a new address to replace it.'
+      : "Remote Control stays off until a private service address is set here. If you don't have one, you can ignore this.";
+  }
+  $('#remote-address').placeholder = on ? 'Saved' : 'Paste the address';
+  $('#remote-reset-notice').hidden = !(state.remoteKeysReset && !remoteDevices().length);
+  $('#remote-panel-lock').hidden = !lockedOut;
+  body.hidden = !on || lockedOut;
+
+  // Off can always be reached, because it must never wait for the PIN. On needs a home PC to
+  // mean anything, and the PIN.
+  const control = $('#remote-control-wrap');
+  control.hidden = !on || !(lockedOut ? status.controlAllowed === true : remoteHomes().length > 0);
+  $('#remote-control-switch').setAttribute('aria-pressed', status.controlAllowed === true ? 'true' : 'false');
+  if (body.hidden) { $('#remote-device-list').replaceChildren(); return; }
+
+  const list = $('#remote-device-list');
+  list.replaceChildren(...remoteDevices().map(renderRemoteDevice));
+  list.hidden = !remoteDevices().length;
+  const own = $('#remote-own-fingerprint');
+  own.hidden = !(remoteDevices().length && status.fingerprint);
+  own.textContent = status.fingerprint ? `This device's fingerprint: ${status.fingerprint}` : '';
+  $('#remote-fingerprint-help').hidden = own.hidden;
+}
+
+function renderRemoteDevice(device) {
+  const row = remoteEl('div', 'remote-device');
+  const left = remoteEl('div', 'remote-device-who');
+  left.appendChild(remoteEl('div', 'remote-device-name', device.name));
+  const facts = remoteEl('div', 'remote-device-facts');
+  facts.appendChild(remoteEl('span', '', device.role === 'home' ? 'Home PC' : 'Laptop'));
+  facts.appendChild(remoteEl('span', 'remote-device-fingerprint', `Fingerprint ${device.fingerprint}`));
+  left.appendChild(facts);
+  row.appendChild(left);
+  const path = remoteEl('span', 'remote-device-path' + (device.connected ? ' up' : ''), RemoteRules.pathLabel(device.path));
+  row.appendChild(path);
+  const armed = remoteUi.removing === device.id;
+  const remove = remoteEl('button', 'remote-device-remove' + (armed ? ' armed' : ''), armed ? 'Remove this device' : 'Remove');
+  remove.type = 'button';
+  remove.addEventListener('click', () => removeRemoteDevice(device.id));
+  row.appendChild(remove);
+  return row;
+}
+
+async function removeRemoteDevice(id) {
+  if (remoteUi.removing !== id) {
+    remoteUi.removing = id;
+    paintRemoteDevices();
+    // A status can redraw this list at any moment, so the second click's chance is held here.
+    clearTimeout(remoteUi.removeTimer);
+    remoteUi.removeTimer = setTimeout(() => {
+      remoteUi.removing = null;
+      paintRemoteDevices();
+    }, REMOTE_REMOVE_ARMED_MS);
+    return;
+  }
+  clearTimeout(remoteUi.removeTimer);
+  remoteUi.removing = null;
+  const answer = await window.api.remote.removeDevice(id).catch(() => ({ ok: false }));
+  if (!answer.ok) showToast(answer.error || "Couldn't remove that device. Try again.", 'err');
+  remoteStatusRefresh();
+}
+
+async function toggleLaptopControl() {
+  const on = remoteStatusNow().controlAllowed === true;
+  const answer = await window.api.remote.setControlAllowed(!on).catch(() => ({ ok: false }));
+  if (!answer.ok) showToast(answer.error || "Couldn't change that. Try again.", 'err');
+  remoteStatusRefresh();
+}
+
+// ---- Showing a code ----
+
+function wireRemoteCodeDialog() {
+  $('#remote-code-close')?.addEventListener('click', closeCodeDialog);
+  $('#remote-code-x')?.addEventListener('click', closeCodeDialog);
+  $('#remote-code-again')?.addEventListener('click', () => {
+    const ui = remoteUi.code;
+    if (ui) openCodeDialog(ui.title);
+  });
+  $('#remote-code-overlay')?.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape') return;
+    e.stopPropagation(); // Settings may be open underneath, and stays open.
+    closeCodeDialog();
+  });
+  setInterval(tickCodeDialog, 1000);
+}
+
+async function openCodeDialog(title) {
+  const ui = { title, stage: 'asking', message: '', code: null, expiresAt: 0, before: new Set(remoteDevices().map(d => d.id)) };
+  remoteUi.code = ui;
+  paintCodeDialog();
+  $('#remote-code-close').focus();
+  const answer = await window.api.remote.createCode().catch(() => ({ error: "Couldn't get a code. Try again." }));
+  if (remoteUi.code !== ui) {
+    // Closed while it was on its way, so nobody will ever read this one.
+    if (answer.code) window.api.remote.cancelCode().catch(() => {});
+    return;
+  }
+  if (answer.code) {
+    ui.stage = 'showing';
+    ui.code = answer.code;
+    ui.expiresAt = answer.expiresAt;
+  } else {
+    ui.stage = 'ended';
+    ui.message = answer.error || "Couldn't get a code. Try again.";
+  }
+  paintCodeDialog();
+}
+
+// Leaving means nobody can read it any more, so it shouldn't go on working.
+function closeCodeDialog() {
+  const ui = remoteUi.code;
+  remoteUi.code = null;
+  if (ui?.stage === 'showing') window.api.remote.cancelCode().catch(() => {});
+  $('#remote-code-overlay').hidden = true;
+}
+
+function endCode(ui, message) {
+  ui.stage = 'ended';
+  ui.code = null;
+  ui.message = message;
+  paintCodeDialog();
+}
+
+function noteCodeDialogStatus() {
+  const ui = remoteUi.code;
+  if (ui?.stage !== 'showing') return;
+  const arrived = remoteDevices().find(d => d.role === 'laptop' && !ui.before.has(d.id));
+  if (arrived) {
+    ui.stage = 'paired';
+    ui.code = null;
+    ui.message = `${arrived.name} is connected.`;
+    paintCodeDialog();
+  } else if (remoteStatusNow().codePending !== true) {
+    endCode(ui, REMOTE_CODE_CANCELLED);
+  }
+}
+
+function tickCodeDialog() {
+  const ui = remoteUi.code;
+  if (ui?.stage !== 'showing') return;
+  if (RemoteRules.codeTimeLeft(ui.expiresAt, Date.now()) === null) {
+    endCode(ui, REMOTE_CODE_EXPIRED);
+    window.api.remote.cancelCode().catch(() => {});
+    return;
+  }
+  paintCodeDialog();
+}
+
+function paintCodeDialog() {
+  const ui = remoteUi.code;
+  const overlay = $('#remote-code-overlay');
+  overlay.hidden = !ui;
+  if (!ui) return;
+  const showing = ui.stage === 'showing';
+  $('#remote-code-title').textContent = ui.title;
+  const value = $('#remote-code-value');
+  value.hidden = !showing;
+  value.textContent = ui.code || '';
+  const hint = $('#remote-code-hint');
+  hint.hidden = !showing;
+  hint.textContent = REMOTE_CODE_HINT;
+  const expiry = $('#remote-code-expiry');
+  expiry.hidden = !showing;
+  expiry.textContent = showing ? `Expires in ${RemoteRules.codeTimeLeft(ui.expiresAt, Date.now()) || '0:00'}` : '';
+  const message = $('#remote-code-message');
+  message.textContent = ui.message;
+  message.hidden = !ui.message;
+  message.classList.toggle('remote-code-good', ui.stage === 'paired');
+  $('#remote-code-asking').hidden = ui.stage !== 'asking';
+  $('#remote-code-again').hidden = ui.stage !== 'ended';
+  $('#remote-code-close').textContent = ui.stage === 'showing' || ui.stage === 'asking' ? 'Cancel' : ui.stage === 'paired' ? 'Done' : 'Close';
+}
+
+// ---- Connecting to a home PC ----
+
+function wireRemoteConnectDialog() {
+  $('#remote-connect-form')?.addEventListener('submit', (e) => { e.preventDefault(); submitConnect(); });
+  $('#remote-connect-cancel')?.addEventListener('click', closeConnectDialog);
+  $('#remote-connect-x')?.addEventListener('click', closeConnectDialog);
+  $('#remote-connect-overlay')?.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape') return;
+    e.stopPropagation();
+    closeConnectDialog();
+  });
+}
+
+function openConnectDialog() {
+  remoteUi.connecting = null;
+  $('#remote-connect-overlay').hidden = false;
+  $('#remote-connect-code').value = '';
+  $('#remote-connect-pin').value = '';
+  $('#remote-connect-pin2').value = '';
+  $('#remote-connect-error').textContent = '';
+  $('#remote-connect-submit').disabled = false;
+  $('#remote-connect-submit').textContent = 'Connect';
+  // The first home PC is what makes this device need one.
+  $('#remote-connect-pin-fields').hidden = remoteStatusNow().hasPin === true;
+  $('#remote-connect-code').focus();
+}
+
+function closeConnectDialog() {
+  remoteUi.connecting = null;
+  $('#remote-connect-pin').value = '';
+  $('#remote-connect-pin2').value = '';
+  $('#remote-connect-overlay').hidden = true;
+}
+
+async function submitConnect() {
+  const error = $('#remote-connect-error');
+  const submit = $('#remote-connect-submit');
+  if (submit.disabled) return;
+  const code = $('#remote-connect-code').value.trim();
+  error.textContent = '';
+  if (!code) { error.textContent = 'Enter the code from your home PC.'; return; }
+  const needsPin = remoteStatusNow().hasPin !== true;
+  const pin = needsPin ? $('#remote-connect-pin').value : undefined;
+  if (needsPin && pin !== $('#remote-connect-pin2').value) { error.textContent = "Those PINs don't match."; return; }
+
+  const attempt = {};
+  remoteUi.connecting = attempt;
+  submit.disabled = true;
+  submit.textContent = 'Connecting…';
+  remoteUi.pairing = true;
+  const answer = await window.api.remote.pair(code, remoteStatusNow().name, pin)
+    .catch(() => ({ ok: false, error: "Couldn't connect. Try again." }));
+  remoteUi.pairing = false;
+  remoteStatusRefresh();
+  // Still happened if the dialog has been closed since, and worth saying so.
+  if (answer.ok) showToast(`Connected to ${answer.device?.name || 'your home PC'}`, 'ok');
+  if (remoteUi.connecting !== attempt) return;
+  remoteUi.connecting = null;
+  submit.disabled = false;
+  submit.textContent = 'Connect';
+  if (answer.ok) closeConnectDialog();
+  else error.textContent = answer.error || "Couldn't connect. Try again.";
+}
+
+// ---- Keys that were reset ----
+
+function explainKeysReset() {
+  if (!state.remoteKeysReset || remoteUi.resetExplained || remoteStatusNow().enabled !== true) return;
+  remoteUi.resetExplained = true;
+  $('#remote-reset-overlay').hidden = false;
+  $('#remote-reset-ok').focus();
+  paintRemoteDevices();
+}
+
 // ============== ACTING FROM A LAPTOP ==============
 // A laptop never changes a remote chat. It sends an action, the home PC does it, and the change
 // comes back through the mirror like any other. So there's one order of events, the order of
@@ -6880,13 +7521,19 @@ function takeBackReturned(key, text, attachments) {
 function returnToBox(key, text, attachments = []) {
   const c = state.chats[key];
   if (!c) {
-    putInBox(text, attachments);
-    showRemoteGone();
+    backInBoxFromGoneChat(text, attachments);
   } else if (currentChat() === c) {
     putInBox(text, attachments);
   } else {
     holdReturned(c, text, attachments);
   }
+}
+
+// Those words were meant for a home PC, so while that's locked away they wait as well.
+function backInBoxFromGoneChat(text, attachments = []) {
+  if (mirror.hidden) { mirror.heldForUnlock.push({ text, attachments }); return; }
+  putInBox(text, attachments);
+  showRemoteGone();
 }
 
 function holdReturned(c, text, attachments = []) {
@@ -6959,7 +7606,8 @@ function paintRemoteChatButton() {
   if (!btn) return;
   const deviceId = connectedHomeId();
   btn.hidden = !deviceId || state.space !== 'home' || remoteChatsHidden();
-  if (deviceId) btn.querySelector('span').textContent = `New chat on ${mirror.homes.get(deviceId).info?.name || 'home PC'}`;
+  // Hidden isn't gone, and while locked that name has no place in the page.
+  btn.querySelector('span').textContent = btn.hidden ? '' : `New chat on ${mirror.homes.get(deviceId).info?.name || 'home PC'}`;
 }
 
 async function newRemoteChat(deviceId) {
@@ -7047,6 +7695,8 @@ const mirror = {
   homes: new Map(),          // deviceId -> { connected, offlineAt, expected, awaitingSnapshot, info, clockOffset }
   hidden: false,             // locked, so remote chats are off the screen
   resumeId: null,            // the remote chat that was open when that happened
+  leftFor: null,             // the chat that took its place
+  heldForUnlock: [],         // words whose chat went away during a lock
   // Acting.
   actions: new Map(),        // id -> { deviceId, resolve, timer }, waiting for an answer
   lateActions: new Map(),    // id -> { deviceId, onLateOk, timer }, timed out but may still be answered
@@ -7094,6 +7744,7 @@ function mirrorOnStatus(status) {
   reflectRemoteLock();
   paintRemoteChatButton();
   paintRemoteComposer();
+  paintRemoteUi();
 }
 
 function mirrorOnFrame(deviceId, frame) {
@@ -7791,10 +8442,7 @@ function dropRemoteChat(key) {
   } else {
     renderChatList();
   }
-  if (c._returned) {
-    putInBox(c._returned.text, c._returned.attachments);
-    showRemoteGone();
-  }
+  if (c._returned) backInBoxFromGoneChat(c._returned.text, c._returned.attachments);
 }
 
 // Where to go when the open remote chat has to leave the screen.
@@ -7805,7 +8453,7 @@ function leaveRemoteChat() {
   else createChat();
 }
 
-// Remote chats go above local ones, newest first. Task 11 groups them under their home PC.
+// Newest first. The sidebar groups them under their home PC, above local chats.
 function sortRemoteChats() {
   const updated = (id) => state.chats[id].updatedAt || 0;
   const remote = state.order.filter(id => state.chats[id]?.remote).sort((a, b) => updated(b) - updated(a));
@@ -7813,8 +8461,7 @@ function sortRemoteChats() {
 }
 
 function remoteChatsHidden() {
-  const status = state.remoteStatus;
-  return !!(status && (status.locked || status.idleLocked));
+  return RemoteRules.chatsLocked(state.remoteStatus);
 }
 
 // Frames keep being applied while locked, so everything is current on unlock. It just isn't
@@ -7824,22 +8471,45 @@ function reflectRemoteLock() {
   if (hidden === mirror.hidden) return;
   mirror.hidden = hidden;
   if (hidden) {
-    if (currentChat()?.remote) {
+    const c = currentChat();
+    if (c?.remote) {
       mirror.resumeId = state.activeId;
+      holdDraftThroughLock(c);
       leaveRemoteChat();
+      mirror.leftFor = state.activeId;
     } else {
       renderChatList();
     }
   } else {
     const resume = mirror.resumeId;
     mirror.resumeId = null;
-    if (resume && state.chats[resume]) setActive(resume);
+    // Someone who has gone on with something else here isn't pulled away from it. What they were
+    // typing waits in its chat for when they go back.
+    const undisturbed = state.activeId === mirror.leftFor && !$('#composer-input').value.trim() && !state.pendingAttachments.length;
+    if (resume && state.chats[resume] && undisturbed) setActive(resume);
     else renderChatList();
+    for (const { text, attachments } of mirror.heldForUnlock.splice(0)) backInBoxFromGoneChat(text, attachments);
   }
 }
 
-// So the state can be seen before Task 11 draws it. On the thread element, not in it, because
-// what's in the thread is what has to match the home PC.
+// Words typed to a home PC go off the screen with its chat, and come back with it. Emptying the
+// box is what brings waiting words back, so those are put to one side while that happens.
+function holdDraftThroughLock(c) {
+  const input = $('#composer-input');
+  const text = input.value;
+  const attachments = state.pendingAttachments;
+  if (!text && !attachments.length) return;
+  const waiting = c._returned;
+  delete c._returned;
+  state.pendingAttachments = [];
+  input.value = '';
+  input.dispatchEvent(new Event('input'));
+  renderAttachments();
+  if (waiting) c._returned = waiting;
+  holdReturned(c, text, attachments);
+}
+
+// On the thread element, not in it, because what's in the thread is what has to match the home PC.
 function paintRemoteOffline() {
   const list = $('#thread');
   if (!list) return;
@@ -7849,12 +8519,26 @@ function paintRemoteOffline() {
   paintRemoteComposer();
 }
 
-// Says in the box why nothing can be sent, until Task 11 draws the banner.
+// The box can't send while the home PC is out of reach. Disabling it leaves what's in it alone,
+// and someone who was typing can carry straight on when it comes back.
 function paintRemoteComposer() {
   const c = currentChat();
   const input = $('#composer-input');
-  if (!c?.remote || !input || input.disabled) return;
-  input.placeholder = homeBlockedReason(c.remote.deviceId) || composerPlaceholder(c.modality);
+  paintRemoteOfflineBanner(c);
+  if (!input) return;
+  if (!c?.remote) { remoteUi.boxHadFocus = false; return; }
+  const reason = homeBlockedReason(c.remote.deviceId);
+  const needsFolder = c.modality === 'agent' && !c.projectFolder;
+  const blocked = !!reason || needsFolder;
+  const wasBlocked = input.disabled;
+  if (blocked && document.activeElement === input) remoteUi.boxHadFocus = true;
+  $('#composer-form')?.classList.toggle('disabled', blocked);
+  input.disabled = blocked;
+  input.placeholder = needsFolder ? 'Select a project folder first…' : reason || composerPlaceholder(c.modality);
+  if (wasBlocked && !blocked && remoteUi.boxHadFocus) {
+    remoteUi.boxHadFocus = false;
+    input.focus();
+  }
 }
 
 // The home PC paints these from timers of its own, which don't run here.

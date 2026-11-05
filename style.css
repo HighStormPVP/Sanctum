@@ -3575,3 +3575,248 @@ textarea:focus-visible, input:focus-visible { outline: none; }
 #thread[data-remote-offline] *,
 #thread[data-remote-offline] *::before,
 #thread[data-remote-offline] *::after { animation: none !important; }
+
+/* Remote Control. Amber is what's live: a shared chat, a code that still works, and the one
+   moment the home model is at work on this machine. Everything else stays quiet. */
+.chat-shared-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent-1); flex-shrink: 0; }
+.chat-shared-marker {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--accent-1);
+  white-space: nowrap;
+}
+.chat-shared-marker::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: var(--accent-1); }
+
+/* Laptop sidebar: each home PC's chats under its name, then a line, then this machine's own. */
+.remote-home { padding-bottom: 8px; margin-bottom: 2px; border-bottom: 1px solid var(--border-1); display: flex; flex-direction: column; }
+.remote-home-head { display: flex; align-items: baseline; gap: 8px; padding: 10px 12px 6px; font-size: 12px; font-weight: 600; color: var(--text-2); }
+.remote-home:first-child .remote-home-head { padding-top: 4px; }
+.remote-home-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.remote-home-state { flex-shrink: 0; font-weight: 400; color: var(--text-4); }
+.remote-home-empty { padding: 2px 12px 6px; font-size: 12px; line-height: 1.45; color: var(--text-4); }
+.remote-lock-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 8px 10px 12px;
+  margin-bottom: 2px;
+  border-bottom: 1px solid var(--border-1);
+  font-size: 12.5px;
+  color: var(--text-2);
+}
+.remote-lock-row button {
+  flex-shrink: 0;
+  padding: 5px 10px;
+  background: var(--surface-2);
+  border: 1px solid var(--border-2);
+  border-radius: var(--r-sm);
+  color: var(--text-1);
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+}
+.remote-lock-row button:hover { background: var(--surface-3); }
+
+.remote-indicators:empty { display: none; }
+.remote-indicator-row { display: flex; align-items: center; gap: 10px; padding: 6px 10px; font-size: 12px; color: var(--text-3); min-width: 0; }
+.remote-indicator-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; border: 1px solid var(--text-4); }
+.remote-indicator-row.up .remote-indicator-dot { background: var(--ok); border-color: var(--ok); }
+.remote-indicator-row.up { color: var(--text-2); }
+.remote-indicator { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* The stronger one. Filled, and over everything including the PIN screen, in the sidebar's corner. */
+.remote-running {
+  position: fixed;
+  left: 12px;
+  bottom: 12px;
+  width: 256px;
+  max-width: calc(100vw - 24px);
+  z-index: 220;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 11px 12px;
+  background: var(--accent);
+  color: var(--on-accent);
+  border-radius: var(--r);
+  box-shadow: var(--shadow-2);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+.remote-running button {
+  padding: 5px 12px;
+  background: var(--on-accent);
+  color: var(--accent);
+  border: 0;
+  border-radius: 999px;
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.remote-running button:hover { opacity: 0.88; }
+.remote-running button:focus-visible { outline-color: var(--on-accent); }
+.app.laptop-running .sidebar-foot { padding-bottom: 96px; }
+
+/* Offline: not an alarm and not amber, because nothing is live. */
+.remote-offline {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0 32px 8px;
+  padding: 10px 14px;
+  background: var(--surface-2);
+  border: 1px solid var(--border-2);
+  border-radius: var(--r);
+  font-size: 13px;
+  color: var(--text-2);
+}
+.remote-offline::before { content: ''; width: 7px; height: 7px; border-radius: 50%; border: 1px solid var(--text-3); flex-shrink: 0; }
+.remote-offline span { min-width: 0; overflow-wrap: anywhere; }
+
+/* Settings > Devices */
+.remote-notice {
+  margin: 10px 0 14px;
+  padding: 12px 14px;
+  background: var(--accent-soft);
+  border: 1px solid rgba(var(--accent-rgb), 0.30);
+  border-radius: var(--r);
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text-1);
+}
+#remote-address-form { margin: 10px 0 0; }
+.remote-address-row { display: flex; align-items: stretch; gap: 8px; }
+.remote-address-row .api-key-input { flex: 1; min-width: 0; }
+.remote-address-row .ghost-btn { flex-shrink: 0; }
+.remote-note-error { color: var(--err); }
+.remote-panel-lock { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 14px; font-size: 13px; color: var(--text-2); }
+
+#remote-devices { margin-top: 18px; }
+#remote-control-wrap { margin-top: 20px; }
+.remote-device-list { border-top: 1px solid var(--border-1); margin-bottom: 14px; }
+.remote-device { display: flex; align-items: center; gap: 14px; padding: 12px 0; border-bottom: 1px solid var(--border-1); }
+.remote-device-who { flex: 1; min-width: 0; }
+.remote-device-name { font-size: 13.5px; font-weight: 600; color: var(--text-1); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.remote-device-facts { display: flex; flex-wrap: wrap; gap: 2px 14px; margin-top: 3px; font-size: 12px; color: var(--text-3); }
+.remote-device-fingerprint { font-family: var(--font-mono); font-size: 11.5px; }
+.remote-device-path { flex-shrink: 0; font-size: 12.5px; color: var(--text-4); }
+.remote-device-path.up { color: var(--ok); }
+.remote-device-remove {
+  flex-shrink: 0;
+  padding: 5px 10px;
+  background: transparent;
+  border: 1px solid var(--border-2);
+  border-radius: var(--r-sm);
+  color: var(--text-2);
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.remote-device-remove:hover { background: var(--surface-2); color: var(--text-1); }
+.remote-device-remove.armed { border-color: var(--err); color: var(--err); }
+.remote-own-fingerprint { font-size: 13px; color: var(--text-2); margin-bottom: 2px; }
+.remote-device-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+.remote-control-switch { padding: 12px; border: 1px solid var(--border-1); }
+.remote-control-switch .tools-menu-label strong { font-size: 13.5px; font-weight: 600; }
+.remote-control-switch .tools-menu-label small { font-size: 12.5px; }
+
+/* Dialogs */
+.modal.remote-dialog { width: min(460px, calc(100vw - 48px)); }
+.remote-dialog-text { font-size: 14px; line-height: 1.55; color: var(--text-2); overflow-wrap: anywhere; }
+.remote-dialog-text.remote-code-good { color: var(--text-1); }
+.remote-code-value {
+  font-family: var(--font-mono);
+  font-size: 46px;
+  font-weight: 500;
+  line-height: 1.1;
+  letter-spacing: 0.14em;
+  color: var(--accent-1);
+  margin-bottom: 14px;
+  user-select: all;
+}
+.remote-code-asking { font-size: 14px; color: var(--text-3); }
+.remote-code-expiry { margin-top: 8px; font-size: 13px; font-variant-numeric: tabular-nums; color: var(--text-3); }
+.remote-field-label { display: block; margin-bottom: 6px; font-size: 12px; font-weight: 600; color: var(--text-2); }
+.remote-connect-code {
+  display: block;
+  width: 100%;
+  padding: 10px 14px;
+  background: var(--surface-2);
+  border: 1px solid var(--border-2);
+  border-radius: var(--r);
+  font-family: var(--font-mono);
+  font-size: 26px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--text-1);
+  outline: none;
+}
+.remote-connect-code:focus, .remote-field:focus { border-color: var(--accent-1); }
+#remote-connect-pin-fields .remote-dialog-text { margin: 16px 0 12px; font-size: 13px; }
+.remote-field-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.remote-field {
+  display: block;
+  width: 100%;
+  padding: 9px 12px;
+  background: var(--surface-2);
+  border: 1px solid var(--border-2);
+  border-radius: var(--r);
+  font-family: var(--font-mono);
+  font-size: 15px;
+  color: var(--text-1);
+  outline: none;
+}
+.remote-error { min-height: 20px; margin-top: 12px; font-size: 13px; line-height: 1.45; color: var(--err); overflow-wrap: anywhere; }
+.remote-error:empty { margin-top: 0; min-height: 0; }
+
+/* The PIN. An opaque room of its own, because what's behind it stays private. */
+.remote-pin-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  display: grid;
+  place-items: center;
+  padding: 32px;
+  background: var(--bg-0);
+  overflow-y: auto;
+  animation: overlay-in 0.18s var(--ease) both;
+}
+.remote-pin-column { width: min(400px, 100%); }
+.remote-pin-column h2 { font-family: var(--font-display); font-size: 30px; font-weight: 500; line-height: 1.15; letter-spacing: -0.02em; color: var(--text-1); }
+.remote-pin-lead { margin-top: 10px; font-size: 14px; line-height: 1.55; color: var(--text-2); overflow-wrap: anywhere; }
+.remote-pin-input {
+  display: block;
+  width: 100%;
+  margin-top: 26px;
+  padding: 6px 0 10px;
+  background: transparent;
+  border: 0;
+  border-bottom: 1px solid var(--text-4);
+  border-radius: 0;
+  font-family: var(--font-mono);
+  font-size: 30px;
+  letter-spacing: 0.3em;
+  color: var(--text-1);
+  outline: none;
+  transition: border-color 0.15s var(--ease);
+}
+.remote-pin-input:focus { border-bottom-color: var(--accent-1); }
+#remote-pin-confirm { margin-top: 20px; }
+#remote-pin-confirm .remote-pin-input { margin-top: 0; }
+.remote-pin-actions { display: flex; align-items: center; gap: 14px; margin-top: 20px; }
+.remote-pin-actions:empty { display: none; }
+.remote-quiet-btn { padding: 8px 2px; background: transparent; border: 0; border-radius: var(--r-sm); color: var(--text-2); font-family: inherit; font-size: 13px; cursor: pointer; }
+.remote-quiet-btn:hover { color: var(--text-1); text-decoration: underline; }
+.remote-pin-foot { margin-top: 30px; font-size: 12.5px; line-height: 1.5; color: var(--text-3); }
+.remote-pin-remove { display: block; margin-top: 26px; text-align: left; color: var(--text-3); overflow-wrap: anywhere; }
+.approval-approve:disabled { opacity: 0.5; cursor: default; transform: none; }

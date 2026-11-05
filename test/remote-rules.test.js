@@ -315,3 +315,87 @@ test('the page loads the rules before the renderer', () => {
   assert.ok(rules > 0);
   assert.ok(rules < html.indexOf('src="renderer.js"'));
 });
+
+// ---- The interface's rules ----
+
+const { pinPrompt, chatsLocked, shouldIdleLock, pathLabel, codeTimeLeft, pinAnswer, IDLE_LOCK_MS } = RemoteRules;
+const HOME_PEER = { id: 'h', role: 'home' };
+const LAPTOP_PEER = { id: 'l', role: 'laptop' };
+
+test('a device with a PIN asks for it while locked', () => {
+  assert.equal(pinPrompt({ enabled: true, locked: true, hasPin: true, devices: [] }), 'enter');
+  assert.equal(pinPrompt({ enabled: true, locked: true, idleLocked: true, hasPin: true, devices: [HOME_PEER] }), 'enter');
+  assert.equal(pinPrompt({ enabled: true, locked: false, hasPin: true, devices: [HOME_PEER] }), null);
+});
+
+test('a laptop with a home PC and no PIN has to set one', () => {
+  assert.equal(pinPrompt({ enabled: true, locked: false, hasPin: false, needsPin: true, devices: [HOME_PEER] }), 'set');
+});
+
+test('a home PC with only laptops is never asked for a PIN', () => {
+  assert.equal(pinPrompt({ enabled: true, locked: false, hasPin: false, needsPin: false, devices: [LAPTOP_PEER] }), null);
+  // Still starting: its own secret unlocks it, with nobody involved.
+  assert.equal(pinPrompt({ enabled: true, locked: true, hasPin: false, needsPin: false, devices: [] }), null);
+  // Asked for during a pairing that hasn't happened yet: the connect dialog holds that field.
+  assert.equal(pinPrompt({ enabled: true, locked: false, hasPin: false, needsPin: true, devices: [LAPTOP_PEER] }), null);
+});
+
+test('nothing asks for a PIN without an address', () => {
+  assert.equal(pinPrompt({ enabled: false, locked: true, hasPin: true, devices: [] }), null);
+  assert.equal(pinPrompt({}), null);
+  assert.equal(pinPrompt(null), null);
+});
+
+test('remote chats stay hidden while locked, and while a PIN is still owed', () => {
+  assert.equal(chatsLocked({ locked: true, devices: [] }), true);
+  assert.equal(chatsLocked({ idleLocked: true, devices: [] }), true);
+  assert.equal(chatsLocked({ enabled: true, locked: false, needsPin: true, hasPin: false, devices: [HOME_PEER] }), true);
+  assert.equal(chatsLocked({ enabled: true, locked: false, hasPin: true, devices: [HOME_PEER] }), false);
+  assert.equal(chatsLocked(null), false);
+  assert.equal(chatsLocked(undefined), false);
+});
+
+test('the idle lock waits 15 minutes, and only for a device a PIN guards', () => {
+  const laptop = { enabled: true, hasPin: true, locked: false, idleLocked: false, devices: [HOME_PEER] };
+  assert.equal(IDLE_LOCK_MS, 15 * 60 * 1000);
+  assert.equal(shouldIdleLock(laptop, IDLE_LOCK_MS - 1), false);
+  assert.equal(shouldIdleLock(laptop, IDLE_LOCK_MS), true);
+  assert.equal(shouldIdleLock({ ...laptop, locked: true }, IDLE_LOCK_MS), false);
+  assert.equal(shouldIdleLock({ ...laptop, idleLocked: true }, IDLE_LOCK_MS), false);
+  assert.equal(shouldIdleLock({ ...laptop, hasPin: false }, IDLE_LOCK_MS), false);
+  assert.equal(shouldIdleLock({ ...laptop, enabled: false }, IDLE_LOCK_MS), false);
+  assert.equal(shouldIdleLock({ ...laptop, devices: [LAPTOP_PEER] }, IDLE_LOCK_MS), false);
+  assert.equal(shouldIdleLock(null, IDLE_LOCK_MS), false);
+});
+
+test('a connection is named in plain words', () => {
+  assert.equal(pathLabel('direct'), 'Direct');
+  assert.equal(pathLabel('relay'), 'Through relay');
+  assert.equal(pathLabel('offline'), 'Offline');
+  assert.equal(pathLabel(undefined), 'Offline');
+  assert.equal(pathLabel('__proto__'), 'Offline');
+});
+
+test('what is left of a code reads as minutes and seconds, and nothing once it has gone', () => {
+  assert.equal(codeTimeLeft(600000, 0), '10:00');
+  assert.equal(codeTimeLeft(600000, 1), '10:00');
+  assert.equal(codeTimeLeft(65000, 0), '1:05');
+  assert.equal(codeTimeLeft(1, 0), '0:01');
+  assert.equal(codeTimeLeft(1000, 1000), null);
+  assert.equal(codeTimeLeft(1000, 2000), null);
+});
+
+test('what a PIN attempt came to is said plainly', () => {
+  assert.deepEqual(pinAnswer({ ok: true }), { ok: true, message: '', waitMs: 0, wiped: false });
+  assert.deepEqual(pinAnswer({ ok: false, waitMs: 0 }), { ok: false, message: "That PIN isn't right.", waitMs: 0, wiped: false });
+  assert.equal(pinAnswer({ ok: false, waitMs: 1000 }).message, 'Too many wrong PINs. Try again in 1 second.');
+  assert.equal(pinAnswer({ ok: false, waitMs: 8000 }).message, 'Too many wrong PINs. Try again in 8 seconds.');
+  assert.equal(pinAnswer({ ok: false, waitMs: 8000 }).waitMs, 8000);
+  assert.equal(pinAnswer({ ok: false, waitMs: 120000 }).message, 'Too many wrong PINs. Try again in 2 minutes.');
+  assert.equal(pinAnswer({ ok: false, waitMs: 61000 }).message, 'Too many wrong PINs. Try again in 2 minutes.');
+  assert.equal(pinAnswer({ ok: false, error: 'Could not record the attempt.' }).message, 'Could not record the attempt.');
+  const wiped = pinAnswer({ ok: false, wiped: true });
+  assert.equal(wiped.wiped, true);
+  assert.match(wiped.message, /deleted/);
+  assert.match(wiped.message, /new code/);
+});

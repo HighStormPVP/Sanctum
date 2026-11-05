@@ -164,7 +164,8 @@ async function launchDevice(name, { flags = 'log,no-stun', ollamaUrl, profile = 
   return device;
 }
 
-// There's no UI for this yet. The host's relay socket opens in the background, and "no
+// Through the API, for tests about what comes after. e2e/ui.e2e.js does it through the
+// interface. The host's relay socket opens in the background, and "no
 // pairing waiting" doesn't count as a failed code, so asking again is fine.
 async function pair(home, laptop, address) {
   assert.deepEqual(await home.remote('setAddress', address), { ok: true });

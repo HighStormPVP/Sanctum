@@ -107,6 +107,7 @@ test('mirroring chats', async (t) => {
     await laptop.page.evaluate(() => {
       const real = Date.now.bind(Date);
       Date.now = () => real() + 3600000;
+      remoteUi.lastInputAt = Date.now(); // a clock that is out is not someone being idle
       state.shellInfo = { name: 'LaptopShell' };
     });
     const before = await snapshotsSeen(laptop);
