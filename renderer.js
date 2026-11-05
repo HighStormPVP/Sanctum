@@ -7249,6 +7249,7 @@ const remoteTools = {
   starters: new Map(),  // chatId -> the laptop whose message is about to start a run
   askWaitMs: REMOTE_ASK_WAIT_MS,
   limitMs: REMOTE_TOOL_LIMIT_MS,
+  toldLeftOut: new Map(), // laptop's deviceId -> what the person at home was last told about its tools
   // On the laptop.
   running: new Map(),   // `${deviceId}:${id}` -> { deviceId, id, name, args, chatTitle, timer }
   homesUp: new Set(),   // home PCs that have heard from this page on their current connection
@@ -7381,7 +7382,7 @@ function devicesPrompt(c) {
 
 ${lines.join('\n')}
 
-File, command, and task tools take a \`device\` argument naming one of these. Leave it out to use the default. Systems and shells can differ, so write commands and paths for the device they run on. Web tools always run on the home PC. A call never moves to another device by itself: if a device is offline, you get an error saying so, and nothing has run.`;
+File, command, and task tools take a \`device\` argument naming one of these. Leave it out to use the default. Systems and shells can differ, so write commands and paths for the device they run on. Web tools always run on the home PC. A call never moves to another device by itself. If a device can't be reached you get an error. A call that fails partway may have partly run, so check before repeating it.`;
 }
 
 // ---- Calling a laptop ----
@@ -7471,9 +7472,8 @@ async function runToolOnDevice(name, args, c, target) {
 
 function applyControlState(deviceId, frame) {
   const said = RemoteRules.cleanControlState(frame);
-  const before = remoteTools.control.get(deviceId);
   remoteTools.control.set(deviceId, said);
-  if (said.dropped > 0 && before?.dropped !== said.dropped) noteToolsLeftOut(deviceId, said.dropped);
+  if (RemoteRules.tellToolsLeftOut(remoteTools.toldLeftOut, deviceId, said.dropped, Date.now())) noteToolsLeftOut(deviceId, said.dropped);
   if (!said.allowed) endToolCallsOfDevice(deviceId, (name) => `${name} turned off control from home, so that stopped.`, 'control off');
 }
 
@@ -7598,9 +7598,11 @@ async function runToolCallHere(deviceId, frame) {
   const name = typeof frame?.name === 'string' ? frame.name : '';
   const chatTitle = typeof frame?.chatTitle === 'string' ? frame.chatTitle : '';
   const key = `${deviceId}:${check.id}`;
-  // The main process has checked this as well, and has written a `started` line for it.
+  // The main process has checked this as well, and has written a `started` line for it, so what stops
+  // here is an `ended`. It can only get here if the two disagree: a tool main knows and this page
+  // hasn't heard about yet.
   if (check.error) {
-    auditLaptopCall('refused', deviceId, { chatTitle, tool: name, args: RemoteRules.auditArgs(name, frame?.args), reason: check.error, ok: false });
+    auditLaptopCall('ended', deviceId, { call: check.id, chatTitle, tool: name, reason: check.error, ok: false });
     if (check.id) answerHome(deviceId, check.id, toolError(check.error, 'refused'));
     return;
   }

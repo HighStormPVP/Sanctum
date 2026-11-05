@@ -554,12 +554,18 @@ app.on('before-quit', (e) => {
     for (const [, entry] of activeChatStreams) { try { entry.controller.abort(); } catch {} }
     for (const task of backgroundTasks.values()) { if (task.proc) killing(task.proc); }
     for (const entry of videoProcesses.values()) { entry.aborted = true; if (entry.proc) killing(entry.proc); }
+    // A test's way to have a kill that never finishes.
+    if (remoteTestFlags.has('hang-kill-at-quit')) killsUnderWay.add(new Promise(() => {}));
+    // Side by side, so one that hangs can't cost the others their turn within the limit below.
     // Windows has to finish taskkill while this app is still here. Quit straight after starting it,
     // and the process goes on running.
-    await Promise.all(killsUnderWay);
-    const unloaded = await unloadAllOllamaModels();
-    if (unloaded.length) dlog(`quit · unloaded ${unloaded.length} model(s): ${unloaded.join(', ')}`);
-    if (mcpManager) { try { await mcpManager.stopAll(); } catch {} }
+    await Promise.all([
+      Promise.all(killsUnderWay),
+      unloadAllOllamaModels().then((unloaded) => {
+        if (unloaded.length) dlog(`quit · unloaded ${unloaded.length} model(s): ${unloaded.join(', ')}`);
+      }).catch(() => {}),
+      mcpManager ? mcpManager.stopAll().catch(() => {}) : null
+    ]);
   })();
 
   const timeout = new Promise(r => setTimeout(r, 6000));
@@ -585,6 +591,7 @@ const REMOTE_TRANSPORT_URL = 'aio-transport://app/remote-transport.html';
 //   log        the hidden window keeps a record of what it was handed
 //   no-stun    no STUN server, so a test only touches this machine's own networking
 //   block-ice  no candidates cross, so a data channel can never form
+//   hang-kill-at-quit  a kill that never settles while quitting
 const remoteTestFlags = new Set(app.isPackaged ? [] : String(process.env.SANCTUM_REMOTE_TEST || '').split(','));
 
 // A renderer that has loaded a file: page can read other file: URLs, which an exploit there
@@ -1462,19 +1469,10 @@ const {
   ANTHROPIC_FALLBACK_BETA,
   geminiThinkingConfig,
   addImagesToAnthropic,
-  addImagesToGemini
+  addImagesToGemini,
+  toAnthropicTools,
+  toGeminiTools
 } = require(path.join(__dirname, 'lib', 'cloud-params.js'));
-
-function toAnthropicTools(tools) {
-  if (!Array.isArray(tools) || !tools.length) return undefined;
-  return tools
-    .filter(t => t && t.function && t.function.name)
-    .map(t => ({
-      name: t.function.name,
-      description: t.function.description || '',
-      input_schema: t.function.parameters || { type: 'object', properties: {} }
-    }));
-}
 
 // Convert Ollama-style messages (system / user / assistant / tool) into the
 // Anthropic format: separate `system` string + `messages` array of user/assistant.
@@ -1735,33 +1733,6 @@ async function streamAnthropic({ apiKey, model, messages, tools, options, images
 // Uses the Generative Language API (Google AI Studio keys) via
 // :streamGenerateContent with alt=sse. Same chunk shape as Anthropic /
 // Ollama so the renderer doesn't need to know which provider this is.
-function toGeminiTools(tools) {
-  if (!Array.isArray(tools) || !tools.length) return undefined;
-  // Strip JSON Schema fields Gemini doesn't accept ($schema, additionalProperties,
-  // and `format` on non-string types). Recursively walk objects and arrays.
-  const sanitize = (node) => {
-    if (Array.isArray(node)) return node.map(sanitize);
-    if (node && typeof node === 'object') {
-      const out = {};
-      for (const [k, v] of Object.entries(node)) {
-        if (k === '$schema' || k === 'additionalProperties') continue;
-        out[k] = sanitize(v);
-      }
-      return out;
-    }
-    return node;
-  };
-  return [{
-    functionDeclarations: tools
-      .filter(t => t && t.function && t.function.name)
-      .map(t => ({
-        name: t.function.name,
-        description: t.function.description || '',
-        parameters: sanitize(t.function.parameters || { type: 'object', properties: {} })
-      }))
-  }];
-}
-
 function toGeminiContents(messages) {
   const sysParts = [];
   const out = [];

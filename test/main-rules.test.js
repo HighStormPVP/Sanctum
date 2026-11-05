@@ -308,17 +308,51 @@ test('being inside a folder lexically is about the words, and case only on Windo
   assert.ok(!isLexicallyWithin('/proj/a', [], { pathMod: path.posix, platform: 'linux' }));
 });
 
+// ---- Links inside an allowed folder, by checkAgentPath, which all six file tools go through ----
+
+test('a link inside an allowed folder that points outside it is refused, for a read and for a write to a target not there yet', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sanctum-agent-link-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const root = path.join(dir, 'root');
+  const outside = path.join(dir, 'outside');
+  fs.mkdirSync(root);
+  fs.mkdirSync(outside);
+  fs.writeFileSync(path.join(outside, 'secret.txt'), 'x');
+  const link = path.join(root, 'link');
+  try { fs.symlinkSync(outside, link, 'junction'); }
+  catch { t.skip('this machine cannot create links'); return; }
+  const profile = path.join(dir, 'profile');
+  const opts = { roots: [root], profile };
+  assert.equal(checkAgentPath(path.join(link, 'secret.txt'), opts), 'outside', 'a read through the link');
+  assert.equal(checkAgentPath(path.join(link, 'new.txt'), opts), 'outside', 'a write through the link, to a file not there yet');
+  assert.equal(checkAgentPath(path.join(link, 'new', 'deeper', 'new.txt'), opts), 'outside', 'and to a folder not there yet');
+  assert.equal(checkAgentPath(link, opts), 'outside', 'the link itself');
+  assert.equal(checkAgentPath(path.join(root, 'new.txt'), opts), null, 'a new file that really is inside');
+  assert.equal(checkAgentPath(path.join(root, 'a', 'new.txt'), opts), null);
+});
+
 // ---- Walking in a worker, I2 ----
 
 const { globInWorker } = lib('grep-runner.js');
 
-// One tree for these tests, since making it is what takes the time. Large enough that a walk on the
-// main thread stalls it for far longer than the tests allow.
+// One tree for these tests, since making it is what takes the time. It has to be large enough that
+// the same walk on the main thread would break the limit the tests set, or they prove nothing. So
+// it's measured, and grown until it is, on however fast a machine this runs.
+const ALLOWED_GAP_MS = 300;
+const REQUIRED_SYNC_WALK_MS = ALLOWED_GAP_MS * 3;
 let sharedTree = null;
 function largeTree() {
   if (sharedTree) return sharedTree;
   sharedTree = fs.mkdtempSync(path.join(os.tmpdir(), 'sanctum-walk-large-'));
-  for (let i = 0; i < 2500; i++) fs.mkdirSync(path.join(sharedTree, `a${i % 50}`, `b${i}`), { recursive: true });
+  let folders = 0;
+  let walkMs = 0;
+  while (walkMs < REQUIRED_SYNC_WALK_MS && folders < 48000) {
+    for (const end = folders + 8000; folders < end; folders++) fs.mkdirSync(path.join(sharedTree, `a${folders % 50}`, `b${folders}`), { recursive: true });
+    const started = Date.now();
+    walkFiles(sharedTree);
+    walkMs = Date.now() - started;
+  }
+  assert.ok(walkMs >= REQUIRED_SYNC_WALK_MS, `a walk of ${folders} folders on this thread took ${walkMs} ms, too little for these tests to mean anything`);
   fs.writeFileSync(path.join(sharedTree, 'a0', 'found.txt'), 'needle');
   return sharedTree;
 }
@@ -358,7 +392,7 @@ test('the main thread stays responsive while a glob walks a large tree', async (
   const started = Date.now();
   const found = await globInWorker({ pattern: '**/*.nothing', root: dir });
   assert.deepEqual(found.matches, []);
-  assert.ok(watch.worst < 300, `the event loop stalled for ${watch.worst} ms during a ${Date.now() - started} ms walk`);
+  assert.ok(watch.worst < ALLOWED_GAP_MS, `the event loop stalled for ${watch.worst} ms during a ${Date.now() - started} ms walk`);
 });
 
 test('so does grep, which walks first as well', async (t) => {
@@ -366,7 +400,7 @@ test('so does grep, which walks first as well', async (t) => {
   const watch = watchStall(t);
   const found = await grepInWorker({ pattern: 'needle', root: dir });
   assert.equal(found.matches.length, 1);
-  assert.ok(watch.worst < 300, `the event loop stalled for ${watch.worst} ms`);
+  assert.ok(watch.worst < ALLOWED_GAP_MS, `the event loop stalled for ${watch.worst} ms`);
 });
 
 test('a walk past its time gives what it has and says so, and past its limit gives a clear error', async () => {
@@ -505,8 +539,70 @@ test('runShellCommand gives what exec gave: output, exit code, and the caps', as
   const long = await runShellCommand({ command: `"${process.execPath}" -e "${script.replace(/"/g, process.platform === 'win32' ? '""' : '\\"')}"`, cwd: os.tmpdir(), shell: SHELL_FOR_TEST, timeoutMs: 20000, env: { ...process.env } });
   assert.equal(long.stdout.length, 20000, 'what comes back is capped as before');
 
-  const big = await runShellCommand({ command: `"${process.execPath}" -e "${script.replace(/"/g, process.platform === 'win32' ? '""' : '\\"')}"`, cwd: os.tmpdir(), shell: SHELL_FOR_TEST, timeoutMs: 20000, maxBuffer: 1000 });
-  assert.equal(big.exitCode, 1, 'past the buffer it is ended, as exec did');
+});
+
+// Scripts in a temp folder, with what each does named. Everything they start ends by itself or is ended here.
+function scripts(t) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sanctum-run-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5 }));
+  return (name, source) => {
+    const file = path.join(dir, name);
+    fs.writeFileSync(file, source);
+    return `"${process.execPath}" "${file}"`;
+  };
+}
+// The shell exits and leaves this running, holding its stdout: `x &`, or cmd's `start /b`.
+const leftBehind = (command) => (process.platform === 'win32' ? `start /b "" ${command}` : `${command} &`);
+
+test('past the buffer the process is ended, not left to finish', async (t) => {
+  const write = scripts(t);
+  const command = write('over.js', `process.stdout.write('x'.repeat(100000)); setInterval(() => {}, 1000);`);
+  const started = Date.now();
+  let child = null;
+  const answer = await runShellCommand({ command, cwd: os.tmpdir(), shell: SHELL_FOR_TEST, timeoutMs: 8000, maxBuffer: 1000, onStart: (c) => { child = c; } });
+  assert.equal(answer.exitCode, 1, 'past the buffer it reads as a failure, as it did');
+  assert.equal(answer.timedOut, false, 'the buffer ended it, not the time limit');
+  assert.ok(Date.now() - started < 5000, `took ${Date.now() - started} ms`);
+  for (let i = 0; i < 40 && pidAlive(child.pid); i++) await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.equal(pidAlive(child.pid), false);
+});
+
+test('the buffer counts bytes, not characters', async (t) => {
+  const write = scripts(t);
+  // 3,000 characters and 9,000 bytes.
+  const wide = write('wide.js', `process.stdout.write('\u20ac'.repeat(3000)); setInterval(() => {}, 1000);`);
+  const over = await runShellCommand({ command: wide, cwd: os.tmpdir(), shell: SHELL_FOR_TEST, timeoutMs: 8000, maxBuffer: 6000 });
+  assert.equal(over.exitCode, 1);
+  assert.equal(over.timedOut, false);
+
+  const fits = write('fits.js', `process.stdout.write('\u20ac'.repeat(1000));`);
+  const under = await runShellCommand({ command: fits, cwd: os.tmpdir(), shell: SHELL_FOR_TEST, timeoutMs: 8000, maxBuffer: 6000 });
+  assert.equal(under.exitCode, 0);
+  assert.equal(under.stdout.trim().length, 1000);
+});
+
+test('a grandchild flooding output after its shell has exited can\'t hold up the answer past the buffer', async (t) => {
+  const write = scripts(t);
+  const command = leftBehind(write('flood.js', `const end = Date.now() + 3000; const s = 'f'.repeat(65536); const go = () => { if (Date.now() < end) process.stdout.write(s, go); else process.exit(0); }; go();`));
+  const started = Date.now();
+  const answer = await runShellCommand({ command, cwd: os.tmpdir(), shell: SHELL_FOR_TEST, timeoutMs: 30000, maxBuffer: 1000 });
+  assert.ok(Date.now() - started < 2000, `took ${Date.now() - started} ms`);
+  assert.equal(answer.exitCode, 1);
+});
+
+test('a grandchild holding output open after its shell has exited can\'t hold up the answer past the time limit', async (t) => {
+  const write = scripts(t);
+  const command = leftBehind(write('holds.js', `setTimeout(() => process.exit(0), 3000);`));
+  const started = Date.now();
+  const answer = await runShellCommand({ command, cwd: os.tmpdir(), shell: SHELL_FOR_TEST, timeoutMs: 500 });
+  assert.ok(Date.now() - started < 2000, `took ${Date.now() - started} ms`);
+  assert.equal(answer.timedOut, true);
+});
+
+test('nothing injected can reach a real process kill', () => {
+  assert.equal(runShellCommand.length, 1);
+  const source = fs.readFileSync(path.join(__dirname, '..', 'lib', 'kill-tree.js'), 'utf8');
+  assert.ok(!source.includes('spawnOptions'), 'a spawn that can be faked beside a kill that can\'t');
 });
 
 test('runShellCommand has a time limit, which ends the process', async () => {
@@ -518,4 +614,30 @@ test('runShellCommand has a time limit, which ends the process', async () => {
   assert.equal(answer.timedOut, true);
   assert.equal(started.length, 1);
   assert.equal(pidAlive(started[0].pid), false);
+});
+
+const { McpClient } = lib('mcp-client.js');
+
+test('stopping an MCP client that ignores its stdin closing has ended it by the time it settles', async (t) => {
+  const write = scripts(t);
+  const server = write('stub-server.js', `
+    const fs = require('fs');
+    const say = (m) => process.stdout.write(JSON.stringify(m) + '\\n');
+    require('readline').createInterface({ input: process.stdin }).on('line', (line) => {
+      const m = JSON.parse(line);
+      if (m.method === 'initialize') say({ jsonrpc: '2.0', id: m.id, result: { serverInfo: { pid: process.pid } } });
+      else if (m.method === 'tools/list') say({ jsonrpc: '2.0', id: m.id, result: { tools: [] } });
+    });
+    setInterval(() => {}, 1000);
+  `);
+  const file = server.split('" "')[1].slice(0, -1);
+  const client = new McpClient({ name: 'stub', command: process.execPath, args: [file], env: {} });
+  await client.start();
+  const pid = client.serverInfo.pid;
+  assert.equal(pidAlive(pid), true);
+  const stopped = client.stop();
+  assert.ok(stopped instanceof Promise);
+  await stopped;
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(pidAlive(pid), false, 'it was still running when stop() settled');
 });

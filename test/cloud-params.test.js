@@ -7,7 +7,9 @@ const {
   anthropicUsesFallbacks,
   geminiThinkingConfig: g,
   addImagesToAnthropic,
-  addImagesToGemini
+  addImagesToGemini,
+  toAnthropicTools,
+  toGeminiTools
 } = require(path.join(__dirname, '..', 'lib', 'cloud-params.js'));
 
 const catalog = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'models.json'), 'utf8'));
@@ -117,4 +119,19 @@ test('no images leaves the request unchanged', () => {
   const messages = [{ role: 'user', content: 'x' }];
   addImagesToAnthropic(messages, undefined);
   assert.strictEqual(messages[0].content, 'x');
+});
+
+test('tool lists go to each provider in its own shape', () => {
+  const tool = (parameters) => ({ type: 'function', function: { name: 't', description: 'd', parameters } });
+  const schema = { type: 'object', $schema: 'x', additionalProperties: false, properties: { a: { type: 'array', items: { type: 'object', additionalProperties: true, $schema: 'y', properties: {} } } } };
+
+  const [{ functionDeclarations: [gemini] }] = toGeminiTools([tool(schema), null, {}]);
+  assert.deepEqual(gemini, { name: 't', description: 'd', parameters: { type: 'object', properties: { a: { type: 'array', items: { type: 'object', properties: {} } } } } }, 'what Gemini rejects is gone, at every depth');
+  assert.deepEqual(toGeminiTools([tool(undefined)])[0].functionDeclarations[0].parameters, { type: 'object', properties: {} });
+  assert.equal(toGeminiTools([]), undefined);
+  assert.equal(toGeminiTools(null), undefined);
+
+  assert.deepEqual(toAnthropicTools([tool(schema), null]), [{ name: 't', description: 'd', input_schema: schema }]);
+  assert.deepEqual(toAnthropicTools([tool(undefined)])[0].input_schema, { type: 'object', properties: {} });
+  assert.equal(toAnthropicTools([]), undefined);
 });

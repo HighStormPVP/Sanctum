@@ -228,6 +228,8 @@ test('tools on a laptop', async (t) => {
     assert.ok(prompt.includes(`"${LAPTOP}"`));
     assert.match(prompt, /Bash|Cmd/);
     assert.ok(prompt.includes(posix(laptopDir)) || prompt.includes(laptopDir), 'each device\'s folder is listed');
+    assert.ok(!/nothing has run/.test(prompt), 'an offline error mid-call can follow something that did run');
+    assert.match(prompt, /may have partly run/);
     first.say('Hello.');
     first.finish();
     await stopped(id);
@@ -1239,6 +1241,64 @@ test('tools on a laptop', async (t) => {
     assert.deepEqual(await laptop.remote('setControlAllowed', true), { ok: true });
     await homeHearsSwitch(home, laptopId, true);
   });
+
+  await t.test('a laptop swinging its count of tools left out gets told about once', async () => {
+    const before = readAudit(home, 'agent-audit.log').filter((e) => e.kind === 'mcp-tools-left-out').length;
+    await home.page.evaluate(() => { remoteTools.toldLeftOut.clear(); document.querySelector('#toast-host').replaceChildren(); });
+    const bad = (i) => ({ type: 'function', function: { name: `mcp__a__t${i}`, description: 'x', parameters: { type: 'string' } } });
+    await laptop.page.evaluate(async ([to, tools]) => {
+      for (let i = 0; i < 300; i++) await window.api.remote.send(to, { type: 'control-state', allowed: true, mcpTools: tools.slice(0, 1 + (i % 2)), os: 'win32', shell: 'Bash' });
+    }, [homeId, [bad(1), bad(2)]]);
+    await waitFor('them all to land', () => home.page.evaluate((d) => remoteTools.control.get(d)?.dropped === 2, laptopId), 10000);
+    await sleep(300);
+    const lines = readAudit(home, 'agent-audit.log').filter((e) => e.kind === 'mcp-tools-left-out').length - before;
+    assert.equal(lines, 1, `${lines} audit lines from 300 frames`);
+    const toasts = await home.page.evaluate(() => [...document.querySelectorAll('#toast-host .toast')].filter((el) => el.textContent.includes('left out')).length);
+    assert.equal(toasts, 1);
+    await laptop.page.evaluate(() => sendControlStateToHomes());
+    await waitFor('the honest list back', () => home.page.evaluate((d) => remoteTools.control.get(d)?.dropped === 0, laptopId), 5000);
+  });
+
+  await t.test('a tool main knows and the page does not yet still gets an ended line, and an answer', async () => {
+    const saved = await laptop.page.evaluate(() => { const tools = state.mcpTools; state.mcpTools = []; return tools.length; });
+    assert.equal(saved, 2);
+    const answer = await forgeCall(home, laptopId, { name: 'mcp__stub__echo', args: { text: 'x' } });
+    assert.equal(answer.ok, false);
+    const lines = readAudit(laptop).filter((e) => e.call === answer.id);
+    assert.deepEqual(lines.map((e) => e.event), ['started', 'ended'], JSON.stringify(lines));
+    assert.equal(lines[1].ok, false);
+    assert.ok(lines[1].reason);
+    await laptop.page.evaluate(async () => { state.mcpTools = await window.api.mcp.getTools(); });
+  });
+
+  const STUBBORN_MCP = (pidFile) => `
+    const fs = require('fs');
+    fs.writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));
+    const say = (m) => process.stdout.write(JSON.stringify(m) + '\\n');
+    require('readline').createInterface({ input: process.stdin }).on('line', (line) => {
+      const m = JSON.parse(line);
+      if (m.method === 'initialize') say({ jsonrpc: '2.0', id: m.id, result: { protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'stubborn', version: '1' } } });
+      else if (m.method === 'tools/list') say({ jsonrpc: '2.0', id: m.id, result: { tools: [] } });
+    });
+    setInterval(() => {}, 1000); // it doesn't stop when its stdin closes
+  `;
+  for (const [what, flags] of [['a clean quit', undefined], ['a clean quit with a kill that never finishes', 'log,no-stun,hang-kill-at-quit']]) {
+    await t.test(`${what} still ends an MCP server that ignores its stdin closing`, async () => {
+      const other = await launchDevice('mcp-quit', { ollamaUrl: trio.ollama.url, ...(flags ? { flags } : {}) });
+      extras.push(other);
+      await started(other);
+      const tag = flags ? 'hung' : 'plain';
+      const file = path.join(root, `stubborn-${tag}.js`);
+      const pidFile = path.join(root, `stubborn-${tag}.pid`);
+      fs.writeFileSync(file, STUBBORN_MCP(pidFile));
+      assert.deepEqual(await other.page.evaluate((f) => window.api.mcp.add('stubborn', { command: 'node', args: [f] }).then((list) => list.map((server) => server.status)), file), ['ready']);
+      const pid = await pidIn(pidFile);
+      assert.ok(isAlive(pid));
+      other.app.evaluate(({ app }) => { app.quit(); }).catch(() => {});
+      await waitFor('it to quit', () => other.exited, 15000);
+      assert.equal(isAlive(pid), false, 'the server outlived the app');
+    });
+  }
 
   await t.test('two laptops with one name: each gets a name of its own, a call reaches only the one it names, and one can\'t answer for another', async () => {
     const twin = await launchDevice(LAPTOP, { ollamaUrl: trio.ollama.url });
