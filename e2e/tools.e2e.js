@@ -563,6 +563,8 @@ test('tools on a laptop', async (t) => {
       const first = await ollama.next();
       first.call(['run_command', { command: 'echo no > unanswered.txt', device: LAPTOP }]);
       first.finish();
+      await waitFor('the pop-up', () => visible(home, '#approval-overlay'), 5000);
+      await home.page.evaluate((chatId) => setChatShared(state.chats[chatId], false), id);
       const second = await ollama.next();
       const [result] = second.body.messages.filter((m) => m.role === 'tool').slice(-1).map((m) => JSON.parse(m.content));
       assert.match(result.error, /Nobody answered/);

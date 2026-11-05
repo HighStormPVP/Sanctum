@@ -1517,7 +1517,9 @@ test('two devices, through the interface', async (t) => {
     await appeared(laptop, '#remote-pin-overlay');
     await home.remote('send', laptopId, { type: 'queued-returned', id: 'wipe_q1', chatId: 'gone-chat', text: 'WORDS-HELD-IN-THE-LOCK' });
     await home.remote('send', laptopId, { type: 'mirror-too-large' });
-    await waitFor('them to land', () => laptop.page.evaluate(() => mirror.heldForGone.size === 1 && mirror.toastsForUnlock.length === 1), 3000);
+    await home.remote('send', laptopId, { type: 'ask', id: 'wipe_ask', kind: 'approval', chatId: sharedId, tool: 'run_command', args: { command: 'ASK-HELD-IN-THE-LOCK', cwd: '' }, device: 'Somewhere' });
+    await waitFor('them to land', () => laptop.page.evaluate(() => mirror.heldForGone.size === 1 && mirror.toastsForUnlock.length === 1 && remoteAsks.held.size === 1), 3000);
+    assert.equal(await foundIn(laptop, 'ASK-HELD-IN-THE-LOCK'), null, 'held, not shown');
     for (let attempt = 1; attempt <= 10; attempt++) {
       await waitFor(`try ${attempt} to be allowed`, () => laptop.page.evaluate(() => !document.querySelector('#remote-pin-submit').disabled), 90000);
       await fill(laptop, '#remote-pin-input', '000000');
@@ -1543,7 +1545,9 @@ test('two devices, through the interface', async (t) => {
     assert.ok((await laptop.remote('createCode')).code);
     await waitFor('the lock to lift', async () => (await status(laptop)).locked === false, 5000);
     await sleep(300);
-    for (const words of ['WORDS-HELD-IN-THE-LOCK', 'TYPED-BEFORE-THE-LOCK']) assert.equal(await foundIn(laptop, words), null);
+    for (const words of ['WORDS-HELD-IN-THE-LOCK', 'TYPED-BEFORE-THE-LOCK', 'ASK-HELD-IN-THE-LOCK']) assert.equal(await foundIn(laptop, words), null);
+    assert.equal(await laptop.page.evaluate(() => remoteAsks.held.size), 0);
+    assert.equal(await isVisible(laptop, '#approval-overlay'), false);
     assert.equal(await barGone(laptop), true);
     assert.equal(await count(laptop, '.toast'), 0);
     assert.deepEqual(await laptop.page.evaluate(() => [mirror.heldForGone.size, mirror.toastsForUnlock.length]), [0, 0]);

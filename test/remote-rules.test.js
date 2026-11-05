@@ -1176,3 +1176,145 @@ test('a line that cannot be written costs nothing but that line', () => {
   log.note({ device: 'd1', tool: 'b' });
   assert.doesNotThrow(() => clock.fire());
 });
+
+// ---- Pop-ups on every device ----
+
+const askOf = (fields = {}) => ({
+  type: 'ask', id: 'ask_1', kind: 'approval', chatId: 'c_1', tool: 'run_command',
+  args: { command: 'echo hi', cwd: 'C:/work' }, device: 'MacBook', ...fields
+});
+
+test('each kind of pop-up has its own closed set of answers, and its own way of saying no', () => {
+  const { askValueIsAllowed, askRefusal } = RemoteRules;
+  for (const kind of ['approval', 'plan']) {
+    assert.equal(askValueIsAllowed(kind, true), true, kind);
+    assert.equal(askValueIsAllowed(kind, false), true, kind);
+    assert.equal(askRefusal(kind), false, kind);
+    for (const value of ['once', 'folder', 'deny', 'true', 'yes', 1, 0, null, undefined, {}, [], [true]]) {
+      assert.equal(askValueIsAllowed(kind, value), false, `${kind}: ${JSON.stringify(value)}`);
+    }
+  }
+  for (const value of ['once', 'folder', 'deny']) assert.equal(askValueIsAllowed('path', value), true, value);
+  assert.equal(askRefusal('path'), 'deny');
+  for (const value of [true, false, 'ONCE', 'always', '', 1, null, undefined, {}, ['once']]) {
+    assert.equal(askValueIsAllowed('path', value), false, JSON.stringify(value));
+  }
+  assert.equal(askValueIsAllowed('toString', true), false, 'no kind but the three');
+  assert.equal(askValueIsAllowed('__proto__', true), false);
+});
+
+test('a pop-up goes whole, or not at all: past 64 KiB it says so and carries nothing', () => {
+  const { askFrame, MAX_ASK_BYTES } = RemoteRules;
+  assert.equal(MAX_ASK_BYTES, 64 * 1024);
+  const base = { id: 'ask_1', kind: 'approval', chatId: 'c_1', tool: 'write_file', device: 'MacBook' };
+  const small = askFrame({ ...base, args: { path: 'a.txt', content: 'x'.repeat(1000) } });
+  assert.deepEqual(small, { type: 'ask', ...base, args: { path: 'a.txt', content: 'x'.repeat(1000) } });
+  assert.equal('tooLarge' in small, false);
+
+  const big = askFrame({ ...base, args: { path: 'a.txt', content: 'x'.repeat(MAX_ASK_BYTES) } });
+  assert.deepEqual(big, { type: 'ask', ...base, args: {}, tooLarge: true });
+
+  // Bytes, not characters. Each of these is three bytes on the wire, and short by a count of letters.
+  const wide = askFrame({ ...base, args: { path: 'a.txt', content: '\u20ac'.repeat(30000) } });
+  assert.equal(wide.tooLarge, true);
+
+  // Right up to the line, by what JSON really comes to.
+  const overhead = Buffer.byteLength(JSON.stringify(askFrame({ ...base, args: { content: '' } })), 'utf8');
+  const fits = askFrame({ ...base, args: { content: 'x'.repeat(MAX_ASK_BYTES - overhead) } });
+  assert.equal(fits.tooLarge, undefined, 'exactly at the limit still goes');
+  const over = askFrame({ ...base, args: { content: 'x'.repeat(MAX_ASK_BYTES - overhead + 1) } });
+  assert.equal(over.tooLarge, true, 'one byte more does not');
+});
+
+test('a laptop takes a pop-up only in exactly the shape a home PC sends', () => {
+  const { cleanAsk, MAX_ASK_BYTES } = RemoteRules;
+  assert.deepEqual(cleanAsk(askOf()), { id: 'ask_1', kind: 'approval', chatId: 'c_1', tool: 'run_command', args: { command: 'echo hi', cwd: 'C:/work' }, device: 'MacBook', tooLarge: false });
+  assert.deepEqual(cleanAsk(askOf({ kind: 'plan', tool: 'exit_plan_mode', args: { plan: 'Do it.' } })).args, { plan: 'Do it.' });
+  assert.deepEqual(cleanAsk(askOf({ kind: 'path', tool: 'read_file', args: { path: 'C:/x', folder: '' } })).args, { path: 'C:/x', folder: '' });
+  assert.equal(cleanAsk(askOf({ args: {}, tooLarge: true })).tooLarge, true);
+  assert.deepEqual(cleanAsk(askOf({ tool: 'mcp__a__b', args: { anything: [1, { two: 2 }] } })).args, { anything: [1, { two: 2 }] });
+
+  const refused = {
+    'not an object': null,
+    'a list': [],
+    'another type': askOf({ type: 'answer' }),
+    'a String object for a type': askOf({ type: new String('ask') }), // eslint-disable-line no-new-wrappers
+    'an unknown field': askOf({ extra: 1 }),
+    'no id': askOf({ id: undefined }),
+    'an id with other characters': askOf({ id: 'a:b' }),
+    'a long id': askOf({ id: 'x'.repeat(65) }),
+    'an unknown kind': askOf({ kind: 'grant' }),
+    'a kind from the prototype': askOf({ kind: 'toString' }),
+    'no chat': askOf({ chatId: '' }),
+    'a chat that is not text': askOf({ chatId: 7 }),
+    'a long chat': askOf({ chatId: 'x'.repeat(257) }),
+    'no tool': askOf({ tool: '' }),
+    'a tool that is not text': askOf({ tool: { name: 'x' } }),
+    'a tool with a line break': askOf({ tool: 'run_command\nApproved' }),
+    'a long tool': askOf({ tool: 'x'.repeat(129) }),
+    'no device': askOf({ device: '' }),
+    'a device that is not text': askOf({ device: ['MacBook'] }),
+    'a device with a line break': askOf({ device: 'MacBook\nHome' }),
+    'a device with a hidden character': askOf({ device: 'Mac\u202eBook' }),
+    'args that are a list': askOf({ args: [] }),
+    'args that are text': askOf({ args: 'echo hi' }),
+    'args with a prototype key': askOf({ tool: 'mcp__a__b', args: JSON.parse('{"__proto__":{"x":1}}') }),
+    'a command that is not text': askOf({ args: { command: ['echo'], cwd: '' } }),
+    'a command with no folder field': askOf({ args: { command: 'echo' } }),
+    'a command with a field that will not run': askOf({ args: { command: 'echo', cwd: '', shell: 'x' } }),
+    'a write with content that is not text': askOf({ tool: 'write_file', args: { path: 'a', content: 1 } }),
+    'a plan with the wrong tool': askOf({ kind: 'plan', tool: 'run_command', args: { plan: 'x' } }),
+    'a plan that is not text': askOf({ kind: 'plan', tool: 'exit_plan_mode', args: { plan: 7 } }),
+    'a plan with more than a plan': askOf({ kind: 'plan', tool: 'exit_plan_mode', args: { plan: 'x', y: 1 } }),
+    'a path with no folder field': askOf({ kind: 'path', tool: 'read_file', args: { path: 'x' } }),
+    'a path that is not text': askOf({ kind: 'path', tool: 'read_file', args: { path: 1, folder: '' } }),
+    'too large, but carrying something': askOf({ tooLarge: true }),
+    'tooLarge that is not exactly true': askOf({ args: {}, tooLarge: 1 }),
+    'tooLarge false': askOf({ tooLarge: false }),
+    'over the size': askOf({ args: { command: 'x'.repeat(MAX_ASK_BYTES), cwd: '' } })
+  };
+  for (const [what, frame] of Object.entries(refused)) assert.equal(cleanAsk(frame), null, what);
+});
+
+test('what a laptop keeps of a pop-up holds nothing but its named fields', () => {
+  const { cleanAsk } = RemoteRules;
+  assert.deepEqual(Object.keys(cleanAsk(askOf())).sort(), ['args', 'chatId', 'device', 'id', 'kind', 'tooLarge', 'tool']);
+});
+
+test('home takes an answer only from a connected laptop it asked, for a question still open on a shared chat', () => {
+  const { checkAnswer } = RemoteRules;
+  const frame = { type: 'answer', id: 'ask_1', value: true };
+  const fine = { role: 'laptop', connected: true, open: { kind: 'approval', tooLarge: false }, asked: true, shared: true };
+  assert.equal(checkAnswer(frame, fine), null);
+  assert.equal(checkAnswer({ ...frame, value: false }, fine), null);
+  assert.equal(checkAnswer({ type: 'answer', id: 'ask_1', value: 'once' }, { ...fine, open: { kind: 'path', tooLarge: false } }), null);
+  assert.equal(checkAnswer({ type: 'answer', id: 'ask_1', value: 'folder' }, { ...fine, open: { kind: 'path', tooLarge: false } }), null);
+  assert.equal(checkAnswer({ type: 'answer', id: 'ask_1', value: true }, { ...fine, open: { kind: 'plan', tooLarge: false } }), null);
+
+  const dropped = [
+    ['a home PC of this one', frame, { ...fine, role: 'home' }],
+    ['a device with no role', frame, { ...fine, role: undefined }],
+    ['a device not connected', frame, { ...fine, connected: false }],
+    ['a device told nothing of it', frame, { ...fine, asked: false }],
+    ['a question not open', frame, { ...fine, open: null }],
+    ['a chat not shared', frame, { ...fine, shared: false }],
+    ['a String object for a type', { ...frame, type: new String('answer') }, fine], // eslint-disable-line no-new-wrappers
+    ['an unknown field', { ...frame, chatId: 'c_1' }, fine],
+    ['an id that is not text', { ...frame, id: 7 }, fine],
+    ['a word for yes', { ...frame, value: 'yes' }, fine],
+    ['a path answer to an approval', { ...frame, value: 'once' }, fine],
+    ['an approval answer to a path', frame, { ...fine, open: { kind: 'path', tooLarge: false } }],
+    ['no value', { type: 'answer', id: 'ask_1' }, fine],
+    ['yes to what could not be shown', frame, { ...fine, open: { kind: 'approval', tooLarge: true } }],
+    ['once to what could not be shown', { ...frame, value: 'once' }, { ...fine, open: { kind: 'path', tooLarge: true } }],
+    ['folder to what could not be shown', { ...frame, value: 'folder' }, { ...fine, open: { kind: 'path', tooLarge: true } }]
+  ];
+  for (const [what, answer, facts] of dropped) {
+    const reason = checkAnswer(answer, facts);
+    assert.equal(typeof reason, 'string', what);
+    assert.ok(reason.length > 0 && reason.length < 100, `${what}: a short reason of its own, nothing from the frame`);
+    assert.ok(!reason.includes('ask_1'), what);
+  }
+  assert.equal(checkAnswer({ ...frame, value: false }, { ...fine, open: { kind: 'approval', tooLarge: true } }), null, 'no is always something it can say');
+  assert.equal(checkAnswer({ ...frame, value: 'deny' }, { ...fine, open: { kind: 'path', tooLarge: true } }), null);
+});

@@ -375,6 +375,7 @@ function setActive(id) {
 function deleteChat(id) {
   if (state.chats[id]?.remote) { askHome(state.chats[id], 'delete'); return; } // it's the home PC's to delete
   if (state.runningChats.has(id)) stopChat(id);
+  endAsksOfChat(id);
   delete state.chats[id];
   state.order = state.order.filter(x => x !== id);
   if (state.activeId === id) {
@@ -5652,7 +5653,7 @@ function stopChat(chatId) {
   const run = state.runningChats.get(chatId);
   if (!run) return;
   run.abortRequested = true;
-  run.endAsk?.();
+  endAsksOfChat(chatId);
   cancelToolCallsOfChat(chatId);
   // Reflect the stop in the UI IMMEDIATELY so the user gets instant feedback.
   // The actual abort cycle (fetch interrupt → server-side aborted chunk →
@@ -5892,6 +5893,7 @@ async function executeTool(name, args, c, offeredTools) {
   const deviceName = auditedDeviceName(name, args, c);
   const origin = state.runningChats.get(c?.id)?.startedBy ?? undefined;
   const res = await executeToolImpl(name, args, c, offeredTools);
+  const answeredBy = takeAskAnswers(c);
   try {
     await window.api.audit.log({
       ts: startedAt,
@@ -5900,6 +5902,7 @@ async function executeTool(name, args, c, offeredTools) {
       tool: name,
       device: deviceName,
       origin,
+      answeredBy,
       args,
       ok: !!res.ok,
       summary: res.summary,
@@ -5956,7 +5959,7 @@ async function executeToolImpl(name, args, c, offeredTools) {
     const approved = await requestPlanApproval(planText, c);
     if (!approved) {
       await window.api.audit.log({ ts: new Date().toISOString(), chat: c.id, model: c.model, tool: name, args: { planLen: planText.length }, status: 'plan-rejected', ok: false });
-      if (askWasUnanswered(c)) return toolError("Nobody answered at the home PC, so the plan wasn't approved. Stay in Plan Mode.", 'no answer');
+      if (askWasUnanswered(c)) return toolError("Nobody answered, at the home PC or on any connected device, so the plan wasn't approved. Stay in Plan Mode.", 'no answer');
       return { result: { error: 'rejected by user — refine the plan and call exit_plan_mode again when ready.' }, summary: 'rejected', ok: false };
     }
     // Flip the chat into Approval Mode. Plan/Approval/NoApproval are mutex,
@@ -5997,20 +6000,28 @@ async function executeToolImpl(name, args, c, offeredTools) {
   if (skipAllApprovals) {
     approvalDecision = 'no-approval-mode';
   } else if (!skipApproval && (alwaysGated || forceApproval) && name !== 'calc') {
-    const ok = await requestApproval(name, args, c, target.named);
+    const willRun = whatWillRun(name, args, c, target.device.id);
+    const ok = await requestApproval(name, willRun, c, askMachine(target, c));
     approvalDecision = ok ? 'approved' : 'denied';
     if (!ok) {
       await window.api.audit.log({ ts: new Date().toISOString(), chat: c?.id, model: c?.model, tool: name, args, status: 'denied', ok: false });
-      if (askWasUnanswered(c)) return toolError("Nobody answered the approval at the home PC, so this didn't run.", 'no answer');
+      if (askWasUnanswered(c)) return toolError("Nobody answered the approval, at the home PC or on any connected device, so this didn't run.", 'no answer');
       return { result: { error: 'denied by user' }, summary: 'denied', ok: false };
     }
     // The chat may have been stopped or deleted while the pop-up was open.
     if (c && !state.chats[c.id]) return { result: { error: 'this chat was deleted' }, summary: 'stopped', ok: false };
     if (c && state.runningChats.get(c.id)?.abortRequested) return { result: { error: 'stopped by user' }, summary: 'stopped', ok: false };
+    // What was approved is what was on the pop-up. Anything that has moved since, such as the chat's
+    // folder, would make this something else.
+    if (JSON.stringify(whatWillRun(name, args, c, target.device.id)) !== JSON.stringify(willRun)) {
+      return toolError("What that would do changed while it was waiting for an answer, so it didn't run. Ask again if it's still wanted.", 'changed');
+    }
   } else if (!skipApproval) {
     approvalDecision = 'auto-allow';
   }
 
+  const machine = askMachine(target, c);
+  const text = (key) => toStringArg(args?.[key]);
   try {
     if (target.remote) return await runToolOnDevice(name, args, c, target);
     if (name === 'web_search') {
@@ -6039,31 +6050,31 @@ async function executeToolImpl(name, args, c, offeredTools) {
     }
     const allow = c?.pathAllowlist || [];
     if (name === 'read_file') {
-      const res = await runWithPathExpansion(name, args, allow, (a) => window.api.fs.readFile(args.path || '', a), c, target.named);
+      const res = await runWithPathExpansion(name, args, allow, (a) => window.api.fs.readFile(text('path'), a), c, machine);
       if (res.error) return { result: { error: res.error }, summary: 'failed', ok: false };
       return { result: { path: res.path, content: res.content }, summary: `${(res.size / 1024).toFixed(1)} KB`, ok: true };
     }
     if (name === 'list_dir') {
-      const res = await runWithPathExpansion(name, args, allow, (a) => window.api.fs.listDir(args.path || '', a), c, target.named);
+      const res = await runWithPathExpansion(name, args, allow, (a) => window.api.fs.listDir(text('path'), a), c, machine);
       if (res.error) return { result: { error: res.error }, summary: 'failed', ok: false };
       const n = (res.entries || []).length;
       return { result: { path: res.path, entries: res.entries }, summary: `${n} item${n === 1 ? '' : 's'}`, ok: true };
     }
     if (name === 'write_file') {
-      const res = await runWithPathExpansion(name, args, allow, (a) => window.api.fs.writeFile(args.path || '', args.content || '', a), c, target.named);
+      const res = await runWithPathExpansion(name, args, allow, (a) => window.api.fs.writeFile(text('path'), text('content'), a), c, machine);
       if (res.error) return { result: { error: res.error }, summary: 'failed', ok: false };
       return { result: { path: res.path, bytes: res.bytes }, summary: `${res.bytes} B written`, ok: true };
     }
     if (name === 'apply_patch') {
-      const res = await runWithPathExpansion(name, args, allow, (a) => window.api.fs.applyPatch(args.path || '', args.find || '', args.replace ?? '', a), c, target.named);
+      const res = await runWithPathExpansion(name, args, allow, (a) => window.api.fs.applyPatch(text('path'), text('find'), text('replace'), a), c, machine);
       if (res.error) return { result: { error: res.error }, summary: 'failed', ok: false };
       return { result: { path: res.path, before_lines: res.before_lines, after_lines: res.after_lines }, summary: 'patched', ok: true };
     }
     if (name === 'run_command') {
       // Default cwd to the project folder when the agent didn't specify one —
       // saves the model from having to remember to set it on every call.
-      const effectiveCwd = args.cwd || c?.projectFolder || undefined;
-      const res = await window.api.shell.run(args.command || '', effectiveCwd);
+      const effectiveCwd = text('cwd') || c?.projectFolder || undefined;
+      const res = await window.api.shell.run(text('command'), effectiveCwd);
       const summary = res.timedOut ? 'timeout' : (res.exitCode === 0 ? `exit 0 · ${res.stdout.length} B` : `exit ${res.exitCode}`);
       return { result: res, summary, ok: res.exitCode === 0 };
     }
@@ -6092,8 +6103,8 @@ async function executeToolImpl(name, args, c, offeredTools) {
       return walkResult({ matches: res.matches }, res, n);
     }
     if (name === 'run_command_async') {
-      const effectiveCwd = args.cwd || c?.projectFolder || undefined;
-      const res = await window.api.shell.runAsync(args.command || '', effectiveCwd, allow);
+      const effectiveCwd = text('cwd') || c?.projectFolder || undefined;
+      const res = await window.api.shell.runAsync(text('command'), effectiveCwd, allow);
       if (res.error) return { result: { error: res.error }, summary: 'failed', ok: false };
       return { result: { task_id: res.taskId, command: res.command, cwd: res.cwd, message: `Started in background as ${res.taskId}. Use task_status to check on it.` }, summary: `${res.taskId} started`, ok: true };
     }
@@ -6187,43 +6198,24 @@ function queueModal(show) {
 // instead of dead-ending the agent, ask the user whether to grant access:
 // once, for-the-whole-folder, or deny. Returns one of 'once' | 'folder' | 'deny'.
 function requestPathExpansion(toolName, requestedPath, c, device = null) {
-  return queueModal(() => new Promise((resolve) => {
-    const overlay = $('#path-expand-overlay');
-    if (!overlay || askIsOver(c)) return resolve('deny');
-    $('#pe-tool-name').textContent = toolName;
-    $('#pe-requested-path').textContent = requestedPath || '(unknown)';
-    $('#pe-current-folder').textContent = folderOn(c, device?.id ?? RemoteRules.HOME_DEVICE) || '(none — no project folder set)';
-    $('#pe-device-row').hidden = !device;
-    $('#pe-device').textContent = device ? device.name : '';
-    overlay.hidden = false;
+  const folder = folderOn(c, device?.id ?? RemoteRules.HOME_DEVICE) || '';
+  const args = { path: requestedPath, folder };
+  return openAsk({ kind: 'path', c, tool: toolName, args, device, paint: () => paintPathAsk({ tool: toolName, args, machine: device?.name }) });
+}
 
-    let done = false;
-    const stopWaiting = askCanEnd(c, () => cleanup('deny'));
-    const cleanup = (decision) => {
-      if (done) return;
-      done = true;
-      stopWaiting();
-      overlay.hidden = true;
-      $('#pe-deny').removeEventListener('click', onDeny);
-      $('#pe-once').removeEventListener('click', onOnce);
-      $('#pe-folder').removeEventListener('click', onFolder);
-      overlay.removeEventListener('click', onBackdrop);
-      document.removeEventListener('keydown', onKey);
-      resolve(decision);
-    };
-    const onDeny     = () => cleanup('deny');
-    const onOnce     = () => cleanup('once');
-    const onFolder   = () => cleanup('folder');
-    const onBackdrop = (e) => { if (e.target === overlay) cleanup('deny'); };
-    const onKey      = (e) => { if (e.key === 'Escape') cleanup('deny'); };
+const PATH_ASK_WORDS = "The agent wants to read or write a path that's outside this chat's project folder.";
 
-    $('#pe-deny').addEventListener('click', onDeny);
-    $('#pe-once').addEventListener('click', onOnce);
-    $('#pe-folder').addEventListener('click', onFolder);
-    overlay.addEventListener('click', onBackdrop);
-    document.addEventListener('keydown', onKey);
-    $('#pe-deny').focus();
-  }));
+function paintPathAsk({ tool, args, machine, from = '', tooLarge = false }) {
+  $('#pe-desc').textContent = from + PATH_ASK_WORDS;
+  $('#pe-too-long').hidden = !tooLarge;
+  $('#pe-too-long p').textContent = ASK_TOO_LONG;
+  $('#pe-path-row').hidden = tooLarge;
+  $('#pe-folder-row').hidden = tooLarge;
+  $('#pe-tool-name').textContent = tool;
+  $('#pe-requested-path').textContent = args.path || '(unknown)';
+  $('#pe-current-folder').textContent = args.folder || '(none — no project folder set)';
+  $('#pe-device-row').hidden = !machine;
+  $('#pe-device').textContent = machine || '';
 }
 
 // Wraps a file-tool IPC call. If the first try fails because the path is
@@ -6278,101 +6270,69 @@ async function runWithPathExpansion(toolName, args, allow, runFn, c, device = nu
 // true on Approve, false on Reject / Escape / overlay click. The plan text is
 // rendered as markdown so numbered lists and inline code look right.
 function requestPlanApproval(planText, c) {
-  return queueModal(() => new Promise((resolve) => {
-    const overlay  = $('#plan-approval-overlay');
-    const bodyEl   = $('#plan-approval-body');
-    const approve  = $('#plan-approval-approve');
-    const deny     = $('#plan-approval-deny');
-    if (!overlay || !bodyEl || !approve || !deny || askIsOver(c)) { resolve(false); return; }
+  return openAsk({
+    kind: 'plan', c, tool: 'exit_plan_mode', args: { plan: planText },
+    paint: () => {
+      $('#plan-approval-desc').textContent = PLAN_ASK_WORDS;
+      $('#plan-approval-body').innerHTML = renderMarkdown(planText);
+    }
+  });
+}
 
-    bodyEl.innerHTML = renderMarkdown(planText);
-    overlay.hidden = false;
+const PLAN_ASK_WORDS = 'The agent is proposing this plan. On Approve the chat flips to Approval Mode and execution begins — every write still pops a per-call approval. On Reject the agent stays in Plan Mode and refines.';
 
-    let done = false;
-    const stopWaiting = askCanEnd(c, () => cleanup(false));
-    const cleanup = (result) => {
-      if (done) return;
-      done = true;
-      stopWaiting();
-      overlay.hidden = true;
-      approve.removeEventListener('click', onYes);
-      deny.removeEventListener('click', onNo);
-      document.removeEventListener('keydown', onKey);
-      overlay.removeEventListener('click', onOverlay);
-      resolve(result);
-    };
-    const onYes = () => cleanup(true);
-    const onNo  = () => cleanup(false);
-    const onKey = (e) => { if (e.key === 'Escape') cleanup(false); };
-    const onOverlay = (e) => { if (e.target === overlay) cleanup(false); };
+// On another device. The words are a home PC's, so they stay words: no markdown can make part of a
+// plan look like something else, or leave part of it out.
+function paintPlanAskFromHome({ args, machine, from, tooLarge }) {
+  $('#plan-approval-desc').textContent = from + PLAN_ASK_WORDS;
+  const body = $('#plan-approval-body');
+  body.textContent = '';
+  body.append(askRow('Machine', machine));
+  body.append(tooLarge ? askTooLongRow() : askRow('Plan', args.plan));
+}
 
-    approve.addEventListener('click', onYes);
-    deny.addEventListener('click', onNo);
-    document.addEventListener('keydown', onKey);
-    overlay.addEventListener('click', onOverlay);
-    deny.focus();
-  }));
+function askRow(label, text) {
+  const row = remoteEl('section', 'approval-section');
+  row.append(remoteEl('div', 'approval-label', label), remoteEl('pre', 'approval-code', text));
+  return row;
+}
+
+function askTooLongRow() {
+  const row = remoteEl('section', 'approval-section');
+  row.append(remoteEl('p', 'ask-too-long', ASK_TOO_LONG));
+  return row;
 }
 
 // ============== APPROVAL MODAL ==============
+// `args` is what the tool will really do: see whatWillRun.
 function requestApproval(toolName, args, c, device = null) {
-  return queueModal(() => new Promise((resolve) => {
-    // Stopped or deleted while waiting its turn: nothing left to ask about.
-    if (c && (!state.chats[c.id] || state.runningChats.get(c.id)?.abortRequested)) return resolve(false);
-    const overlay  = $('#approval-overlay');
-    const nameEl   = $('#approval-name');
-    const descEl   = $('#approval-desc');
-    const bodyEl   = $('#approval-body');
-    const approve  = $('#approval-approve');
-    const deny     = $('#approval-deny');
-
-    const presets = {
-      write_file:     { label: 'write_file',     desc: 'The model wants to overwrite a file on your disk.' },
-      apply_patch:    { label: 'apply_patch',    desc: 'The model wants to edit a file in-place.' },
-      run_command:    { label: 'run_command',    desc: 'The model wants to run a shell command on your machine.' },
-      web_search:     { label: 'web_search',     desc: 'The model wants to search the public web.' },
-      web_fetch:      { label: 'web_fetch',      desc: 'The model wants to fetch a URL.' },
-      read_file:      { label: 'read_file',      desc: 'The model wants to read a file from disk.' },
-      list_dir:       { label: 'list_dir',       desc: 'The model wants to list a directory.' }
-    };
-    const preset = presets[toolName] || { label: toolName, desc: 'The model wants to perform an action.' };
-
-    nameEl.textContent = preset.label;
+  return openAsk({
+    kind: 'approval', c, tool: toolName, args, device,
     // With agents running in several chats, say which one is asking.
-    const desc = device ? preset.desc.replace(/on your (machine|disk)/, () => `on ${device.name}`) : preset.desc;
-    descEl.textContent = (c && c.id !== state.activeId)
-      ? `From the chat "${c.title || 'New chat'}". ${desc}`
-      : desc;
-    const machine = device
-      ? `<section class="approval-section"><div class="approval-label">Machine</div><pre class="approval-code" id="approval-device">${escapeHtml(device.name)}</pre></section>`
-      : '';
-    bodyEl.innerHTML = machine + renderApprovalBody(toolName, args);
-    overlay.hidden = false;
+    paint: () => paintApprovalAsk({ tool: toolName, args, machine: device?.name, from: c && c.id !== state.activeId ? `From the chat "${c.title || 'New chat'}". ` : '' })
+  });
+}
 
-    let done = false;
-    const stopWaiting = askCanEnd(c, () => cleanup(false));
-    const cleanup = (result) => {
-      if (done) return;
-      done = true;
-      stopWaiting();
-      overlay.hidden = true;
-      approve.removeEventListener('click', onYes);
-      deny.removeEventListener('click', onNo);
-      document.removeEventListener('keydown', onKey);
-      overlay.removeEventListener('click', onOverlay);
-      resolve(result);
-    };
-    const onYes = () => cleanup(true);
-    const onNo  = () => cleanup(false);
-    const onKey = (e) => { if (e.key === 'Escape') cleanup(false); };
-    const onOverlay = (e) => { if (e.target === overlay) cleanup(false); };
+const APPROVAL_ASK_WORDS = {
+  write_file:  'The model wants to overwrite a file on your disk.',
+  apply_patch: 'The model wants to edit a file in-place.',
+  run_command: 'The model wants to run a shell command on your machine.',
+  run_command_async: 'The model wants to start a shell command in the background on your machine.',
+  web_search:  'The model wants to search the public web.',
+  web_fetch:   'The model wants to fetch a URL.',
+  read_file:   'The model wants to read a file from disk.',
+  list_dir:    'The model wants to list a directory.'
+};
 
-    approve.addEventListener('click', onYes);
-    deny.addEventListener('click', onNo);
-    document.addEventListener('keydown', onKey);
-    overlay.addEventListener('click', onOverlay);
-    deny.focus();
-  }));
+function paintApprovalAsk({ tool, args, machine, from = '', tooLarge = false }) {
+  $('#approval-name').textContent = tool;
+  const words = Object.hasOwn(APPROVAL_ASK_WORDS, tool) ? APPROVAL_ASK_WORDS[tool] : 'The model wants to perform an action.';
+  const desc = machine ? words.replace(/on your (machine|disk)/, () => `on ${machine}`) : words;
+  $('#approval-desc').textContent = from + desc;
+  const named = machine
+    ? `<section class="approval-section"><div class="approval-label">Machine</div><pre class="approval-code" id="approval-device">${escapeHtml(machine)}</pre></section>`
+    : '';
+  $('#approval-body').innerHTML = named + (tooLarge ? `<section class="approval-section"><p class="ask-too-long">${escapeHtml(ASK_TOO_LONG)}</p></section>` : renderApprovalBody(tool, args));
 }
 
 function renderApprovalBody(toolName, args) {
@@ -6389,17 +6349,14 @@ function renderApprovalBody(toolName, args) {
     `;
   }
   if (toolName === 'write_file') {
-    const c = String(args.content ?? '');
-    const truncated = c.length > 4000;
-    const preview = truncated ? c.slice(0, 4000) : c;
     return `
       <section class="approval-section">
         <div class="approval-label">Path</div>
         <pre class="approval-code">${escapeHtml(args.path || '')}</pre>
       </section>
       <section class="approval-section">
-        <div class="approval-label">New content${truncated ? ' (first 4 KB shown)' : ''}</div>
-        <pre class="approval-code">${escapeHtml(preview)}</pre>
+        <div class="approval-label">New content</div>
+        <pre class="approval-code">${escapeHtml(args.content ?? '')}</pre>
       </section>
     `;
   }
@@ -7483,22 +7440,394 @@ function noteToolsLeftOut(deviceId, count) {
   remoteToast(`Some MCP tools on ${name} can't be offered here.`);
 }
 
-// ---- A pop-up nobody is there to answer ----
+// ---- Pop-ups on every device ----
+//
+// At home a pop-up is an entry in remoteAsks.open from the moment it's asked for, whether or not its
+// turn on this screen has come. It ends once, in endAsk, however that happens: the person here, a
+// laptop's answer, Stop, the chat going, or nobody being left to answer. Whatever a laptop sends is
+// treated as hostile, because an answer can make a command run.
+//
+// On a laptop it's an entry in remoteAsks.held, by home PC and id together, until that home PC says
+// it's over or can't be reached. Held isn't shown: it stays off the page while chats are hidden.
+const ASK_KEY_GUARD_MS = 800;
+const ASK_HELD_MAX = 20;
+const ASK_TOO_LONG = 'This is too long to show here. To approve it, answer on the home PC.';
+// The first choice of each is the refusal, and it's where focus starts. `words` is what's emptied
+// when it comes down, because a hidden element is still in the page, and a lock means nothing is.
+const ASK_MODALS = {
+  approval: { overlay: '#approval-overlay', choices: [['#approval-deny', false], ['#approval-approve', true]], words: ['#approval-name', '#approval-desc', '#approval-body'] },
+  plan: { overlay: '#plan-approval-overlay', choices: [['#plan-approval-deny', false], ['#plan-approval-approve', true]], words: ['#plan-approval-desc', '#plan-approval-body'] },
+  path: { overlay: '#path-expand-overlay', choices: [['#pe-deny', 'deny'], ['#pe-once', 'once'], ['#pe-folder', 'folder']], words: ['#pe-desc', '#pe-tool-name', '#pe-device', '#pe-requested-path', '#pe-current-folder'] }
+};
 
-// Stop closes a pop-up. And when a laptop started the run, there may be nobody at this machine at
-// all, so it doesn't wait forever. Task 13 shows these on the laptop too.
-function askCanEnd(c, end) {
-  const run = c ? state.runningChats.get(c.id) : null;
-  if (!run) return () => {};
-  run.endAsk = end;
-  const timer = run.startedBy ? setTimeout(() => {
-    run.askUnanswered = true;
-    end();
-  }, remoteTools.askWaitMs) : null;
-  return () => {
-    clearTimeout(timer);
-    if (run.endAsk === end) run.endAsk = null;
+const remoteAsks = {
+  keyGuardMs: ASK_KEY_GUARD_MS,
+  // At home.
+  open: new Map(),     // id -> { id, kind, chatId, refusal, frame, tooLarge, sentTo, asked, offered, timer, takeDown, turnOver, over, resolve }
+  answers: new Map(),  // chatId -> who answered for the tool call under way, for its line in the log
+  // On the laptop.
+  held: new Map(),     // `${deviceId}:${id}` -> what cleanAsk kept, and { key, deviceId, chatKey, queued, answered, takeDown, turnOver }
+  saidTooMany: new Set() // home PCs whose extra pop-ups have been mentioned
+};
+
+// Puts a pop-up on the screen, at home or on a laptop. `answer` gets the value of whichever choice
+// is made, and what comes back takes it down again.
+//
+// It can appear while someone is in the middle of typing. So for a moment Enter and Space do nothing
+// at all, and a key already held down never counts. Focus goes on the refusal, and goes back to where
+// it was afterwards.
+function wireAskModal(kind, answer, onlyRefuse = false) {
+  const { overlay: selector, choices, words } = ASK_MODALS[kind];
+  const overlay = $(selector);
+  const refusal = choices[0][1];
+  const buttons = choices.map(([button, value]) => ({ el: $(button), value, onClick: () => answer(value) }));
+  const cameFrom = document.activeElement;
+  const openedAt = Date.now();
+  const onGuard = (e) => {
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    if (e.repeat || Date.now() - openedAt < remoteAsks.keyGuardMs) {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+    }
   };
+  const onKey = (e) => { if (e.key === 'Escape') answer(refusal); };
+  const onBackdrop = (e) => { if (e.target === overlay) answer(refusal); };
+  for (const { el, value, onClick } of buttons) {
+    el.addEventListener('click', onClick);
+    el.hidden = onlyRefuse && value !== refusal;
+  }
+  for (const type of ['keydown', 'keypress', 'keyup']) document.addEventListener(type, onGuard, true);
+  document.addEventListener('keydown', onKey);
+  overlay.addEventListener('click', onBackdrop);
+  overlay.hidden = false;
+  buttons[0].el.focus();
+  return () => {
+    overlay.hidden = true;
+    for (const element of words) $(element).textContent = '';
+    for (const { el, onClick } of buttons) {
+      el.removeEventListener('click', onClick);
+      el.hidden = false;
+    }
+    for (const type of ['keydown', 'keypress', 'keyup']) document.removeEventListener(type, onGuard, true);
+    document.removeEventListener('keydown', onKey);
+    overlay.removeEventListener('click', onBackdrop);
+    // A lock has put its own screen up, and that keeps the focus.
+    if (!remoteChatsHidden() && cameFrom?.isConnected && cameFrom !== document.body) cameFrom.focus();
+  };
+}
+
+// ---- At home ----
+
+// Where a tool will really run and what with, read the way the code that runs it reads it. It's what
+// a pop-up shows, here and on every other device, so there's no summary that could say otherwise.
+function whatWillRun(name, args, c, deviceId) {
+  const text = (key) => toStringArg(args?.[key]);
+  const fields = (...keys) => Object.fromEntries(keys.map((key) => [key, text(key)]));
+  const folder = folderOn(c, deviceId) || '';
+  switch (name) {
+    case 'run_command':
+    case 'run_command_async': return { command: text('command'), cwd: text('cwd') || folder };
+    case 'write_file': return fields('path', 'content');
+    case 'apply_patch': return fields('path', 'find', 'replace');
+    case 'read_file':
+    case 'list_dir': return fields('path');
+    case 'web_search': return fields('query');
+    case 'web_fetch': return fields('url');
+    case 'glob': return { pattern: text('pattern'), root: folder || allowlistOn(c, deviceId)[0] || '' };
+    case 'grep': return { pattern: text('pattern'), root: folder || allowlistOn(c, deviceId)[0] || '', glob: text('glob'), case_insensitive: !!args?.case_insensitive };
+    case 'task_status':
+    case 'task_kill': return fields('task_id');
+    case 'task_list': return {};
+    default: return args && typeof args === 'object' ? args : {};
+  }
+}
+
+// The machine to name. With only this PC in play there's nothing to tell apart, until someone may be
+// reading it on another device, where "your machine" would mean the wrong one.
+function askMachine(target, c) {
+  return target.named || (c && sharedChatById(c.id) ? target.device : null);
+}
+
+// The one way any pop-up starts. It's asked of laptops straight away, and waits its turn on this
+// screen, so an answer from elsewhere doesn't have to wait for whatever is in front of it here.
+function openAsk({ kind, c, tool, args, device = null, paint }) {
+  const refusal = RemoteRules.askRefusal(kind);
+  if (askIsOver(c)) return Promise.resolve(refusal);
+  return new Promise((resolve) => {
+    const id = crypto.randomUUID();
+    const frame = RemoteRules.askFrame({ id, kind, chatId: c?.id ?? null, tool, args, device: device?.name ?? pairedToolDevices()[0].name });
+    const ask = {
+      id, kind, chatId: c?.id ?? null, refusal, frame, tooLarge: frame.tooLarge === true,
+      sentTo: new Set(), asked: new Set(), offered: false, timer: null, takeDown: null, turnOver: null, over: false, resolve
+    };
+    remoteAsks.open.set(id, ask);
+    queueModal(() => new Promise((turnOver) => {
+      if (ask.over) return turnOver();
+      ask.turnOver = turnOver;
+      try {
+        paint();
+        ask.takeDown = wireAskModal(kind, (value) => endAsk(ask, value, { name: 'home' }));
+      } catch (e) {
+        console.warn('A pop-up could not be drawn', e);
+        endAsk(ask, refusal);
+      }
+    }));
+    syncOpenAsks();
+  });
+}
+
+// However a pop-up ends, once. `by` is who answered, if anyone did.
+function endAsk(ask, value, by = null) {
+  if (ask.over) return;
+  ask.over = true;
+  remoteAsks.open.delete(ask.id);
+  clearTimeout(ask.timer);
+  ask.timer = null;
+  ask.takeDown?.();
+  ask.turnOver?.();
+  tellAskClosed(ask, by ? value : null);
+  if (by && ask.chatId) {
+    const list = remoteAsks.answers.get(ask.chatId) || [];
+    list.push({ kind: ask.kind, ...by });
+    remoteAsks.answers.set(ask.chatId, list);
+  }
+  ask.resolve(value);
+}
+
+function endAsksOfChat(chatId) {
+  for (const ask of [...remoteAsks.open.values()]) {
+    if (ask.chatId === chatId) endAsk(ask, ask.refusal);
+  }
+}
+
+// Who answered for the tool call that has just ended, for its line in the log.
+function takeAskAnswers(c) {
+  const list = c ? remoteAsks.answers.get(c.id) : undefined;
+  if (list) remoteAsks.answers.delete(c.id);
+  return list;
+}
+
+function connectedLaptops() {
+  return remoteDevices().filter((d) => d.role === 'laptop' && d.connected === true);
+}
+
+// A chat too large for the mirror isn't on any laptop, so there's nothing there to ask about.
+function askCanGoOut(ask) {
+  return !!sharedChatById(ask.chatId) && !mirror.tooLarge.has(ask.chatId);
+}
+
+function tellAskClosed(ask, value) {
+  if (!ask.offered) return;
+  for (const { id } of connectedLaptops()) {
+    window.api.remote.send(id, { type: 'ask-closed', id: ask.id, value }).catch(() => {});
+  }
+}
+
+// When a laptop started the run, there may be nobody at this machine at all, so it doesn't wait
+// forever. But that's only so while no laptop can answer either. The time starts again each time the
+// last one goes. Started here, someone may just be slow.
+function watchAskTimer(ask) {
+  const run = state.runningChats.get(ask.chatId);
+  const nobody = !!run?.startedBy && !(askCanGoOut(ask) && connectedLaptops().length > 0);
+  if (!nobody) {
+    clearTimeout(ask.timer);
+    ask.timer = null;
+  } else if (ask.timer === null) {
+    ask.timer = setTimeout(() => {
+      run.askUnanswered = true;
+      endAsk(ask, ask.refusal);
+    }, remoteTools.askWaitMs);
+  }
+}
+
+// Brings every open pop-up into line with who's connected and what's shared. A laptop gets one once
+// it has all of a snapshot, so the chat is there when it arrives: see finishMirrorSnapshot. Every
+// snapshot starts this over, which is what covers a laptop that reloads or reconnects, and one that
+// was already told only ignores it.
+function syncOpenAsks() {
+  for (const ask of remoteAsks.open.values()) {
+    watchAskTimer(ask);
+    if (!askCanGoOut(ask)) {
+      if (ask.sentTo.size) {
+        tellAskClosed(ask, null);
+        ask.sentTo.clear();
+        ask.asked.clear();
+      }
+      continue;
+    }
+    if (!mirror.sent.has(ask.chatId)) continue;
+    for (const [deviceId, laptop] of mirror.laptops) {
+      if (ask.sentTo.has(deviceId) || !laptop.seq || laptop.paced || mirror.needsSnapshot.has(deviceId)) continue;
+      ask.sentTo.add(deviceId);
+      ask.asked.add(deviceId);
+      ask.offered = true;
+      window.api.remote.send(deviceId, ask.frame).then((sent) => {
+        if (!sent) ask.sentTo.delete(deviceId);
+      }, () => ask.sentTo.delete(deviceId));
+    }
+  }
+}
+
+// A new snapshot means saying it again. A laptop that was told on this connection can still answer
+// while that's under way: `asked` only goes with the connection.
+function sayAsksAgainTo(deviceId) {
+  for (const ask of remoteAsks.open.values()) ask.sentTo.delete(deviceId);
+}
+
+function forgetAsksSentTo(deviceId) {
+  for (const ask of remoteAsks.open.values()) {
+    ask.sentTo.delete(deviceId);
+    ask.asked.delete(deviceId);
+  }
+}
+
+// A paired device's frame, on its way to running a command. Everything but a good answer stops here
+// and is written down, in the log that a device can't fill: see createRefusalLog.
+function answerFromDevice(deviceId, frame) {
+  const device = remoteDevices().find((d) => d.id === deviceId);
+  const ask = typeof frame.id === 'string' ? remoteAsks.open.get(frame.id) : undefined;
+  const problem = RemoteRules.checkAnswer(frame, {
+    role: device?.role,
+    connected: device?.connected,
+    open: ask ? { kind: ask.kind, tooLarge: ask.tooLarge } : null,
+    asked: ask?.asked.has(deviceId) === true,
+    shared: !!ask && askCanGoOut(ask)
+  });
+  if (problem) {
+    window.api.remote.audit({ event: 'refused', device: deviceId, deviceName: device?.name, tool: 'answer', reason: problem, ok: false }).catch(() => {});
+    return;
+  }
+  const name = pairedToolDevices().find((d) => d.id === deviceId)?.name || device.name;
+  if (ask.takeDown) showToast(`Answered on ${name}.`);
+  endAsk(ask, frame.value, { name, device: deviceId });
+}
+
+// ---- On a laptop ----
+
+function heldAsksOf(deviceId) {
+  return [...remoteAsks.held.values()].filter((held) => held.deviceId === deviceId);
+}
+
+// Only ever a device this one treats as its home PC, and only for a chat it has sent here. One that's
+// already held stays exactly as it is, so a pop-up can't change under someone reading it.
+function acceptAsk(deviceId, frame) {
+  const ask = RemoteRules.cleanAsk(frame);
+  if (!ask) return;
+  const key = `${deviceId}:${ask.id}`;
+  const chatKey = remoteChatKey(deviceId, ask.chatId);
+  if (remoteAsks.held.has(key) || !state.chats[chatKey]) return;
+  if (heldAsksOf(deviceId).length >= ASK_HELD_MAX) {
+    if (!remoteAsks.saidTooMany.has(deviceId)) {
+      remoteAsks.saidTooMany.add(deviceId);
+      remoteToast(`Too many questions from ${remoteHomeLabel(deviceId)} at once. The rest are waiting on that PC.`);
+    }
+    return;
+  }
+  remoteAsks.held.set(key, { ...ask, key, deviceId, chatKey, queued: false, answered: false, takeDown: null, turnOver: null });
+  showHeldAsks();
+}
+
+// Everything held that isn't on its way to the screen goes in the queue, unless chats are hidden.
+function showHeldAsks() {
+  if (remoteChatsHidden()) return;
+  for (const held of remoteAsks.held.values()) {
+    if (held.queued || held.answered) continue;
+    held.queued = true;
+    queueModal(() => showHeldAsk(held));
+  }
+}
+
+function showHeldAsk(held) {
+  return new Promise((turnOver) => {
+    if (remoteAsks.held.get(held.key) !== held || held.answered || remoteChatsHidden()) {
+      held.queued = false;
+      turnOver();
+      return;
+    }
+    held.turnOver = turnOver;
+    const home = remoteHomeLabel(held.deviceId);
+    const from = `From the chat "${state.chats[held.chatKey]?.title || 'New chat'}" on ${home}. `;
+    const words = { tool: held.tool, args: held.args, machine: held.device, from, tooLarge: held.tooLarge };
+    try {
+      if (held.kind === 'approval') paintApprovalAsk(words);
+      else if (held.kind === 'plan') paintPlanAskFromHome(words);
+      else paintPathAsk(words);
+      held.takeDown = wireAskModal(held.kind, (value) => answerHeldAsk(held, value), held.tooLarge);
+    } catch (e) {
+      console.warn('A pop-up could not be drawn', e);
+      letGoOfHeldAsk(held, null);
+    }
+  });
+}
+
+// Off the screen, and its turn over. It's still held unless whoever called this has let go of it.
+function putAwayHeldAsk(held) {
+  held.queued = false;
+  held.takeDown?.();
+  held.takeDown = null;
+  held.turnOver?.();
+  held.turnOver = null;
+}
+
+// Answers go to the home PC that asked, and nowhere else. It stays held, without showing, until that
+// home PC says it's over, which is also how a late copy of it gets ignored.
+function answerHeldAsk(held, value) {
+  if (held.answered) return;
+  held.answered = true;
+  putAwayHeldAsk(held);
+  const notSent = () => {
+    if (remoteAsks.held.get(held.key) !== held) return;
+    held.answered = false;
+    showHeldAsks();
+  };
+  window.api.remote.send(held.deviceId, { type: 'answer', id: held.id, value }).then((sent) => {
+    if (!sent) notSent();
+  }, notSent);
+}
+
+// Someone reading a pop-up is told what became of it. One they never saw is nobody's business.
+function letGoOfHeldAsk(held, words) {
+  const onScreen = held.takeDown !== null;
+  remoteAsks.held.delete(held.key);
+  putAwayHeldAsk(held);
+  if (heldAsksOf(held.deviceId).length < ASK_HELD_MAX) remoteAsks.saidTooMany.delete(held.deviceId);
+  // The status that brings a lock can also be the one that ends this, before the lock has hidden it.
+  if (onScreen && words && !remoteChatsHidden()) showToast(words);
+}
+
+function askClosedWords(held, value) {
+  if (value === true || value === 'once' || value === 'folder') return held.kind === 'path' ? 'Access was allowed on another device.' : 'Approved on another device.';
+  if (value === false || value === 'deny') return held.kind === 'path' ? 'Access was denied on another device.' : 'Refused on another device.';
+  return `${remoteHomeLabel(held.deviceId)} no longer needs an answer to that question.`;
+}
+
+// Keyed by who sent it, so one home PC can't close another's.
+function closeHeldAsk(deviceId, frame) {
+  const held = typeof frame.id === 'string' ? remoteAsks.held.get(`${deviceId}:${frame.id}`) : undefined;
+  if (held) letGoOfHeldAsk(held, askClosedWords(held, frame.value));
+}
+
+function letGoOfAsksOfHome(deviceId, words) {
+  for (const held of heldAsksOf(deviceId)) letGoOfHeldAsk(held, words);
+}
+
+function letGoOfAsksOfChat(chatKey, words) {
+  for (const held of [...remoteAsks.held.values()]) {
+    if (held.chatKey === chatKey) letGoOfHeldAsk(held, words);
+  }
+}
+
+// A wipe, or removing the home PCs instead of setting a PIN.
+function discardHeldAsks() {
+  for (const held of [...remoteAsks.held.values()]) letGoOfHeldAsk(held, null);
+  remoteAsks.saidTooMany.clear();
+}
+
+// The lock has come down. Nothing is let go of, but nothing stays on the page.
+function hideHeldAsks() {
+  for (const held of remoteAsks.held.values()) {
+    if (held.takeDown) putAwayHeldAsk(held);
+  }
 }
 
 function askWasUnanswered(c) {
@@ -7680,7 +8009,7 @@ function sendControlState(deviceId) {
 // Only what fits goes, and the person whose tools they are gets told.
 function outgoingToolsNoting() {
   const { tools, dropped } = RemoteRules.outgoingMcpTools(state.mcpTools);
-  if (dropped > 0 && dropped !== remoteTools.toolsLeftOut) remoteToast(`${dropped} MCP ${dropped === 1 ? 'tool' : 'tools'} on this device ${dropped === 1 ? "doesn't" : "don't"} fit in what a home PC can be offered, so ${dropped === 1 ? 'it was' : 'they were'} left out.`);
+  if (dropped > 0 && dropped !== remoteTools.toolsLeftOut) remoteToast(`${dropped} MCP ${dropped === 1 ? 'tool' : 'tools'} on this device can't be offered to a home PC, so ${dropped === 1 ? 'it was' : 'they were'} left out.`);
   remoteTools.toolsLeftOut = dropped;
   return tools;
 }
@@ -8512,6 +8841,7 @@ function mirrorOnStatus(status) {
   paintRemoteChatButton();
   paintRemoteComposer();
   paintRemoteUi();
+  syncOpenAsks();
 }
 
 function mirrorOnFrame(deviceId, frame) {
@@ -8534,6 +8864,7 @@ function mirrorOnFrame(deviceId, frame) {
     if (role === 'laptop') handleRemoteAction(deviceId, frame);
     return;
   }
+  if (frame.type === 'answer') { answerFromDevice(deviceId, frame); return; }
   // Matched against the call that was sent to this device, so it needs no more than that.
   if (frame.type === 'tool-result') { finishToolCall(deviceId, frame); return; }
   // On a page that has just loaded the role may not be known yet, and a home PC is the one thing
@@ -8549,6 +8880,8 @@ function mirrorOnFrame(deviceId, frame) {
   // Only a device this one treats as its home PC gets to put chats here.
   if (role !== 'home') return;
   if (frame.type === 'action-result') { finishAction(deviceId, frame); return; }
+  if (frame.type === 'ask') { acceptAsk(deviceId, frame); return; }
+  if (frame.type === 'ask-closed') { closeHeldAsk(deviceId, frame); return; }
   if (frame.type === 'mirror-part-fence') { acknowledgePart(deviceId, frame); return; }
   if (frame.type === 'queued-returned') { applyQueuedReturned(deviceId, frame); return; }
   if (frame.type === 'mirror-too-large') {
@@ -8567,7 +8900,11 @@ function mirrorOnFrame(deviceId, frame) {
   if (frame.type === 'mirror-snapshot') {
     // The first a home PC sends after it has lost track of this device, whether by a reload or by
     // losing sight of it for a moment. It can't go on what it heard before.
-    if (frame.seq === 1) sendControlState(deviceId);
+    // The same goes for what it had asked: it says again what's still open, once this has landed.
+    if (frame.seq === 1) {
+      sendControlState(deviceId);
+      letGoOfAsksOfHome(deviceId, `The question from ${remoteHomeLabel(deviceId)} closed. If it still needs an answer, it will ask again.`);
+    }
     applyMirrorSnapshot(deviceId, home, frame);
     return;
   }
@@ -8672,6 +9009,7 @@ function dropLaptop(deviceId) {
   clearTimeout(mirror.laptops.get(deviceId)?.resyncTimer);
   mirror.laptops.delete(deviceId);
   mirror.needsSnapshot.delete(deviceId);
+  forgetAsksSentTo(deviceId);
   if (!mirror.laptops.size) {
     mirror.sent.clear();
     mirror.sentRunning.clear();
@@ -8776,6 +9114,7 @@ function mirrorTick() {
   if (!mirror.laptops.size) {
     mirror.dirtyAll = false;
     mirror.dirty.clear();
+    syncOpenAsks();
     return;
   }
   for (const [id, laptop] of mirror.laptops) dropStalledTransfer(id, laptop);
@@ -8809,6 +9148,7 @@ function mirrorTick() {
   }
   for (const id of mirror.needsSnapshot) sendMirrorSnapshot(id);
   mirror.needsSnapshot.clear();
+  syncOpenAsks();
 
   if ([...shared.keys()].some(id => state.runningChats.has(id))) scheduleMirrorTick(MIRROR_TICK_MS);
 }
@@ -8886,6 +9226,7 @@ function markTransferToRestart(deviceId, laptop) {
 // Numbered across laptops and connections, so a number can't come round again while a laptop
 // still remembers it.
 function startMirrorTransfer(deviceId, laptop) {
+  sayAsksAgainTo(deviceId);
   mirror.transfers += 1;
   laptop.paced = {
     transfer: mirror.transfers, parts: mirrorSnapshotParts(), next: 0, acked: 0, inFlightBytes: 0,
@@ -9000,6 +9341,7 @@ function finishMirrorSnapshot(deviceId) {
   }
   // After the snapshot, so a chat the words belong to is there for them to go back to.
   sendReturnedWords(deviceId);
+  syncOpenAsks();
 }
 
 // ---- Watching ----
@@ -9072,6 +9414,8 @@ function homeDeviceStatus(device, firstStatus) {
       if (home.connected && home.awaitingSnapshot && !home.nextPart) requestMirrorSnapshot(device.id, home);
     }, MIRROR_SNAPSHOT_GRACE_MS);
   } else {
+    // An answer couldn't land. What's still open comes back with the connection.
+    letGoOfAsksOfHome(device.id, `The connection to ${device.name} dropped, so its question closed. If it still needs an answer, it will ask again.`);
     // Nothing can say a reply has ended now, and Stop can't reach it. What's on screen stays
     // exactly as it was until a snapshot says otherwise, but it stops moving: see style.css.
     for (const c of remoteChatsOf(device.id)) state.runningChats.delete(c.id);
@@ -9084,6 +9428,7 @@ function homeDeviceStatus(device, firstStatus) {
 }
 
 function forgetHome(deviceId) {
+  letGoOfAsksOfHome(deviceId, 'This device is no longer paired with that home PC, so its question closed.');
   for (const c of remoteChatsOf(deviceId)) dropRemoteChat(c.id);
   clearTimeout(mirror.homes.get(deviceId)?.snapshotTimer);
   mirror.homes.delete(deviceId);
@@ -9215,6 +9560,7 @@ function applyMirrorRun(key, running) {
 function dropRemoteChat(key) {
   const c = state.chats[key];
   if (!c) return;
+  letGoOfAsksOfChat(key, 'That question closed, because its chat is no longer shared.');
   delete state.chats[key];
   state.order = state.order.filter(id => id !== key);
   state.runningChats.delete(key);
@@ -9262,6 +9608,7 @@ function reflectRemoteLock() {
   if (hidden === mirror.hidden) return;
   mirror.hidden = hidden;
   if (hidden) {
+    hideHeldAsks();
     const c = currentChat();
     if (c?.remote) {
       mirror.resumeId = state.activeId;
@@ -9283,11 +9630,13 @@ function reflectRemoteLock() {
     else renderChatList();
     if (mirror.awaited) openIfAwaited(mirror.awaited.key);
     for (const text of mirror.toastsForUnlock.splice(0)) showToast(text);
+    showHeldAsks();
   }
   paintStrandedBar();
 }
 
 function discardHeldByLock() {
+  discardHeldAsks();
   mirror.heldForGone.clear();
   mirror.goneTitles.clear();
   mirror.toastsForUnlock.length = 0;

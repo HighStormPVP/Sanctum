@@ -4100,6 +4100,41 @@ test('an idle-locked device sends no action, and the frames that keep a mirror g
   assert.equal(laptop.manager.send(home.id, ACTION_FRAME), true, 'and after the PIN it goes again');
 });
 
+test('pop-ups go out from a locked home PC, and an answer never leaves a locked laptop', async (t) => {
+  const world = newWorld(t);
+  const home = await world.device('Home');
+  const laptop = await world.device('Laptop');
+  home.start();
+  laptop.start();
+  const { code } = await home.manager.createCode();
+  world.relay.pump();
+  const pairing = laptop.manager.pair(code, 'Laptop');
+  world.relay.pump();
+  assert.equal((await pairing).ok, true);
+  world.relay.pump();
+  const answer = { type: 'answer', id: 'ask_1', value: true };
+
+  assert.equal(laptop.manager.send(home.id, answer), true, 'unlocked, it goes');
+  world.relay.pump();
+  assert.equal(home.frames.filter((f) => f.frame.type === 'answer').length, 1);
+
+  laptop.manager.lock();
+  assert.equal(laptop.manager.send(home.id, answer), false, 'idle-locked');
+  assert.equal(laptop.manager.send(home.id, { ...answer, type: new String('answer') }), false, 'a String object'); // eslint-disable-line no-new-wrappers
+  assert.equal(laptop.manager.send(home.id, { ...answer, type: ['answer'] }), false, 'a list');
+  assert.equal(laptop.manager.send(home.id, { type: 'ask', id: 'x' }), false, 'nor does a laptop ask anything of its home PC');
+  world.relay.pump();
+  assert.equal(home.frames.filter((f) => f.frame.type === 'answer').length, 1, 'nothing more reached home');
+  assert.equal((await laptop.manager.unlock(PIN)).ok, true);
+
+  home.manager.lock();
+  assert.equal(home.manager.send(laptop.id, { type: 'ask', id: 'ask_2', kind: 'approval' }), true, 'its lock is about someone using it, and this is it serving');
+  assert.equal(home.manager.send(laptop.id, { type: 'ask-closed', id: 'ask_2', value: null }), true);
+  world.relay.pump();
+  assert.ok(laptop.frames.some(({ frame }) => frame.type === 'ask'));
+  assert.ok(laptop.frames.some(({ frame }) => frame.type === 'ask-closed'));
+});
+
 test('a laptop owing a PIN sends no action, though its keys are open, until the PIN is set', async (t) => {
   const world = newWorld(t);
   const home = await world.device('Home');

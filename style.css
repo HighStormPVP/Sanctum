@@ -2716,6 +2716,9 @@ button { font-family: inherit; }
   word-wrap: break-word;
 }
 .approval-code.dim { color: var(--text-3); }
+.plan-approval-body .approval-section + .approval-section { margin-top: 12px; }
+.plan-approval-body .approval-code { max-height: none; }
+.ask-too-long { margin: 0; color: var(--text-1); font-size: 14px; line-height: 1.55; }
 
 .approval-diff {
   background: var(--bg-2);

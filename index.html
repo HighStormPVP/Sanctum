@@ -317,11 +317,14 @@
           </div>
           <div class="approval-title-block">
             <h2 id="pe-title">Access path outside project folder?</h2>
-            <p>The agent wants to read or write a path that's outside this chat's project folder.</p>
+            <p id="pe-desc">The agent wants to read or write a path that's outside this chat's project folder.</p>
           </div>
         </div>
       </header>
       <div class="modal-body">
+        <section class="approval-section" id="pe-too-long" hidden>
+          <p class="ask-too-long"></p>
+        </section>
         <section class="approval-section" id="pe-device-row" hidden>
           <div class="approval-label">Machine</div>
           <pre class="approval-code" id="pe-device"></pre>
@@ -330,11 +333,11 @@
           <div class="approval-label">Tool</div>
           <pre class="approval-code dim" id="pe-tool-name">read_file</pre>
         </section>
-        <section class="approval-section">
+        <section class="approval-section" id="pe-path-row">
           <div class="approval-label">Requested path</div>
           <pre class="approval-code" id="pe-requested-path">…</pre>
         </section>
-        <section class="approval-section">
+        <section class="approval-section" id="pe-folder-row">
           <div class="approval-label">Project folder (currently allowed)</div>
           <pre class="approval-code dim" id="pe-current-folder">…</pre>
         </section>
@@ -357,7 +360,7 @@
           </div>
           <div class="approval-title-block">
             <h2 id="plan-approval-title">Approve plan?</h2>
-            <p>The agent is proposing this plan. On Approve the chat flips to Approval Mode and execution begins — every write still pops a per-call approval. On Reject the agent stays in Plan Mode and refines.</p>
+            <p id="plan-approval-desc">The agent is proposing this plan. On Approve the chat flips to Approval Mode and execution begins — every write still pops a per-call approval. On Reject the agent stays in Plan Mode and refines.</p>
           </div>
         </div>
       </header>
