@@ -5990,6 +5990,9 @@ async function executeToolImpl(name, args, c, offeredTools) {
     await window.api.audit.log({ ts: new Date().toISOString(), chat: c?.id, model: c?.model, tool: name, args, status: 'blocked-no-device', ok: false });
     return toolError(target.error, 'no device');
   }
+  // The list is prefix-matched and was written with one machine in mind, so `git` there doesn't
+  // quietly allow `git clean -fdx` on another computer. A call that lands on a laptop always asks.
+  if (target.remote) skipApproval = false;
 
   if (skipAllApprovals) {
     approvalDecision = 'no-approval-mode';
@@ -6072,7 +6075,7 @@ async function executeToolImpl(name, args, c, offeredTools) {
       const res = await window.api.fs.glob(pattern, root, allow);
       if (res.error) return { result: { error: res.error }, summary: 'failed', ok: false };
       const n = res.matches.length;
-      return { result: { root: res.root, matches: res.matches }, summary: `${n} match${n === 1 ? '' : 'es'}`, ok: true };
+      return walkResult({ root: res.root, matches: res.matches }, res, n);
     }
     if (name === 'grep') {
       const pattern = toStringArg(args?.pattern);
@@ -6086,7 +6089,7 @@ async function executeToolImpl(name, args, c, offeredTools) {
       });
       if (res.error) return { result: { error: res.error }, summary: 'failed', ok: false };
       const n = res.matches.length;
-      return { result: { matches: res.matches }, summary: `${n} match${n === 1 ? '' : 'es'}`, ok: true };
+      return walkResult({ matches: res.matches }, res, n);
     }
     if (name === 'run_command_async') {
       const effectiveCwd = args.cwd || c?.projectFolder || undefined;
@@ -7233,6 +7236,9 @@ function explainKeysReset() {
 // nothing about them reaches the page except the running indicator.
 const REMOTE_TOOL_LIMIT_MS = 180000; // past anything a tool takes: run_command and MCP stop at 60 s, so a long command is safe
 const REMOTE_ASK_WAIT_MS = 2 * 60 * 1000;
+// All home can say when it stops waiting: the tool-cancel lands when the path recovers, or the laptop
+// gives up by itself after long silence. It can't know yet that either has happened.
+const REMOTE_WILL_BE_STOPPED = 'What was running there will be stopped, and may not have finished.';
 const DEVICE_OS_LABELS = new Map([['win32', 'Windows'], ['darwin', 'macOS'], ['linux', 'Linux']]);
 
 const remoteTools = {
@@ -7245,10 +7251,18 @@ const remoteTools = {
   limitMs: REMOTE_TOOL_LIMIT_MS,
   // On the laptop.
   running: new Map(),   // `${deviceId}:${id}` -> { deviceId, id, name, args, chatTitle, timer }
-  homesUp: new Set()    // home PCs that have heard from this page on their current connection
+  homesUp: new Set(),   // home PCs that have heard from this page on their current connection
+  runningLabel: null,   // what the running indicator was last told
+  toolsLeftOut: 0       // how many MCP tools the last control-state couldn't carry
 };
 
 const toolError = (error, summary = 'failed') => ({ result: { error }, summary, ok: false });
+
+// What glob and grep hand back, which is only part of what's there if the walk ran out of time.
+function walkResult(result, res, n) {
+  const partial = res.partial ? { partial: true, note: res.note } : {};
+  return { result: { ...result, ...partial }, summary: `${n} match${n === 1 ? '' : 'es'}${res.partial ? ', partial' : ''}`, ok: true };
+}
 
 // ---- Which machine ----
 
@@ -7310,7 +7324,8 @@ function toolTarget(name, args, c) {
     if (!still) return { error: toolDeviceProblem(undefined, { deviceId: seen.deviceId }) };
     return { device, remote: true, tool: seen.tool, named: device };
   }
-  if (!RemoteRules.routesToDevice(name)) return { device: home, remote: false, named: name.startsWith('mcp__') && devices.length > 1 ? home : null };
+  // A model can send anything for a name, or nothing. wasOffered answers that as a tool error.
+  if (!RemoteRules.routesToDevice(name)) return { device: home, remote: false, named: typeof name === 'string' && name.startsWith('mcp__') && devices.length > 1 ? home : null };
   const picked = RemoteRules.resolveDevice(args?.device, c, devices);
   if (picked.error) return { error: toolDeviceProblem(args?.device, picked) };
   const device = devices.find((d) => d.id === picked.deviceId);
@@ -7341,7 +7356,7 @@ function addDeviceTools(tools, modality, readOnly) {
   if (modality === 'agent' && !readOnly) {
     const taken = new Set(out.map((tool) => tool.function.name));
     for (const name of taken) remoteTools.mcpSeen.delete(name);
-    for (const entry of RemoteRules.laptopToolDefs({ devices, control: remoteTools.control, taken })) {
+    for (const entry of RemoteRules.laptopToolDefs({ devices, paired: pairedToolDevices(), control: remoteTools.control, taken })) {
       remoteTools.mcpSeen.set(entry.publicName, { deviceId: entry.deviceId, tool: entry.tool });
       out.push(entry.def);
     }
@@ -7373,11 +7388,12 @@ File, command, and task tools take a \`device\` argument naming one of these. Le
 
 function callDevice(device, name, args, c) {
   if (RemoteRules.chatsLocked(remoteStatusNow())) return Promise.resolve(toolError(`${device.name} can't be reached while this device is locked`, 'locked'));
+  if (remoteDevices().find((d) => d.id === device.id)?.quiet) return Promise.resolve(toolError(`${device.name} isn't answering right now, so that wasn't sent.`, 'no answer'));
   const id = crypto.randomUUID();
   const frame = { type: 'tool-call', id, name, args, chatTitle: c?.title || '' };
   if (RemoteRules.overToolLimit(frame)) return Promise.resolve(toolError(`That's too large to send to ${device.name}.`, 'too large'));
   return new Promise((resolve) => {
-    const timer = setTimeout(() => giveUpOnToolCall(id, toolError(`${device.name} didn't answer in time, so that was stopped.`, 'no answer')), remoteTools.limitMs);
+    const timer = setTimeout(() => giveUpOnToolCall(id, toolError(`${device.name} didn't answer in time. ${REMOTE_WILL_BE_STOPPED}`, 'no answer')), remoteTools.limitMs);
     remoteTools.pending.set(id, { deviceId: device.id, deviceName: device.name, chatId: c?.id, resolve, timer });
     const offline = () => endToolCall(id, toolError(`${device.name} is offline`, 'offline'));
     window.api.remote.send(device.id, frame).then((sent) => { if (!sent) offline(); }, offline);
@@ -7455,8 +7471,16 @@ async function runToolOnDevice(name, args, c, target) {
 
 function applyControlState(deviceId, frame) {
   const said = RemoteRules.cleanControlState(frame);
+  const before = remoteTools.control.get(deviceId);
   remoteTools.control.set(deviceId, said);
+  if (said.dropped > 0 && before?.dropped !== said.dropped) noteToolsLeftOut(deviceId, said.dropped);
   if (!said.allowed) endToolCallsOfDevice(deviceId, (name) => `${name} turned off control from home, so that stopped.`, 'control off');
+}
+
+function noteToolsLeftOut(deviceId, count) {
+  window.api.audit.log({ ts: new Date().toISOString(), source: 'remote-tools', kind: 'mcp-tools-left-out', device: deviceId, count, ok: false }).catch(() => {});
+  const name = pairedToolDevices().find((d) => d.id === deviceId)?.name || 'A laptop';
+  remoteToast(`${name} has more MCP tools than can be offered here, so ${count} ${count === 1 ? 'was' : 'were'} left out.`);
 }
 
 // ---- A pop-up nobody is there to answer ----
@@ -7512,14 +7536,12 @@ const LAPTOP_TOOLS = new Map([
   ['glob', async (a) => {
     const res = await window.api.fs.glob(a.pattern, a.root, a.allowlist || []);
     if (res.error) return toolError(res.error);
-    const n = res.matches.length;
-    return { result: { root: res.root, matches: res.matches }, summary: `${n} match${n === 1 ? '' : 'es'}`, ok: true };
+    return walkResult({ root: res.root, matches: res.matches }, res, res.matches.length);
   }],
   ['grep', async (a) => {
     const res = await window.api.fs.grep(a.pattern, a.root, { glob: a.glob, caseInsensitive: !!a.case_insensitive, allowlist: a.allowlist || [] });
     if (res.error) return toolError(res.error);
-    const n = res.matches.length;
-    return { result: { matches: res.matches }, summary: `${n} match${n === 1 ? '' : 'es'}`, ok: true };
+    return walkResult({ matches: res.matches }, res, res.matches.length);
   }],
   ['run_command', async (a, call) => {
     const res = await window.api.shell.run(a.command, a.cwd, { deviceId: call.deviceId, id: call.id });
@@ -7576,15 +7598,21 @@ async function runToolCallHere(deviceId, frame) {
   const name = typeof frame?.name === 'string' ? frame.name : '';
   const chatTitle = typeof frame?.chatTitle === 'string' ? frame.chatTitle : '';
   const key = `${deviceId}:${check.id}`;
-  const refusal = check.error || (remoteTools.running.has(key) ? 'That call is already running.' : null);
-  if (refusal) {
-    auditLaptopCall('refused', deviceId, { chatTitle, tool: name, args: RemoteRules.auditArgs(name, frame?.args), reason: refusal, ok: false });
-    if (check.id) answerHome(deviceId, check.id, toolError(refusal, 'refused'));
+  // The main process has checked this as well, and has written a `started` line for it.
+  if (check.error) {
+    auditLaptopCall('refused', deviceId, { chatTitle, tool: name, args: RemoteRules.auditArgs(name, frame?.args), reason: check.error, ok: false });
+    if (check.id) answerHome(deviceId, check.id, toolError(check.error, 'refused'));
+    return;
+  }
+  if (remoteTools.running.has(key)) {
+    const already = 'That call is already running.';
+    auditLaptopCall('ended', deviceId, { call: check.id, chatTitle, tool: name, reason: already, ok: false });
+    answerHome(deviceId, check.id, toolError(already, 'refused'));
     return;
   }
   const call = { deviceId, id: check.id, name: check.name, args: check.args, chatTitle: check.chatTitle, timer: null };
   remoteTools.running.set(key, call);
-  call.timer = setTimeout(() => finishToolCallHere(key, toolError("That took too long, so it was stopped.", 'too long')), REMOTE_TOOL_LIMIT_MS);
+  call.timer = setTimeout(() => endToolCallTooLong(key, call), remoteTools.limitMs);
   paintLaptopRunning();
   // Looked up in a closed list, or one of this laptop's own MCP tools, which checkToolCall has seen.
   const handler = LAPTOP_TOOLS.get(check.name) ?? runLaptopMcpTool;
@@ -7597,6 +7625,13 @@ async function runToolCallHere(deviceId, frame) {
   finishToolCallHere(key, out);
 }
 
+// A command really is ended here. Nothing can end a file or MCP call that's under way, so this only
+// says it stopped waiting.
+function endToolCallTooLong(key, call) {
+  window.api.remote.endRun(call.deviceId, call.id, 'too long').catch(() => {});
+  finishToolCallHere(key, toolError('That took too long, so this device stopped waiting. A command was ended. Anything else may still finish.', 'too long'));
+}
+
 // Once for each call, whichever ending gets here first. It's what turns the indicator off, so every
 // way a call can end comes through here.
 function finishToolCallHere(key, out) {
@@ -7605,8 +7640,8 @@ function finishToolCallHere(key, out) {
   remoteTools.running.delete(key);
   clearTimeout(call.timer);
   paintLaptopRunning();
-  auditLaptopCall('ran', call.deviceId, {
-    chatTitle: call.chatTitle, tool: call.name, args: RemoteRules.auditArgs(call.name, call.args), summary: String(out.summary ?? ''), ok: out.ok === true
+  auditLaptopCall('ended', call.deviceId, {
+    call: call.id, chatTitle: call.chatTitle, tool: call.name, args: RemoteRules.auditArgs(call.name, call.args), summary: String(out.summary ?? ''), ok: out.ok === true
   });
   answerHome(call.deviceId, call.id, out);
 }
@@ -7618,9 +7653,15 @@ function cancelToolCallHere(deviceId, frame) {
   finishToolCallHere(`${deviceId}:${frame.id}`, toolError('Stopped from the home PC.', 'stopped'));
 }
 
+// For calls under way, and for background tasks a home PC started, which outlast their call. On a
+// locked laptop this is the one way to turn those off.
 function paintLaptopRunning() {
-  const names = [...new Set([...remoteTools.running.values()].map((call) => remoteHomeLabel(call.deviceId)))];
-  setLaptopRunning(names.length ? names.join(' and ') : null, names.length > 1);
+  const homes = [...[...remoteTools.running.values()].map((call) => call.deviceId), ...(remoteStatusNow().homeTasks || [])];
+  const names = [...new Set(homes.map(remoteHomeLabel))];
+  const label = names.length ? names.join(' and ') : null;
+  if (label === remoteTools.runningLabel) return;
+  remoteTools.runningLabel = label;
+  setLaptopRunning(label, names.length > 1);
 }
 
 function sendControlState(deviceId) {
@@ -7628,10 +7669,18 @@ function sendControlState(deviceId) {
   window.api.remote.send(deviceId, {
     type: 'control-state',
     allowed,
-    mcpTools: allowed ? RemoteRules.outgoingMcpTools(state.mcpTools) : [],
+    mcpTools: allowed ? outgoingToolsNoting() : [],
     os: window.api.platform,
     shell: shellNameHere()
   }).catch(() => {});
+}
+
+// Only what fits goes, and the person whose tools they are gets told.
+function outgoingToolsNoting() {
+  const { tools, dropped } = RemoteRules.outgoingMcpTools(state.mcpTools);
+  if (dropped > 0 && dropped !== remoteTools.toolsLeftOut) remoteToast(`${dropped} MCP ${dropped === 1 ? 'tool' : 'tools'} on this device ${dropped === 1 ? "doesn't" : "don't"} fit in what a home PC can be offered, so ${dropped === 1 ? 'it was' : 'they were'} left out.`);
+  remoteTools.toolsLeftOut = dropped;
+  return tools;
 }
 
 function sendControlStateToHomes() {
@@ -7645,8 +7694,10 @@ function noteToolStatus(before, status) {
   const connected = (id) => devices.some((d) => d.id === id && d.connected);
 
   // At home. What a laptop said only holds for the connection it said it on.
+  const entry = (id) => devices.find((d) => d.id === id);
   for (const [id, call] of [...remoteTools.pending]) {
     if (!connected(call.deviceId)) giveUpOnToolCall(id, toolError(`${call.deviceName} is offline`, 'offline'));
+    else if (entry(call.deviceId).quiet) giveUpOnToolCall(id, toolError(`${call.deviceName} stopped answering. ${REMOTE_WILL_BE_STOPPED}`, 'no answer'));
   }
   for (const id of [...remoteTools.control.keys()]) {
     if (!connected(id)) remoteTools.control.delete(id);
@@ -7669,7 +7720,9 @@ function noteToolStatus(before, status) {
   for (const [key, call] of [...remoteTools.running]) {
     if (off) finishToolCallHere(key, toolError('Control from home was turned off on this device, so that stopped.', 'control off'));
     else if (!connected(call.deviceId)) finishToolCallHere(key, toolError('The connection to the home PC dropped, so that stopped.', 'offline'));
+    else if (entry(call.deviceId).longQuiet) finishToolCallHere(key, toolError('Nothing was heard from the home PC for 30 seconds, so that stopped.', 'silence'));
   }
+  paintLaptopRunning();
 }
 
 // ---- Asking at pairing ----

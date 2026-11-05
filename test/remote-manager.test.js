@@ -48,6 +48,10 @@ function fakeClock() {
     clearInterval(id) {
       timers.delete(id);
     },
+    // This device wasn't running for a while: time passed, and no timer had a chance to fire.
+    stall(ms) {
+      time += ms;
+    },
     // Runs what falls due, in order. `after` runs after each one, so what a timer sent
     // arrives at the time it was sent rather than after the whole advance.
     advance(ms, after = () => {}) {
@@ -60,7 +64,7 @@ function fakeClock() {
         }
         if (!nextEntry) break;
         const [id, timer] = nextEntry;
-        time = timer.due;
+        time = Math.max(time, timer.due);
         if (timer.every) timer.due += timer.every;
         else timers.delete(id);
         timer.fn();
@@ -1244,7 +1248,7 @@ test('the manager has no route from a frame to anything but onFrame listeners', 
   const device = await world.device('Device');
   device.start();
   assert.deepEqual(Object.keys(device.manager).sort(), [
-    'cancelCode', 'createCode', 'lock', 'onFrame', 'onStatus', 'pair', 'removeDevice',
+    'cancelCode', 'createCode', 'lock', 'onFrame', 'onStatus', 'pair', 'refreshStatus', 'removeDevice',
     'send', 'setAddress', 'setControlAllowed', 'setPin', 'shutdown', 'status', 'toolCallRefusal', 'unlock'
   ]);
 
@@ -1257,6 +1261,28 @@ test('the manager has no route from a frame to anything but onFrame listeners', 
   const signaling = 'if (frame.type === FRAME_RTC) return receiveSignal(conn, frame.data);';
   assert.equal(receiving.split(signaling).length, 2);
   assert.ok(!/frame\.(t|type|method|kind)\b/.test(receiving.replace(signaling, '')));
+
+  // Tool calls are the one kind of frame looked at before the listeners. That section may read the
+  // switch, once, and nothing else about a frame can come to matter without this test saying so.
+  const admitting = source.slice(source.indexOf('// ---- Tool calls ----'), source.indexOf('// ---- Pairing, home side ----'));
+  assert.ok(admitting.includes('function admitFrame'));
+  assert.ok(!/setControlAllowed/.test(admitting), 'nothing here can set the switch');
+  assert.ok(!/\bpeer(\.\w+)*\s*=[^=]/.test(admitting), 'nothing here can change who a device is');
+  assert.equal(admitting.split('getControlAllowed()').length, 2, 'the switch is read in one place');
+  assert.deepEqual(
+    [...admitting.matchAll(/frame\.type\s*[!=]==\s*\w+/g)].map((m) => m[0]).sort(),
+    [
+      'frame.type !== FRAME_TOOL_CALL',
+      'frame.type === FRAME_RTC',
+      'frame.type === FRAME_TOOL_CALL',
+      'frame.type === FRAME_TOOL_CANCEL',
+      'frame.type === FRAME_TOOL_RESULT',
+      'frame.type === FRAME_TOOL_RESULT'
+    ],
+    'the frame types looked at are exactly these'
+  );
+  const read = new Set([...admitting.matchAll(/\bframe\.(\w+)/g)].map((m) => m[1]));
+  assert.deepEqual([...read].sort(), ['data', 'id', 'type'], 'and only these fields of a frame are read here');
 });
 
 test('setControlAllowed is refused unless the caller says it is the local UI', async (t) => {
@@ -4399,25 +4425,106 @@ function losingEverything(world, ms, stopWhen = () => false) {
   return elapsed;
 }
 
-test('while a call is out, a device that goes quiet shows as offline within 5 seconds', async (t) => {
+test('while a call is out, a device that goes quiet shows as quiet within 5 seconds, and stays connected', async (t) => {
   const { world, home, laptop } = await connected(t);
   assert.deepEqual(laptop.manager.setControlAllowed(true, { fromLocalUi: true }), { ok: true });
   home.manager.send(laptop.id, TOOL_CALL());
   world.run(1);
-  assert.equal(home.entry(laptop.id).connected, true);
+  assert.equal(home.entry(laptop.id).quiet, false);
 
   // Busy isn't gone: it answers its probes for as long as anyone likes.
   world.run(20000);
-  assert.equal(home.entry(laptop.id).connected, true, 'a working device stays connected');
+  assert.equal(home.entry(laptop.id).quiet, false, 'a working device is not quiet');
 
   // Now a closed lid, a lost network, or a direct path that has died with nothing to say so.
-  const took = losingEverything(world, 10000, () => !home.entry(laptop.id).connected);
+  const before = home.statuses.length;
+  const took = losingEverything(world, 10000, () => home.entry(laptop.id).quiet);
   assert.ok(took <= 5000, `took ${took} ms`);
-  assert.equal(home.statuses.at(-1).devices.find((d) => d.id === laptop.id).connected, false, 'and a status said so');
+  const entry = home.statuses.at(-1).devices.find((d) => d.id === laptop.id);
+  assert.equal(entry.quiet, true, 'a status said so');
+  assert.equal(entry.connected, true, 'and being quiet is not being offline, so it costs no snapshot');
+  assert.ok(home.statuses.length > before);
+  assert.ok(home.statuses.slice(before).every((s) => s.devices.find((d) => d.id === laptop.id).connected), 'connected never changed');
 
   // Hearing from it again ends that, on the same session.
   world.run(16000);
+  assert.equal(home.entry(laptop.id).quiet, false);
   assert.equal(home.entry(laptop.id).connected, true);
+});
+
+test('quiet for 30 s says so separately, which is what ends a command, and nothing short of that does', async (t) => {
+  const { world, home, laptop } = await connected(t);
+  assert.deepEqual(laptop.manager.setControlAllowed(true, { fromLocalUi: true }), { ok: true });
+  home.manager.send(laptop.id, TOOL_CALL());
+  world.run(1);
+  losingEverything(world, 29000);
+  assert.equal(laptop.entry(home.id).quiet, true);
+  assert.equal(laptop.entry(home.id).longQuiet, false, 'not yet');
+  losingEverything(world, 1500);
+  const entry = laptop.entry(home.id);
+  assert.equal(entry.longQuiet, true);
+  assert.equal(entry.connected, true);
+  assert.equal(laptop.statuses.at(-1).devices.find((d) => d.id === home.id).longQuiet, true, 'and a status said so');
+
+  world.run(16000);
+  assert.equal(laptop.entry(home.id).quiet, false);
+  assert.equal(laptop.entry(home.id).longQuiet, false, 'hearing from it ends both');
+});
+
+test('a device that stalled itself does not blame the other end', async (t) => {
+  const { world, home, laptop } = await connected(t);
+  assert.deepEqual(laptop.manager.setControlAllowed(true, { fromLocalUi: true }), { ok: true });
+  home.manager.send(laptop.id, TOOL_CALL());
+  world.run(1500);
+  // Everything from the other end has been waiting to be read while this one wasn't running.
+  world.clock.stall(4500);
+  world.clock.advance(1000);
+  assert.equal(home.entry(laptop.id).quiet, false, 'its own late timer is no sign of anything');
+  world.run(1000);
+  assert.equal(home.entry(laptop.id).quiet, false);
+});
+
+test('anything heard over the direct path counts', async (t) => {
+  const world = newWorld(t);
+  const home = await world.device('Home');
+  const laptop = await world.device('Laptop');
+  seedPair(home, laptop);
+  home.direct = fakeDirect();
+  laptop.direct = fakeDirect();
+  home.createDirect = home.direct.create;
+  laptop.createDirect = laptop.direct.create;
+  home.start();
+  laptop.start();
+  world.relay.pump();
+  assert.deepEqual(laptop.manager.setControlAllowed(true, { fromLocalUi: true }), { ok: true });
+  home.direct.callbacks.onOpen(laptop.id);
+  home.manager.send(laptop.id, TOOL_CALL());
+  world.run(1);
+
+  // The relay carries nothing from here on, and only what this test hands over crosses by direct.
+  world.relay.drop = () => true;
+  const before = home.statuses.length;
+  for (let i = 0; i < 80; i++) {
+    world.clock.advance(100);
+    home.direct.callbacks.onData(laptop.id, Uint8Array.of(9, 9, 9));
+  }
+  assert.equal(home.entry(laptop.id).quiet, false, 'it was being heard from');
+  assert.ok(home.statuses.slice(before).every((s) => !s.devices.find((d) => d.id === laptop.id).quiet));
+  for (let i = 0; i < 50; i++) world.clock.advance(100);
+  assert.equal(home.entry(laptop.id).quiet, true, 'and this test does tell silence apart');
+});
+
+test('each end answers a probe with a heartbeat of its own', async (t) => {
+  const { world, home, laptop } = await connected(t);
+  assert.deepEqual(laptop.manager.setControlAllowed(true, { fromLocalUi: true }), { ok: true });
+  home.manager.send(laptop.id, TOOL_CALL());
+  world.run(1);
+  const dataFrom = (device, to) => linkMessages(world.relay, device.id, to.id).filter((m) => fromRelayB64(m.data.b)[0] === DATA).length;
+  const before = dataFrom(laptop, home);
+  world.run(5000); // no heartbeat of the regular kind falls due in this
+  // Its own probe once a second, and one answer to each of the other end's.
+  const sent = dataFrom(laptop, home) - before;
+  assert.ok(sent >= 8 && sent <= 12, `${sent} data frames in 5 s`);
 });
 
 test('a laptop running a call notices its home PC going quiet too', async (t) => {
@@ -4425,8 +4532,9 @@ test('a laptop running a call notices its home PC going quiet too', async (t) =>
   assert.deepEqual(laptop.manager.setControlAllowed(true, { fromLocalUi: true }), { ok: true });
   home.manager.send(laptop.id, TOOL_CALL());
   world.run(1);
-  const took = losingEverything(world, 10000, () => !laptop.entry(home.id).connected);
+  const took = losingEverything(world, 10000, () => laptop.entry(home.id).quiet);
   assert.ok(took <= 5000, `took ${took} ms`);
+  assert.equal(laptop.entry(home.id).connected, true);
 });
 
 test('with no call out, nothing watches, and nothing extra goes over the relay', async (t) => {
@@ -4436,7 +4544,7 @@ test('with no call out, nothing watches, and nothing extra goes over the relay',
   world.run(5000);
   assert.equal(world.relay.log.length, before);
   losingEverything(world, 14000);
-  assert.equal(home.entry(laptop.id).connected, true, 'quiet means nothing with no call out');
+  assert.equal(home.entry(laptop.id).quiet, false, 'silence means nothing with no call out');
 });
 
 test('a result ends the watching, and so does a cancel with nothing left out', async (t) => {
@@ -4474,15 +4582,36 @@ test('a call that never gets an answer stops being watched in the end', async (t
   assert.equal(home.entry(laptop.id).connected, true);
 });
 
-test('a tool call from a home PC gets through unchanged, and nothing about it is kept when a session ends', async (t) => {
+test('a tool call from a home PC gets through unchanged', async (t) => {
   const { world, home, laptop } = await connected(t);
   assert.deepEqual(laptop.manager.setControlAllowed(true, { fromLocalUi: true }), { ok: true });
   const frame = TOOL_CALL('whole');
   home.manager.send(laptop.id, frame);
   world.run(1);
   assert.deepEqual(toolFrames(laptop)[0].frame, frame);
-  const timers = world.clock.pendingTimers();
+});
+
+test('the watch timer goes when a call ends it, and when the session does', async (t) => {
+  const { world, home, laptop } = await connected(t);
+  assert.deepEqual(laptop.manager.setControlAllowed(true, { fromLocalUi: true }), { ok: true });
+  world.run(1);
+  const before = world.clock.pendingTimers();
+  home.manager.send(laptop.id, TOOL_CALL('a'));
+  world.run(1);
+  assert.equal(world.clock.pendingTimers(), before + 2, 'one timer watching at each end');
+
+  // The session goes under it, and no timer is left behind.
   laptop.manager.shutdown();
   home.manager.shutdown();
-  assert.ok(world.clock.pendingTimers() < timers);
+  assert.equal(world.clock.pendingTimers(), 0, 'nothing is left running after a session ends');
+});
+
+test('refreshStatus tells listeners again, without using up what status() reports once', async (t) => {
+  const { laptop } = await connected(t);
+  const before = laptop.statuses.length;
+  laptop.manager.refreshStatus();
+  assert.equal(laptop.statuses.length, before + 1);
+  laptop.manager.shutdown();
+  laptop.manager.refreshStatus();
+  assert.equal(laptop.statuses.length, before + 1);
 });

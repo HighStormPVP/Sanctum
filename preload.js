@@ -195,7 +195,7 @@ contextBridge.exposeInMainWorld('api', {
     setControlAllowed: (allowed) => ipcRenderer.invoke('remote:setControlAllowed', { allowed }),
     send:       (deviceId, frame) => ipcRenderer.invoke('remote:send', { deviceId, frame }),
     audit:      (entry)       => ipcRenderer.invoke('remote:audit', entry),
-    endRun:     (deviceId, id) => ipcRenderer.invoke('remote:endRun', { deviceId, id }),
+    endRun:     (deviceId, id, reason) => ipcRenderer.invoke('remote:endRun', { deviceId, id, reason }),
     onFrame: (cb) => {
       const wrapped = (_e, { deviceId, frame }) => cb(deviceId, frame);
       ipcRenderer.on('remote:frame', wrapped);

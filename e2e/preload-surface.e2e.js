@@ -41,7 +41,7 @@ test('the preload surface', async (t) => {
     // A device id is the hash of a public key, so status may show that, but these fields
     // are all a device gets, so none of them can be a key under another name.
     const entry = await home.entry();
-    assert.deepEqual(Object.keys(entry).sort(), ['connected', 'fingerprint', 'id', 'name', 'path', 'role']);
+    assert.deepEqual(Object.keys(entry).sort(), ['connected', 'fingerprint', 'id', 'longQuiet', 'name', 'path', 'quiet', 'role']);
   });
 
   await t.test("a peer's frame can't reach the control switch, and only ever reaches the renderer", async () => {

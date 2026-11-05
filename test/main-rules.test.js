@@ -95,7 +95,7 @@ test('a walk or a search from a parent folder goes around the profile', async (t
   assert.deepEqual(walked, ['AppData/beside.txt', 'work/mine.txt']);
   assert.equal(walkFiles(dir).length, 4, 'without being told to, a walk still finds everything');
 
-  const found = await grepInWorker({ pattern: 'CANARY', root: dir, skipDir });
+  const found = await grepInWorker({ pattern: 'CANARY', root: dir, profile });
   assert.deepEqual(found.matches.map((m) => m.file).sort(), ['AppData/beside.txt', 'work/mine.txt']);
 });
 
@@ -241,4 +241,281 @@ test('isAppPage takes only the exact file, however its URL is spelled', () => {
     undefined
   ];
   for (const other of others) assert.strictEqual(isAppPage(other, index), false, String(other));
+});
+
+// ---- Paths that can reach out, I9 ----
+
+const { isLexicallyWithin, checkAgentPath } = lib('fs-rules.js');
+
+function spied(pathMod, platform) {
+  const calls = [];
+  return { calls, pathMod, platform, realpath: (p) => { calls.push(p); return p; } };
+}
+
+const NETWORK_SHAPES = [
+  '\\\\192.0.2.1\\share\\x.txt',
+  '//192.0.2.1/share/x.txt',
+  '\\/192.0.2.1/share/x.txt',
+  '/\\192.0.2.1\\share\\x.txt',
+  '\\\\?\\UNC\\192.0.2.1\\share\\x.txt',
+  '\\\\.\\C:\\x.txt',
+  '\\\\?\\C:\\x.txt'
+];
+
+test('a path outside every allowed folder is refused before anything looks at it', () => {
+  for (const shape of NETWORK_SHAPES) {
+    const opts = spied(path.win32, 'win32');
+    assert.equal(isWithinRoots(shape, ['C:\\work'], opts), false, shape);
+    assert.deepEqual(opts.calls, [], `${shape} reached realpath`);
+    assert.equal(checkAgentPath(shape, { roots: ['C:\\work'], profile: 'C:\\profile', ...opts }), 'outside', shape);
+    assert.deepEqual(opts.calls, [], `${shape} reached realpath by way of the profile check`);
+  }
+  const noRoots = spied(path.win32, 'win32');
+  assert.equal(checkAgentPath('\\\\192.0.2.1\\share\\x.txt', { roots: [], profile: 'C:\\profile', ...noRoots }), 'outside');
+  assert.deepEqual(noRoots.calls, []);
+});
+
+test('a roots list holding a network path costs nothing unless the path is inside it', () => {
+  const opts = spied(path.win32, 'win32');
+  assert.equal(isWithinRoots('C:\\work\\a.txt', ['\\\\192.0.2.1\\share', 'C:\\work'], opts), true);
+  assert.ok(!opts.calls.some((p) => p.includes('192.0.2.1')), opts.calls.join());
+});
+
+test('a folder a person deliberately allowed on a NAS keeps working', () => {
+  const opts = spied(path.win32, 'win32');
+  assert.equal(checkAgentPath('\\\\192.0.2.1\\share\\a.txt', { roots: ['\\\\192.0.2.1\\share'], profile: 'C:\\profile', ...opts }), null);
+  assert.ok(opts.calls.length > 0, 'an allowed path still goes on to be canonicalized');
+});
+
+test('the profile stays refused: plainly, by case, and through a link', () => {
+  const profile = 'C:\\Users\\A\\sanctum';
+  const plain = spied(path.win32, 'win32');
+  assert.equal(checkAgentPath(`${profile}\\keys.json`, { roots: [], profile, ...plain }), 'profile', 'with no pop-up to offer');
+  assert.deepEqual(plain.calls, [], 'and with no need to look');
+  assert.equal(checkAgentPath(`c:\\users\\a\\SANCTUM\\keys.json`, { roots: ['C:\\'], profile, ...spied(path.win32, 'win32') }), 'profile');
+
+  const link = 'C:\\work\\link';
+  const realpath = (p) => (p.toLowerCase().startsWith(link.toLowerCase()) ? profile + p.slice(link.length) : p);
+  const opts = { pathMod: path.win32, platform: 'win32', realpath };
+  assert.equal(checkAgentPath(`${link}\\keys.json`, { roots: ['C:\\work'], profile, ...opts }), 'profile', 'a link inside an allowed folder');
+  assert.equal(checkAgentPath(`${link}\\keys.json`, { roots: [], profile, ...opts }), 'outside', 'and not looked into unless allowed');
+});
+
+test('being inside a folder lexically is about the words, and case only on Windows', () => {
+  assert.ok(isLexicallyWithin('C:\\proj\\a\\..\\b.txt', ['c:/PROJ'], { pathMod: path.win32, platform: 'win32' }));
+  assert.ok(!isLexicallyWithin('C:\\proj-other\\b.txt', ['C:\\proj'], { pathMod: path.win32, platform: 'win32' }));
+  assert.ok(!isLexicallyWithin('/Proj/a', ['/proj'], { pathMod: path.posix, platform: 'linux' }));
+  assert.ok(!isLexicallyWithin('/proj/a', [], { pathMod: path.posix, platform: 'linux' }));
+});
+
+// ---- Walking in a worker, I2 ----
+
+const { globInWorker } = lib('grep-runner.js');
+
+// One tree for these tests, since making it is what takes the time. Large enough that a walk on the
+// main thread stalls it for far longer than the tests allow.
+let sharedTree = null;
+function largeTree() {
+  if (sharedTree) return sharedTree;
+  sharedTree = fs.mkdtempSync(path.join(os.tmpdir(), 'sanctum-walk-large-'));
+  for (let i = 0; i < 2500; i++) fs.mkdirSync(path.join(sharedTree, `a${i % 50}`, `b${i}`), { recursive: true });
+  fs.writeFileSync(path.join(sharedTree, 'a0', 'found.txt'), 'needle');
+  return sharedTree;
+}
+test.after(() => {
+  if (sharedTree) fs.rmSync(sharedTree, { recursive: true, force: true, maxRetries: 5 });
+});
+
+function watchStall(t) {
+  const watch = { worst: 0 };
+  let last = Date.now();
+  const ticker = setInterval(() => {
+    watch.worst = Math.max(watch.worst, Date.now() - last);
+    last = Date.now();
+  }, 10);
+  t.after(() => clearInterval(ticker));
+  return watch;
+}
+
+test('glob walks in a worker: it finds what it should, and goes around the profile', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sanctum-glob-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const profile = path.join(dir, 'profile');
+  fs.mkdirSync(path.join(profile), { recursive: true });
+  fs.mkdirSync(path.join(dir, 'work', 'deep'), { recursive: true });
+  fs.writeFileSync(path.join(profile, 'keys.txt'), 'x');
+  fs.writeFileSync(path.join(dir, 'work', 'deep', 'mine.txt'), 'x');
+  fs.writeFileSync(path.join(dir, 'work', 'other.md'), 'x');
+  const found = await globInWorker({ pattern: '**/*.txt', root: dir, profile });
+  assert.equal(found.root, dir);
+  assert.deepEqual(found.matches, ['work/deep/mine.txt']);
+  assert.equal(found.partial, undefined);
+});
+
+test('the main thread stays responsive while a glob walks a large tree', async (t) => {
+  const dir = largeTree();
+  const watch = watchStall(t);
+  const started = Date.now();
+  const found = await globInWorker({ pattern: '**/*.nothing', root: dir });
+  assert.deepEqual(found.matches, []);
+  assert.ok(watch.worst < 300, `the event loop stalled for ${watch.worst} ms during a ${Date.now() - started} ms walk`);
+});
+
+test('so does grep, which walks first as well', async (t) => {
+  const dir = largeTree();
+  const watch = watchStall(t);
+  const found = await grepInWorker({ pattern: 'needle', root: dir });
+  assert.equal(found.matches.length, 1);
+  assert.ok(watch.worst < 300, `the event loop stalled for ${watch.worst} ms`);
+});
+
+test('a walk past its time gives what it has and says so, and past its limit gives a clear error', async () => {
+  const dir = largeTree();
+  const partial = await globInWorker({ pattern: '**/*', root: dir, walkMs: 1 });
+  assert.equal(partial.partial, true, JSON.stringify(partial).slice(0, 200));
+  assert.match(partial.note, /only part/);
+  assert.ok(Array.isArray(partial.matches));
+
+  const stopped = await globInWorker({ pattern: '**/*', root: dir, timeoutMs: 1 });
+  assert.match(stopped.error, /took too long/);
+
+  const grepped = await grepInWorker({ pattern: 'needle', root: dir, walkMs: 1 });
+  assert.equal(grepped.partial, true);
+  const grepStopped = await grepInWorker({ pattern: 'needle', root: dir, timeoutMs: 1 });
+  assert.match(grepStopped.error, /took too long/);
+});
+
+// ---- Ending a process, I3 and I4 ----
+
+const { killTree, startInOwnGroup, runShellCommand } = lib('kill-tree.js');
+const { spawn: realSpawn } = require('node:child_process');
+
+const pidAlive = (pid) => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+test('POSIX: a process starts in its own group, and a kill reaches the whole group', async () => {
+  const calls = [];
+  const spawnImpl = (command, args, options) => {
+    calls.push({ command, args, options });
+    return { pid: 42 };
+  };
+  startInOwnGroup('sleep 100', { cwd: '/tmp', shell: '/bin/sh' }, { platform: 'darwin', spawnImpl });
+  assert.equal(calls[0].options.detached, true);
+  assert.equal(calls[0].options.shell, '/bin/sh');
+  assert.equal(calls[0].options.cwd, '/tmp');
+  assert.equal(calls[0].command, 'sleep 100');
+
+  const signals = [];
+  const proc = { pid: 42, kill: () => assert.fail('the group was there, so this should not be needed') };
+  await killTree(proc, { platform: 'darwin', killImpl: (pid, signal) => signals.push([pid, signal]) });
+  assert.deepEqual(signals, [[-42, 'SIGKILL']]);
+});
+
+test('POSIX: with no group to signal, a kill falls back to the process', async () => {
+  const signals = [];
+  const proc = { pid: 42, kill: (signal) => signals.push(signal) };
+  await killTree(proc, { platform: 'linux', killImpl: () => { throw new Error('ESRCH'); } });
+  assert.deepEqual(signals, ['SIGKILL']);
+  await killTree({ pid: 42, kill: () => { throw new Error('gone'); } }, { platform: 'linux', killImpl: () => { throw new Error('ESRCH'); } });
+});
+
+test('Windows does as it did: no group, and taskkill on the tree', async () => {
+  const calls = [];
+  const { EventEmitter } = require('node:events');
+  startInOwnGroup('dir', { shell: 'cmd.exe' }, { platform: 'win32', spawnImpl: (c, a, options) => { calls.push(options); return { pid: 1 }; } });
+  assert.notEqual(calls[0].detached, true);
+
+  const killer = new EventEmitter();
+  let args = null;
+  let settled = false;
+  const promise = killTree({ pid: 7 }, {
+    platform: 'win32',
+    spawnImpl: (command, list) => {
+      args = [command, ...list];
+      return killer;
+    }
+  }).then(() => { settled = true; });
+  assert.deepEqual(args, ['taskkill', '/pid', '7', '/T', '/F']);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(settled, false, 'it has not finished until taskkill has');
+  killer.emit('exit', 0);
+  await promise;
+  assert.equal(settled, true);
+});
+
+test('a kill settles whatever happens, and nothing to kill is nothing to wait for', async () => {
+  await killTree(null);
+  await killTree({});
+  const { EventEmitter } = require('node:events');
+  const killer = new EventEmitter();
+  let fellBack = false;
+  const promise = killTree({ pid: 7, kill: () => { fellBack = true; } }, { platform: 'win32', spawnImpl: () => killer });
+  killer.emit('error', new Error('no taskkill'));
+  await promise;
+  assert.equal(fellBack, true);
+  await killTree({ pid: 7, kill: () => {} }, { platform: 'win32', spawnImpl: () => { throw new Error('cannot spawn'); } });
+});
+
+test('a real process tree: a kill ends the children too', { skip: process.platform === 'win32' ? 'POSIX only, for Task 15 to run on a Mac' : false }, async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sanctum-tree-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const file = path.join(dir, 'grandchild.pid');
+  const proc = startInOwnGroup(`sh -c 'sleep 100 & echo $! > "${file}"; wait'`, { shell: '/bin/sh', stdio: 'ignore' });
+  let grandchild = null;
+  for (let i = 0; i < 200 && !grandchild; i++) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    try { grandchild = Number(fs.readFileSync(file, 'utf8')) || null; } catch { /* not yet */ }
+  }
+  assert.ok(grandchild && pidAlive(grandchild));
+  await killTree(proc);
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  assert.equal(pidAlive(grandchild), false, 'the grandchild outlived the kill');
+});
+
+test('a real process: when a kill has settled, it has ended', async () => {
+  const proc = realSpawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore', env: { ...process.env, ELECTRON_RUN_AS_NODE: undefined } });
+  await new Promise((resolve) => proc.once('spawn', resolve));
+  assert.equal(pidAlive(proc.pid), true);
+  await killTree(proc);
+  for (let i = 0; i < 40 && pidAlive(proc.pid); i++) await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.equal(pidAlive(proc.pid), false);
+});
+
+const SHELL_FOR_TEST = process.platform === 'win32' ? 'cmd.exe' : '/bin/sh';
+
+test('runShellCommand gives what exec gave: output, exit code, and the caps', async () => {
+  const ok = await runShellCommand({ command: 'echo hello', cwd: os.tmpdir(), shell: SHELL_FOR_TEST, timeoutMs: 20000 });
+  assert.equal(ok.exitCode, 0);
+  assert.match(ok.stdout, /hello/);
+  assert.equal(ok.timedOut, false);
+
+  const failed = await runShellCommand({ command: 'exit 3', cwd: os.tmpdir(), shell: SHELL_FOR_TEST, timeoutMs: 20000 });
+  assert.equal(failed.exitCode, 3);
+
+  const noFolder = await runShellCommand({ command: 'echo x', cwd: path.join(os.tmpdir(), 'sanctum-no-such-folder'), shell: SHELL_FOR_TEST, timeoutMs: 20000 });
+  assert.equal(noFolder.exitCode, 1, 'a command that could not start reads as a failure, as it did');
+
+  const script = 'process.stdout.write("x".repeat(100000))';
+  const long = await runShellCommand({ command: `"${process.execPath}" -e "${script.replace(/"/g, process.platform === 'win32' ? '""' : '\\"')}"`, cwd: os.tmpdir(), shell: SHELL_FOR_TEST, timeoutMs: 20000, env: { ...process.env } });
+  assert.equal(long.stdout.length, 20000, 'what comes back is capped as before');
+
+  const big = await runShellCommand({ command: `"${process.execPath}" -e "${script.replace(/"/g, process.platform === 'win32' ? '""' : '\\"')}"`, cwd: os.tmpdir(), shell: SHELL_FOR_TEST, timeoutMs: 20000, maxBuffer: 1000 });
+  assert.equal(big.exitCode, 1, 'past the buffer it is ended, as exec did');
+});
+
+test('runShellCommand has a time limit, which ends the process', async () => {
+  const started = [];
+  const script = 'setInterval(function () {}, 1000)';
+  const answer = await runShellCommand({
+    command: `"${process.execPath}" -e "${script}"`, cwd: os.tmpdir(), shell: SHELL_FOR_TEST, timeoutMs: 400, onStart: (child) => started.push(child)
+  });
+  assert.equal(answer.timedOut, true);
+  assert.equal(started.length, 1);
+  assert.equal(pidAlive(started[0].pid), false);
 });

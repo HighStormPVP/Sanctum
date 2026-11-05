@@ -5,11 +5,11 @@ const crypto = require('crypto');
 const os = require('os');
 const { exec, spawn } = require('child_process');
 const { McpManager } = require('./lib/mcp-manager');
-const { isWithinRoots, isInProfile, applyExactPatch, globToRegex, walkFiles } = require('./lib/fs-rules');
+const { isWithinRoots, checkAgentPath, applyExactPatch } = require('./lib/fs-rules');
 const { safeFetchText, isAppPage } = require('./lib/url-rules');
-const { grepInWorker } = require('./lib/grep-runner');
+const { grepInWorker, globInWorker } = require('./lib/grep-runner');
 const { detectRepetitionLoop, splitOutputLines, quoteWindowsArg, encodePowerShell } = require('./lib/text-rules');
-const { killTree } = require('./lib/kill-tree');
+const { killTree, startInOwnGroup, runShellCommand } = require('./lib/kill-tree');
 const { devToolsAllowed, applicationMenuTemplate } = require('./lib/window-rules');
 const { createKeystore, retryTransient } = require('./lib/remote/keystore');
 const { createManager: createRemoteManager } = require('./lib/remote/manager');
@@ -549,10 +549,14 @@ app.on('before-quit', (e) => {
   const cleanup = (async () => {
     // Kill in-flight generations first so nothing reloads a model behind us.
     endRemoteRunsWithPage();
+    remoteRefusals.flush();
     if (remoteManager) { try { remoteManager.shutdown(); } catch {} }
     for (const [, entry] of activeChatStreams) { try { entry.controller.abort(); } catch {} }
-    for (const task of backgroundTasks.values()) { if (task.proc) killTree(task.proc); }
-    for (const entry of videoProcesses.values()) { entry.aborted = true; if (entry.proc) killTree(entry.proc); }
+    for (const task of backgroundTasks.values()) { if (task.proc) killing(task.proc); }
+    for (const entry of videoProcesses.values()) { entry.aborted = true; if (entry.proc) killing(entry.proc); }
+    // Windows has to finish taskkill while this app is still here. Quit straight after starting it,
+    // and the process goes on running.
+    await Promise.all(killsUnderWay);
     const unloaded = await unloadAllOllamaModels();
     if (unloaded.length) dlog(`quit · unloaded ${unloaded.length} model(s): ${unloaded.join(', ')}`);
     if (mcpManager) { try { await mcpManager.stopAll(); } catch {} }
@@ -725,13 +729,14 @@ function startRemoteControl() {
     })
   });
   remoteManager.onFrame((deviceId, frame) => {
-    const delivered = sendToLocalUi('remote:frame', { deviceId, frame });
-    if (!delivered && frame?.type === 'tool-call') refuseWithNoWindow(deviceId, frame);
+    if (frame?.type === 'tool-call' && !admitToolCall(deviceId, frame)) return;
+    sendToLocalUi('remote:frame', { deviceId, frame });
   });
   // The work ends first, so a switch turned off has taken effect by the time anything says so.
   remoteManager.onStatus((status) => {
+    lastRemoteStatus = status;
     reconcileRemoteWork(status);
-    sendToLocalUi('remote:status', status);
+    sendToLocalUi('remote:status', withHomeTasks(status));
   });
 }
 
@@ -762,7 +767,7 @@ function handleRemote(channel, handler) {
   });
 }
 
-handleRemote('remote:status', () => remoteManager.status());
+handleRemote('remote:status', () => withHomeTasks(remoteManager.status()));
 handleRemote('remote:setAddress', ({ url }) => remoteManager.setAddress(url));
 handleRemote('remote:setPin', ({ pin }) => remoteManager.setPin(pin));
 handleRemote('remote:unlock', ({ pin }) => remoteManager.unlock(pin));
@@ -774,46 +779,75 @@ handleRemote('remote:removeDevice', ({ id }) => remoteManager.removeDevice(id));
 // handleRemote has checked the sender by now, which is what makes this claim true.
 handleRemote('remote:setControlAllowed', ({ allowed }) => remoteManager.setControlAllowed(allowed, { fromLocalUi: true }));
 handleRemote('remote:send', ({ deviceId, frame }) => remoteManager.send(deviceId, frame));
-handleRemote('remote:audit', (entry) => writeRemoteAudit(entry));
-handleRemote('remote:endRun', ({ deviceId, id }) => endRemoteRun(remoteRunKey({ deviceId, id }), 'stopped'));
+handleRemote('remote:audit', (entry) => {
+  if (entry?.event === 'refused') remoteRefusals.note(entry);
+  else writeLog(REMOTE_AUDIT_FILE, entry);
+  return { ok: true };
+});
+handleRemote('remote:endRun', ({ deviceId, id, reason }) => endRemoteRun(remoteRunKey({ deviceId, id }), reason === 'too long' ? reason : 'stopped'));
 
 // =================== WHAT A HOME PC RUNS HERE ===================
 // The switch going off, the link dropping, and Stop all have to reach a process, so what a home PC
-// started is kept here, where they are, rather than in a page that may be gone. A live run_command
-// ends with the link, because the model has been told it failed. A background task only ends with
-// the switch or the pairing: the design has it keep going, and report on reconnect.
-const REMOTE_AUDIT_MAX_BYTES = 16 * 1024 * 1024;
+// started is kept here, where they are, rather than in a page that may be gone. What ends what is
+// decided by RemoteRules.remoteWorkToEnd.
+const REMOTE_LOG_MAX_BYTES = 16 * 1024 * 1024;
+const REMOTE_AUDIT_FILE = 'remote-audit.log';
+const REMOTE_REFUSALS_FILE = 'remote-refusals.log';
 const remoteRuns = new Map(); // `${deviceId}:${id}` -> { child, deviceId, id, command, ended }
+const killsUnderWay = new Set();
+let lastRemoteStatus = null;
 
-// One JSON object per line, in this device's own profile, and it can't grow without limit however
-// many refusals a paired device asks for.
-function writeRemoteAudit(entry) {
+// One JSON object per line, in this device's own profile, each log rotating by itself.
+//
+// remote-audit.log holds only what ran: a `started` line, written here before anything runs, so a
+// crash leaves a record of what it interrupted, and an `ended` line. Refusals have their own file,
+// so a device with the switch off can't rotate this one away by asking for what it can't have. A
+// home with the switch on can still rotate it by running things, and can delete it with a command.
+// That's accepted, since a device that can run commands here can already do either.
+function writeLog(file, entry) {
   try {
-    const file = path.join(app.getPath('userData'), 'remote-audit.log');
+    const full = path.join(app.getPath('userData'), file);
     try {
-      if (fs.statSync(file).size > REMOTE_AUDIT_MAX_BYTES) fs.renameSync(file, `${file}.old`);
+      if (fs.statSync(full).size > REMOTE_LOG_MAX_BYTES) fs.renameSync(full, `${full}.old`);
     } catch (err) {
       if (err.code !== 'ENOENT') throw err;
     }
-    fs.appendFileSync(file, RemoteRules.auditLine({ ...entry, ts: new Date().toISOString() }) + '\n');
-    return { ok: true };
-  } catch (e) {
-    return { error: e.message };
-  }
+    fs.appendFileSync(full, RemoteRules.auditLine({ ...entry, ts: new Date().toISOString() }) + '\n');
+  } catch { /* what can't be written can't stop what it records */ }
 }
+
+const remoteRefusals = RemoteRules.createRefusalLog({
+  write: (entry) => writeLog(REMOTE_REFUSALS_FILE, entry),
+  clock: { setTimeout: (fn, ms) => setTimeout(fn, ms), clearTimeout: (timer) => clearTimeout(timer) }
+});
 
 function noteToolRefused({ deviceId, deviceName, reason, frame }) {
   const tool = typeof frame?.name === 'string' ? frame.name : '';
-  writeRemoteAudit({
+  remoteRefusals.note({
     event: 'refused', device: deviceId, deviceName, chatTitle: frame?.chatTitle, tool, args: RemoteRules.auditArgs(tool, frame?.args), reason, ok: false
   });
 }
 
-// A Mac with its window closed has nothing to run this, and home shouldn't wait to find out.
-function refuseWithNoWindow(deviceId, frame) {
-  const reason = "Sanctum's window is closed on this device, so nothing ran.";
-  noteToolRefused({ deviceId, reason, frame });
-  remoteManager.send(deviceId, { type: 'tool-result', id: frame.id, result: { error: reason }, summary: 'refused', ok: false });
+function remoteDeviceName(deviceId) {
+  return lastRemoteStatus?.devices?.find((d) => d.id === deviceId)?.name;
+}
+
+// The manager has settled that this device may ask. This settles what it's asking for, by the rules
+// the page also uses, and records it before anything can happen. False if it stops here.
+function admitToolCall(deviceId, frame) {
+  const mcpNames = new Set(mcpManager ? mcpManager.getOllamaTools().map((tool) => tool.function.name) : []);
+  const check = RemoteRules.checkToolCall(frame, mcpNames);
+  const noWindow = !mainWindow || mainWindow.isDestroyed();
+  const reason = check.error || (noWindow ? "Sanctum's window is closed on this device, so nothing ran." : null);
+  if (reason) {
+    noteToolRefused({ deviceId, deviceName: remoteDeviceName(deviceId), reason, frame });
+    if (check.id) remoteManager.send(deviceId, { type: 'tool-result', id: check.id, result: { error: reason }, summary: 'refused', ok: false });
+    return false;
+  }
+  writeLog(REMOTE_AUDIT_FILE, {
+    event: 'started', call: check.id, device: deviceId, deviceName: remoteDeviceName(deviceId), chatTitle: check.chatTitle, tool: check.name, args: RemoteRules.auditArgs(check.name, check.args)
+  });
+  return true;
 }
 
 function remoteRunKey(remoteCall) {
@@ -827,33 +861,46 @@ function remoteCallRefused(remoteCall) {
   return remoteManager.toolCallRefusal(remoteCall.deviceId);
 }
 
+// A kill that quitting has to wait for.
+function killing(proc) {
+  const kill = killTree(proc).finally(() => killsUnderWay.delete(kill));
+  killsUnderWay.add(kill);
+  return kill;
+}
+
 function endRemoteRun(key, reason) {
   const run = remoteRuns.get(key);
   if (!run || run.ended) return { ok: true };
   run.ended = true;
-  killTree(run.child);
-  writeRemoteAudit({ event: 'ended', device: run.deviceId, tool: 'run_command', args: { command: run.command }, reason, ok: false });
+  killing(run.child);
+  writeLog(REMOTE_AUDIT_FILE, { event: 'ended', call: run.id, device: run.deviceId, tool: 'run_command', args: { command: run.command }, reason, ok: false });
   return { ok: true };
 }
 
 function endRemoteTask(task, reason) {
   task.status = 'killed';
-  killTree(task.proc);
-  writeRemoteAudit({ event: 'ended', device: task.remoteDevice, tool: 'run_command_async', args: { command: task.command }, reason, ok: false });
+  killing(task.proc);
+  writeLog(REMOTE_AUDIT_FILE, { event: 'ended', device: task.remoteDevice, tool: 'run_command_async', args: { command: task.command }, reason, ok: false });
 }
 
 function reconcileRemoteWork(status) {
-  const off = status.controlAllowed !== true || status.needsPin === true;
-  const homes = new Map((status.devices || []).filter((d) => d.role === 'home').map((d) => [d.id, d]));
-  for (const [key, run] of remoteRuns) {
-    if (off) endRemoteRun(key, 'off');
-    else if (!homes.get(run.deviceId)?.connected) endRemoteRun(key, 'offline');
+  const tasks = [...backgroundTasks.values()].filter((task) => task.remoteDevice && task.status === 'running');
+  const ending = RemoteRules.remoteWorkToEnd({
+    status,
+    runs: [...remoteRuns].filter(([, run]) => !run.ended).map(([key, run]) => ({ key, deviceId: run.deviceId })),
+    tasks: tasks.map((task) => ({ id: task.id, deviceId: task.remoteDevice }))
+  });
+  for (const end of ending) {
+    if (end.kind === 'run') endRemoteRun(end.key, end.reason);
+    else endRemoteTask(backgroundTasks.get(end.id), end.reason);
   }
-  for (const task of backgroundTasks.values()) {
-    if (!task.remoteDevice || task.status !== 'running') continue;
-    if (off) endRemoteTask(task, 'off');
-    else if (!homes.has(task.remoteDevice)) endRemoteTask(task, 'removed');
-  }
+}
+
+// Which home PCs have something running here that outlasts its call. The page shows the running
+// indicator for these too, because that's the one way to turn them off without the PIN.
+function withHomeTasks(status) {
+  const running = [...backgroundTasks.values()].filter((task) => task.remoteDevice && task.status === 'running');
+  return { ...status, homeTasks: [...new Set(running.map((task) => task.remoteDevice))] };
 }
 
 // The page that would have answered is going away, so nothing else will tell the home PC.
@@ -2063,7 +2110,7 @@ ipcMain.handle('shell:run_async', async (_e, { command, cwd, allowlist, remoteCa
     }
     // An id of its own, so one a model remembers from here can't find a task on the home PC.
     const taskId = (remoteCall ? 'remote_task_' : 'task_') + (nextTaskId++);
-    const proc = spawn(command, [], {
+    const proc = startInOwnGroup(command, {
       cwd: wd,
       // Same resolved shell as sync shell:run — Git Bash on Windows if
       // installed, else cmd.exe.
@@ -2080,19 +2127,24 @@ ipcMain.handle('shell:run_async', async (_e, { command, cwd, allowlist, remoteCa
     const cap = (s) => s.length > 200_000 ? s.slice(-200_000) : s;
     proc.stdout.on('data', d => { task.stdout = cap(task.stdout + d.toString()); });
     proc.stderr.on('data', d => { task.stderr = cap(task.stderr + d.toString()); });
+    // The running indicator on a laptop goes by these, so it has to hear when one ends.
+    const homeTaskChanged = () => { if (task.remoteDevice) remoteManager?.refreshStatus(); };
     proc.on('exit', (code) => {
       task.status = (task.status === 'killed') ? 'killed' : 'done';
       task.exitCode = code;
       task.finishedAt = Date.now();
       task.proc = null;
+      homeTaskChanged();
     });
     proc.on('error', (err) => {
       task.status = 'error';
       task.stderr += '\n' + err.message;
       task.finishedAt = Date.now();
       task.proc = null;
+      homeTaskChanged();
     });
     backgroundTasks.set(taskId, task);
+    homeTaskChanged();
     return { taskId, command, cwd: wd };
   } catch (e) { return { error: e.message }; }
 });
@@ -2751,15 +2803,32 @@ function withinAllowlist(filePath, allowlist) {
 // The agent's reads stop here, before the allowlist, so being refused can't offer a pop-up to
 // widen it. A folder above the profile is fine: a walk goes around it. Sanctum's own code reads
 // this folder with fs directly, not through these handlers. run_command isn't limited by this.
-const inProfile = (fp) => isInProfile(fp, app.getPath('userData'));
 const PROFILE_REFUSAL = { error: "That is inside Sanctum's own data folder, which the agent's file tools can't open.", inProfile: true };
+
+// Null if a tool may use this path. A path outside every allowed folder is refused by its words,
+// before anything canonicalizes it, so a network path nobody allowed touches nothing.
+function checkedPath(fp, allowlist) {
+  return checkAgentPath(fp, { roots: (allowlist || []).map(resolveSafe).filter(Boolean), profile: app.getPath('userData') });
+}
+
+function pathRefusal(fp, requested, allowlist) {
+  const problem = checkedPath(fp, allowlist);
+  if (problem === 'profile') return PROFILE_REFUSAL;
+  return problem ? { error: `path "${requested}" is outside the allowed roots: ${(allowlist || []).join(', ')}` } : null;
+}
+
+function rootRefusal(root, allowlist) {
+  const problem = checkedPath(root, allowlist);
+  if (problem === 'profile') return PROFILE_REFUSAL;
+  return problem ? { error: 'root outside allowed roots' } : null;
+}
 
 ipcMain.handle('fs:read_file', async (_e, requestedPath, allowlist) => {
   try {
     const fp = resolveSafe(requestedPath);
     if (!fp) return { error: 'path required' };
-    if (inProfile(fp)) return PROFILE_REFUSAL;
-    if (!withinAllowlist(fp, allowlist)) return { error: `path "${requestedPath}" is outside the allowed roots: ${(allowlist || []).join(', ')}` };
+    const refused = pathRefusal(fp, requestedPath, allowlist);
+    if (refused) return refused;
     if (!fs.existsSync(fp)) return { error: 'file not found' };
     const stat = fs.statSync(fp);
     if (stat.isDirectory()) return { error: 'path is a directory — use list_dir instead' };
@@ -2773,8 +2842,8 @@ ipcMain.handle('fs:list_dir', async (_e, requestedPath, allowlist) => {
   try {
     const fp = resolveSafe(requestedPath);
     if (!fp) return { error: 'path required' };
-    if (inProfile(fp)) return PROFILE_REFUSAL;
-    if (!withinAllowlist(fp, allowlist)) return { error: `path "${requestedPath}" is outside the allowed roots: ${(allowlist || []).join(', ')}` };
+    const refused = pathRefusal(fp, requestedPath, allowlist);
+    if (refused) return refused;
     if (!fs.existsSync(fp)) return { error: 'directory not found' };
     const stat = fs.statSync(fp);
     if (!stat.isDirectory()) return { error: 'not a directory' };
@@ -2793,8 +2862,8 @@ ipcMain.handle('fs:write_file', async (_e, { path: p, content, allowlist }) => {
   try {
     const fp = resolveSafe(p);
     if (!fp) return { error: 'path required' };
-    if (inProfile(fp)) return PROFILE_REFUSAL;
-    if (!withinAllowlist(fp, allowlist)) return { error: `path "${p}" is outside the allowed roots: ${(allowlist || []).join(', ')}` };
+    const refused = pathRefusal(fp, p, allowlist);
+    if (refused) return refused;
     fs.mkdirSync(path.dirname(fp), { recursive: true });
     fs.writeFileSync(fp, content ?? '', 'utf-8');
     return { path: fp, bytes: Buffer.byteLength(content ?? '', 'utf-8') };
@@ -2805,8 +2874,8 @@ ipcMain.handle('fs:apply_patch', async (_e, { path: p, find, replace, allowlist 
   try {
     const fp = resolveSafe(p);
     if (!fp) return { error: 'path required' };
-    if (inProfile(fp)) return PROFILE_REFUSAL;
-    if (!withinAllowlist(fp, allowlist)) return { error: `path "${p}" is outside the allowed roots: ${(allowlist || []).join(', ')}` };
+    const refused = pathRefusal(fp, p, allowlist);
+    if (refused) return refused;
     if (typeof find !== 'string' || !find.length) return { error: 'find string required' };
     if (!fs.existsSync(fp)) return { error: 'file not found' };
     const orig = fs.readFileSync(fp, 'utf-8');
@@ -2846,17 +2915,10 @@ ipcMain.handle('fs:glob', async (_e, { pattern, root, allowlist }) => {
   try {
     const r = resolveSafe(root || os.homedir());
     if (!r) return { error: 'root required' };
-    if (inProfile(r)) return PROFILE_REFUSAL;
-    if (!withinAllowlist(r, allowlist)) return { error: 'root outside allowed roots' };
+    const refused = rootRefusal(r, allowlist);
+    if (refused) return refused;
     if (!pattern || typeof pattern !== 'string') return { error: 'pattern required' };
-    const re = globToRegex(pattern);
-    const all = walkFiles(r, { skipDir: inProfile });
-    const matches = [];
-    for (const f of all) {
-      const rel = path.relative(r, f).replace(/\\/g, '/');
-      if (re.test(rel)) { matches.push(rel); if (matches.length >= 500) break; }
-    }
-    return { root: r, matches };
+    return await globInWorker({ pattern, root: r, profile: app.getPath('userData') });
   } catch (e) { return { error: e.message }; }
 });
 
@@ -2864,10 +2926,10 @@ ipcMain.handle('fs:grep', async (_e, { pattern, root, glob: globFilter, caseInse
   try {
     const r = resolveSafe(root || os.homedir());
     if (!r) return { error: 'root required' };
-    if (inProfile(r)) return PROFILE_REFUSAL;
-    if (!withinAllowlist(r, allowlist)) return { error: 'root outside allowed roots' };
+    const refused = rootRefusal(r, allowlist);
+    if (refused) return refused;
     if (!pattern || typeof pattern !== 'string') return { error: 'pattern required' };
-    return await grepInWorker({ pattern, root: r, globFilter, caseInsensitive, skipDir: inProfile });
+    return await grepInWorker({ pattern, root: r, globFilter, caseInsensitive, profile: app.getPath('userData') });
   } catch (e) { return { error: e.message }; }
 });
 
@@ -2875,31 +2937,20 @@ ipcMain.handle('fs:grep', async (_e, { pattern, root, glob: globFilter, caseInse
 ipcMain.handle('shell:run', async (_e, { command, cwd, remoteCall }) => {
   const refused = remoteCallRefused(remoteCall);
   if (refused) return { error: refused };
-  return new Promise((resolve) => {
-    const wd = cwd ? resolveSafe(cwd) : os.homedir();
-    let timedOut = false;
-    const child = exec(command, {
-      cwd: wd,
-      maxBuffer: 4 * 1024 * 1024,
-      // SHELL is the resolved shell at boot — Git Bash on Windows when it's
-      // installed, else cmd.exe; /bin/sh on macOS/Linux.
-      shell: SHELL.path,
-      windowsHide: true
-    }, (err, stdout, stderr) => {
-      clearTimeout(timer);
-      if (remoteCall) remoteRuns.delete(remoteRunKey(remoteCall));
-      resolve({
-        command,
-        cwd: wd,
-        exitCode: err ? (typeof err.code === 'number' ? err.code : 1) : 0,
-        stdout: (stdout || '').slice(0, 20_000),
-        stderr: (stderr || '').slice(0, 20_000),
-        timedOut
-      });
-    });
-    if (remoteCall) remoteRuns.set(remoteRunKey(remoteCall), { child, deviceId: remoteCall.deviceId, id: remoteCall.id, command, ended: false });
-    const timer = setTimeout(() => { timedOut = true; killTree(child); }, 60_000);
+  const wd = cwd ? resolveSafe(cwd) : os.homedir();
+  const result = await runShellCommand({
+    command,
+    cwd: wd,
+    // SHELL is the resolved shell at boot — Git Bash on Windows when it's
+    // installed, else cmd.exe; /bin/sh on macOS/Linux.
+    shell: SHELL.path,
+    timeoutMs: 60_000,
+    onStart: (child) => {
+      if (remoteCall) remoteRuns.set(remoteRunKey(remoteCall), { child, deviceId: remoteCall.deviceId, id: remoteCall.id, command, ended: false });
+    }
   });
+  if (remoteCall) remoteRuns.delete(remoteRunKey(remoteCall));
+  return { command, cwd: wd, ...result };
 });
 
 // Download a ComfyUI-generated media file into the local cache and return an aio-media:// URL.
