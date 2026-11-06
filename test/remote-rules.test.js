@@ -1380,6 +1380,20 @@ test('a relative cwd lands where the machine\'s own path rules put it', () => {
   }
 });
 
+test('on Windows a cwd rooted with no drive takes the project folder\'s drive', () => {
+  const { resolveCwd } = RemoteRules;
+  const win = require('node:path').win32;
+  for (const folder of ['C:\\work\\proj', 'd:/other/place', '\\\\server\\share\\deep']) {
+    for (const cwd of ['\\foo', '/foo', '\\foo\\..\\bar', '/', '\\', '/a/./b/../c']) {
+      assert.deepEqual(resolveCwd(cwd, folder, 'win32'), { cwd: win.resolve(folder, cwd) }, `${folder} + ${cwd}`);
+    }
+  }
+  for (const cwd of ['\\foo', '/foo']) assert.match(resolveCwd(cwd, '', 'win32').error ?? '', /drive letter/, `${cwd} with no folder`);
+  assert.deepEqual(resolveCwd('\\\\server\\share\\x', 'C:\\work', 'win32'), { cwd: '\\\\server\\share\\x' }, 'a share is left alone');
+  assert.deepEqual(resolveCwd('//server/share/x', 'C:\\work', 'win32'), { cwd: '//server/share/x' });
+  assert.deepEqual(resolveCwd('/usr/local', '/home/a', 'linux'), { cwd: '/usr/local' }, 'elsewhere a slash is a root');
+});
+
 test('a cwd that is blank, absolute, or can\'t be placed', () => {
   const { resolveCwd } = RemoteRules;
   for (const blank of [undefined, null, '', ' ', '\t ']) {

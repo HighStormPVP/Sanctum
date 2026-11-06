@@ -68,7 +68,12 @@ const visible = (device, selector) => device.page.evaluate((sel) => {
   return Boolean(el) && !el.hidden && el.getClientRects().length > 0;
 }, selector);
 const textOf = (device, selector) => device.page.evaluate((sel) => document.querySelector(sel)?.textContent ?? null, selector);
-const click = (device, selector) => device.page.evaluate((sel) => document.querySelector(sel).click(), selector);
+const click = (device, selector) => device.page.evaluate(async (sel) => {
+  const el = document.querySelector(sel);
+  const overlay = el.closest('.modal-overlay');
+  for (let i = 0; overlay && !overlay.hidden && overlay.dataset.shown !== 'yes' && i < 250; i += 1) await new Promise((resolve) => setTimeout(resolve, 20));
+  el.click();
+}, selector);
 const framesOf = async (device, type) => (await device.frames()).filter((f) => f.type === type);
 const pendingCalls = (device) => device.page.evaluate(() => remoteTools.pending.size);
 const runningCalls = (device) => device.page.evaluate(() => remoteTools.running.size);

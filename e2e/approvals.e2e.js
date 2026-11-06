@@ -29,9 +29,15 @@ const visible = (device, selector) => device.page.evaluate((sel) => {
   return Boolean(el) && !el.hidden && el.getClientRects().length > 0;
 }, selector);
 const textOf = (device, selector) => device.page.evaluate((sel) => document.querySelector(sel)?.textContent ?? null, selector);
-const click = (device, selector) => device.page.evaluate((sel) => document.querySelector(sel).click(), selector);
+const click = (device, selector) => device.page.evaluate(async (sel) => {
+  const el = document.querySelector(sel);
+  const overlay = el.closest('.modal-overlay');
+  for (let i = 0; overlay && !overlay.hidden && overlay.dataset.shown !== 'yes' && i < 250; i += 1) await new Promise((resolve) => setTimeout(resolve, 20));
+  el.click();
+}, selector);
 const framesOf = async (device, type) => (await device.frames()).filter((f) => f.type === type);
-const appears = (device, kind, ms = 8000) => waitFor(`${device.name} to show the ${kind} pop-up`, () => visible(device, OVERLAY[kind]), ms);
+const painted = (device, selector) => device.page.evaluate((sel) => document.querySelector(sel)?.dataset.shown === 'yes', selector);
+const appears = (device, kind, ms = 8000) => waitFor(`${device.name} to show the ${kind} pop-up`, async () => (await visible(device, OVERLAY[kind])) && painted(device, OVERLAY[kind]), ms);
 const closes = (device, kind, ms = 8000) => waitFor(`${device.name} to close the ${kind} pop-up`, async () => !(await visible(device, OVERLAY[kind])), ms);
 const toasts = (device) => device.page.evaluate(() => [...document.querySelectorAll('#toast-host .toast')].map((el) => el.textContent));
 const clearToasts = (device) => device.page.evaluate(() => document.querySelectorAll('#toast-host .toast').forEach((el) => el.remove()));
@@ -1228,7 +1234,7 @@ test('pop-ups on every device', async (t) => {
     await waitFor('the second to reach the laptop', async () => (await heldCount(laptop)) === 2, 5000);
     return { a, b, finishA, finishB };
   }
-  const showing = (device, words) => waitFor(`${device.name} to show ${words}`, async () => (await visible(device, OVERLAY.approval)) && ((await textOf(device, '#approval-body')) ?? '').includes(words), 5000);
+  const showing = (device, words) => waitFor(`${device.name} to show ${words}`, async () => (await visible(device, OVERLAY.approval)) && (await painted(device, OVERLAY.approval)) && ((await textOf(device, '#approval-body')) ?? '').includes(words), 5000);
 
   await t.test('a stray or double click can\'t approve what nobody read', async (s) => {
     await shippedGuard(home, laptop);
@@ -1954,6 +1960,194 @@ test('pop-ups on every device', async (t) => {
     await finish();
     await home.remote('removeDevice', slowId);
     await waitFor('it to go', async () => !(await home.remote('status')).devices.some((d) => d.id === slowId), 5000);
+  });
+
+
+  // ---- Round 2: judged by when things happened ----
+
+  await t.test('a pop-up is judged by when each press happened, not when the page got round to it', async (s) => {
+    const MIB = 1024 * 1024;
+    const cdpOf = new Map();
+    const cdp = async (device) => {
+      if (!cdpOf.has(device)) cdpOf.set(device, await device.page.context().newCDPSession(device.page));
+      return cdpOf.get(device);
+    };
+    const press = async (device, p, clickCount) => {
+      const session = await cdp(device);
+      const ev = (type) => session.send('Input.dispatchMouseEvent', { type, x: p.x, y: p.y, button: 'left', clickCount });
+      return [ev('mousePressed'), ev('mouseReleased')];
+    };
+    // Two writes in two chats, the second large, both open here and nothing anywhere else.
+    async function smallThenLarge(name, mb) {
+      const a = await newChat(home, { ...baseChat, remoteControl: false });
+      const b = await newChat(home, { ...baseChat, remoteControl: false });
+      const fileA = path.join(homeDir, `${name}-a.txt`);
+      const fileB = path.join(homeDir, `${name}-b.txt`);
+      const finishA = await modelCalls(a, 'write_file', { path: fileA, content: 'a'.repeat(20000) });
+      await appears(home, 'approval');
+      const finishB = await modelCalls(b, 'write_file', { path: fileB, content: 'b'.repeat(mb * MIB) });
+      await waitFor('both open', () => home.page.evaluate(() => remoteAsks.open.size === 2), 60000);
+      return { fileA, fileB, finishA, finishB };
+    }
+    await shippedGuard(home);
+
+    for (const mb of [6, 10]) {
+      await s.test(`a double-click queued while a ${mb} MB pop-up is drawn approves only the first`, async () => {
+        const { fileA, fileB, finishA, finishB } = await smallThenLarge(`queued-${mb}`, mb);
+        await pastTheGuard();
+        const p = await mouseAt(home, YES.approval);
+        await sleep(300);
+        // Sent together, as a person's double-click is queued while the page is busy.
+        await Promise.all([...(await press(home, p, 1)), ...(await press(home, p, 2))]);
+        assert.equal((await finishA()).bytes, 20000);
+        await waitFor('the second to be painted', () => painted(home, OVERLAY.approval), 60000);
+        await sleep(500);
+        assert.equal(fs.existsSync(fileB), false, 'nothing ran for the one never on screen');
+        assert.equal(await visible(home, OVERLAY.approval), true);
+        await click(home, NO.approval);
+        assert.match((await finishB()).error, /denied/);
+        assert.equal(fs.existsSync(fileA), true);
+      });
+    }
+
+    await s.test('a key press queued while a large pop-up is drawn doesn\'t answer it', async () => {
+      const { fileB, finishA, finishB } = await smallThenLarge('queued-key', 6);
+      await pastTheGuard();
+      const p = await mouseAt(home, YES.approval);
+      const session = await cdp(home);
+      const key = (type) => session.send('Input.dispatchKeyEvent', { type, key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, text: type === 'keyDown' ? '\r' : undefined });
+      await Promise.all([...(await press(home, p, 1)), key('keyDown'), key('keyUp')]);
+      await finishA();
+      await waitFor('the second to be painted', () => painted(home, OVERLAY.approval), 60000);
+      await sleep(500);
+      assert.equal(await visible(home, OVERLAY.approval), true, 'neither approved nor refused by it');
+      assert.equal(fs.existsSync(fileB), false);
+      await click(home, NO.approval);
+      await finishB();
+    });
+
+    await s.test('a click after the guard on a large pop-up still approves', async () => {
+      const id = await newChat(home, { ...baseChat, remoteControl: false });
+      const file = path.join(homeDir, 'large-approved.txt');
+      const finish = await modelCalls(id, 'write_file', { path: file, content: 'c'.repeat(6 * MIB) });
+      await waitFor('it to be painted', async () => (await visible(home, OVERLAY.approval)) && painted(home, OVERLAY.approval), 60000);
+      await pastTheGuard();
+      const p = await mouseAt(home, YES.approval);
+      await home.page.mouse.click(p.x, p.y);
+      assert.equal((await finish()).bytes, 6 * MIB);
+      assert.equal(fs.statSync(file).size, 6 * MIB);
+    });
+
+    await s.test('a press inside the guard that the page only gets to after it doesn\'t count', async () => {
+      const busy = (ms) => home.page.evaluate((wait) => { setTimeout(() => { const end = performance.now() + wait; while (performance.now() < end) { /* busy */ } }, 0); }, ms);
+      for (const how of ['mouse', 'key']) {
+        const id = await newChat(home, { ...baseChat, remoteControl: false });
+        const file = path.join(homeDir, `late-${how}.txt`);
+        const finish = await modelCalls(id, 'run_command', { command: `echo x >> late-${how}.txt` });
+        await appears(home, 'approval');
+        const p = await centre(home, YES.approval);
+        // Focus on Approve without a key, so a key press reaching it would be one press after a quiet spell.
+        await home.page.evaluate(() => document.querySelector('#approval-approve').focus());
+        const session = await cdp(home);
+        await busy(guardMs + 1000);
+        if (how === 'mouse') await Promise.all(await press(home, p, 1));
+        else await Promise.all(['keyDown', 'keyUp'].map((type) => session.send('Input.dispatchKeyEvent', { type, key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, text: type === 'keyDown' ? '\r' : undefined })));
+        await sleep(guardMs + 1500);
+        assert.equal(lineCount(file), 0, `${how}: made inside the guard, so it didn't count, however late it was handled`);
+        assert.equal(await visible(home, OVERLAY.approval), true);
+        await click(home, NO.approval);
+        await finish();
+      }
+    });
+
+    await s.test('until it has been painted nothing on it agrees, however long it has been open', async () => {
+      const id = await shared();
+      await go(id);
+      await home.page.evaluate(() => {
+        // Holds back the paint, as a busy or hidden window does.
+        window.__realFrame = window.requestAnimationFrame;
+        window.requestAnimationFrame = () => 0;
+      });
+      const first = await ollama.next();
+      first.call(['run_command', { command: 'echo x >> unpainted.txt' }]);
+      first.finish();
+      await waitFor('it to be up', () => visible(home, OVERLAY.approval), 5000);
+      await home.page.evaluate(() => { remoteAsks.guardMs = 0; });
+      await sleep(400);
+      await home.page.evaluate(() => document.querySelector('#approval-approve').click());
+      const p = await mouseAt(home, YES.approval);
+      await home.page.mouse.click(p.x, p.y);
+      await home.page.keyboard.press('Tab');
+      await home.page.keyboard.press('Enter');
+      await sleep(300);
+      assert.equal(await visible(home, OVERLAY.approval), true);
+      assert.equal(lineCount(path.join(homeDir, 'unpainted.txt')), 0);
+      await home.page.evaluate(() => { window.requestAnimationFrame = window.__realFrame; });
+      await home.page.evaluate(() => document.querySelector('#approval-deny').click());
+      await closes(home, 'approval');
+      await shippedGuard(home);
+      const second = await ollama.next();
+      second.say('Done.');
+      second.finish();
+      await stopped(id);
+    });
+
+    await noGuard(home);
+  });
+
+  await t.test('"more lines below" goes under whatever scrolls', async (s) => {
+    const moreNotes = (device) => device.page.evaluate(() => [...document.querySelectorAll('.ask-more-lines')].filter((el) => !el.hidden).map((el) => ({
+      text: el.textContent,
+      under: el.previousElementSibling?.id || el.previousElementSibling?.className || ''
+    })));
+    const count = (text) => Number(/^(\d+) more lines? below$/.exec(text ?? '')?.[1]);
+
+    await s.test('a laptop\'s plan with its second step under 80 blank lines', async () => {
+      const id = await shared({ planMode: true, approvalMode: false });
+      const finish = await modelCalls(id, 'exit_plan_mode', { plan: `1. Read the README.${'\n'.repeat(80)}2. Do the second thing.` });
+      await appears(laptop, 'plan');
+      const notes = await moreNotes(laptop);
+      const under = notes.find((n) => n.under === 'plan-approval-body');
+      assert.ok(under, JSON.stringify(notes));
+      assert.ok(count(under.text) >= 20, under.text);
+      await laptop.page.evaluate(() => { const body = document.querySelector('#plan-approval-body'); body.scrollTop = body.scrollHeight; });
+      await waitFor('it to go', async () => !(await moreNotes(laptop)).some((n) => n.under === 'plan-approval-body'), 3000);
+      await click(laptop, NO.plan);
+      await finish();
+    });
+
+    await s.test('a long plan at home', async () => {
+      const id = await shared({ planMode: true, approvalMode: false });
+      const plan = Array.from({ length: 90 }, (_, i) => `${i + 1}. Step number ${i + 1}.`).join('\n');
+      const finish = await modelCalls(id, 'exit_plan_mode', { plan });
+      await appears(home, 'plan');
+      const under = (await moreNotes(home)).find((n) => n.under === 'plan-approval-body');
+      assert.ok(under && count(under.text) > 0, JSON.stringify(await moreNotes(home)));
+      await click(home, NO.plan);
+      await finish();
+    });
+
+    await s.test('a box and its container both overflowing each say so', async () => {
+      const size = await laptop.app.evaluate(({ BrowserWindow }) => {
+        const win = BrowserWindow.getAllWindows().find((w) => w.isVisible());
+        const before = win.getSize();
+        win.setSize(before[0], 520);
+        return before;
+      });
+      try {
+        await sleep(300);
+        const id = await shared();
+        const finish = await modelCalls(id, 'write_file', { path: path.join(laptopDir, 'both.txt'), content: 'line\n'.repeat(200), device: LAPTOP });
+        await appears(laptop, 'approval');
+        const notes = await moreNotes(laptop);
+        assert.ok(notes.some((n) => n.under === 'approval-body' && count(n.text) > 0), `the container: ${JSON.stringify(notes)}`);
+        assert.ok(notes.some((n) => /approval-code/.test(n.under) && count(n.text) > 0), `and the box: ${JSON.stringify(notes)}`);
+        await click(laptop, NO.approval);
+        await finish();
+      } finally {
+        await laptop.app.evaluate(({ BrowserWindow }, [w, h]) => BrowserWindow.getAllWindows().find((win) => win.isVisible()).setSize(w, h), size);
+      }
+    });
   });
 
 

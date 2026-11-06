@@ -7484,39 +7484,44 @@ const remoteAsks = {
 // is made, and what comes back takes it down again.
 //
 // It can appear under someone's hands, because another device has just answered the one before it.
-// So until remoteAsks.guardMs has passed, every choice but the refusal ignores whatever reaches it,
-// and a click only counts if its press started after this pop-up appeared. Enter and Space do nothing
-// at all until that long after the pop-up, and after the last key pressed, so someone still typing
-// isn't answering. A key held down never counts. Escape and a click on the refusal always work. Focus
-// goes on the refusal, and goes back to where it was afterwards.
+// So its guard starts only once it has been painted, and until remoteAsks.guardMs after that, every
+// choice but the refusal ignores whatever reaches it. A click only counts if its press started after
+// the pop-up was painted. Enter and Space do nothing until that long after the paint, and after the
+// last key pressed, so someone still typing isn't answering. A key held down never counts. Each of
+// these goes by when the press happened, its own timeStamp, not by when the page got round to it: a
+// large pop-up can keep the page busy while a double-click waits in the queue. Escape, the backdrop,
+// and a click on the refusal always work. Focus goes on the refusal, and goes back to where it was.
 function wireAskModal(kind, answer, onlyRefuse = false) {
   const { overlay: selector, choices, words } = ASK_MODALS[kind];
   const overlay = $(selector);
   const refusal = choices[0][1];
-  const openedAt = Date.now();
-  let lastKeyAt = openedAt;
+  // performance.now() when it was first on screen, which is the clock event timeStamps use. The second
+  // frame is the one after the pop-up's content was painted.
+  let shownAt = Infinity;
+  let lastKeyAt = -Infinity;
+  let pressAt = -Infinity;
   let keyLetThrough = null;
-  let pressedSinceOpen = false;
+  const settled = (at) => at >= shownAt + remoteAsks.guardMs;
   const buttons = choices.map(([button, value]) => ({
     el: $(button),
     value,
     onClick: (e) => {
-      if (value !== refusal && (Date.now() - openedAt < remoteAsks.guardMs || (e.detail > 0 && !pressedSinceOpen))) return;
+      if (value !== refusal && (!settled(e.timeStamp) || (e.detail > 0 && pressAt < shownAt))) return;
       answer(value);
     }
   }));
   const cameFrom = document.activeElement;
-  const onPress = () => { pressedSinceOpen = true; };
+  const onPress = (e) => { pressAt = e.timeStamp; };
   const stop = (e) => {
     e.preventDefault();
     e.stopImmediatePropagation();
   };
   const onKeyDown = (e) => {
     if (e.key === 'Escape') return;
-    const quietFor = Date.now() - lastKeyAt;
-    lastKeyAt = Date.now();
+    const quietFor = e.timeStamp - lastKeyAt;
+    lastKeyAt = e.timeStamp;
     if (e.key !== 'Enter' && e.key !== ' ') return;
-    if (e.repeat || quietFor < remoteAsks.guardMs) {
+    if (e.repeat || !settled(e.timeStamp) || quietFor < remoteAsks.guardMs) {
       keyLetThrough = null;
       stop(e);
     } else {
@@ -7533,7 +7538,7 @@ function wireAskModal(kind, answer, onlyRefuse = false) {
     el.addEventListener('click', onClick);
     el.hidden = onlyRefuse && value !== refusal;
   }
-  document.addEventListener('pointerdown', onPress, true);
+  for (const type of ['pointerdown', 'mousedown', 'touchstart']) document.addEventListener(type, onPress, true);
   document.addEventListener('keydown', onKeyDown, true);
   document.addEventListener('keypress', onKeyRest, true);
   document.addEventListener('keyup', onKeyRest, true);
@@ -7542,7 +7547,15 @@ function wireAskModal(kind, answer, onlyRefuse = false) {
   overlay.hidden = false;
   buttons[0].el.focus();
   const unmarkBoxes = markAskBoxes(overlay);
+  let frame = requestAnimationFrame(() => {
+    frame = requestAnimationFrame(() => {
+      shownAt = performance.now();
+      overlay.dataset.shown = 'yes';
+    });
+  });
   return () => {
+    cancelAnimationFrame(frame);
+    delete overlay.dataset.shown;
     overlay.hidden = true;
     unmarkBoxes();
     for (const element of words) $(element).textContent = '';
@@ -7550,7 +7563,7 @@ function wireAskModal(kind, answer, onlyRefuse = false) {
       el.removeEventListener('click', onClick);
       el.hidden = false;
     }
-    document.removeEventListener('pointerdown', onPress, true);
+    for (const type of ['pointerdown', 'mousedown', 'touchstart']) document.removeEventListener(type, onPress, true);
     document.removeEventListener('keydown', onKeyDown, true);
     document.removeEventListener('keypress', onKeyRest, true);
     document.removeEventListener('keyup', onKeyRest, true);
@@ -7562,8 +7575,9 @@ function wireAskModal(kind, answer, onlyRefuse = false) {
 }
 
 // Goes over the boxes of a pop-up that's on the screen. What can't be seen becomes codes, with a line
-// above to say so, in the pop-up only. And a box whose content doesn't fit says how much more there
-// is, because a second command under a screenful of blank lines looks like no second command at all.
+// above to say so, in the pop-up only. And whatever scrolls, a box or the body around the boxes, says
+// how much more there is below it, because a second command under a screenful of blank lines looks
+// like no second command at all.
 function markAskBoxes(overlay) {
   const plain = overlay.querySelector('.plan-approval-body');
   const boxes = [...overlay.querySelectorAll('.approval-code, .approval-diff')];
@@ -7582,12 +7596,19 @@ function markAskBoxes(overlay) {
       node.replaceWith(...parts.map((part) => (part.code ? remoteEl('span', 'ask-code', part.text) : document.createTextNode(part.text))));
     }
     if (found) box.before(remoteEl('p', 'ask-hidden-note', 'This has hidden characters, shown here as codes.'));
-    if (box.scrollHeight > box.clientHeight) noteLinesBelow(box, listening.signal);
+  }
+  // The boxes first, then what holds them, so what the boxes' notes add is counted too.
+  for (const scroller of [...overlay.querySelectorAll('.approval-code, .approval-diff'), ...overlay.querySelectorAll('.modal-body')]) {
+    if (scrollsDown(scroller)) noteLinesBelow(scroller, listening.signal);
   }
   return () => {
     listening.abort();
     overlay.querySelectorAll('.ask-hidden-note, .ask-more-lines').forEach((note) => note.remove());
   };
+}
+
+function scrollsDown(el) {
+  return el.scrollHeight > el.clientHeight && /^(auto|scroll)$/.test(getComputedStyle(el).overflowY);
 }
 
 function noteLinesBelow(box, signal) {

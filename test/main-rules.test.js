@@ -644,6 +644,29 @@ test('runShellCommand has a time limit, which ends the process', async () => {
 
 const { McpClient } = lib('mcp-client.js');
 
+test('an MCP server whose args aren\'t a list of text fails, naming the server, and nothing starts', async (t) => {
+  const write = scripts(t);
+  const marker = path.join(os.tmpdir(), `sanctum-mcp-args-${process.pid}-${Date.now()}.txt`);
+  t.after(() => fs.rmSync(marker, { force: true }));
+  const server = write('marker.js', `require('fs').writeFileSync(${JSON.stringify(marker)}, 'ran'); setInterval(() => {}, 1000);`);
+  const file = server.split('" "')[1].slice(0, -1);
+  for (const args of [file, { 0: file }, [file, 7], [file, null], 5]) {
+    const client = new McpClient({ name: 'my server', command: process.execPath, args, env: {} });
+    await assert.rejects(client.start(), /my server.*args must be a list of text/, JSON.stringify(args));
+    assert.equal(client.status, 'error');
+    assert.match(client.error, /"my server".*args must be a list of text/);
+    assert.equal(client.proc, null, 'nothing was started');
+  }
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  assert.equal(fs.existsSync(marker), false);
+  // Valid ones get past the check, to fail only because there's no such program.
+  for (const args of [undefined, null, []]) {
+    const client = new McpClient({ name: 'fine', command: 'sanctum-no-such-program-xyz', args, env: {} });
+    assert.doesNotMatch(String(await client.start().catch((e) => e.message)), /args must be/, String(args));
+    await client.stop();
+  }
+});
+
 test('starting an MCP client through a shell keeps its arguments apart, with no deprecation warning', { skip: process.platform !== 'win32' && 'only Windows starts them through a shell' }, async (t) => {
   const write = scripts(t);
   const server = write('stub server.js', `
