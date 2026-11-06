@@ -37,3 +37,81 @@ test('every window main.js makes follows the rule, and the menu is applied', () 
   assert.equal(main.split('devTools: devToolsAllowed(app.isPackaged)').length - 1, windows);
   assert.ok(main.includes('applicationMenuTemplate(app.isPackaged, process.platform)'));
 });
+
+// ---- Debug switches in an installed app ----
+
+const { DEBUG_SWITCHES, refusedDebugSwitch } = require(path.join(__dirname, '..', 'lib', 'window-rules.js'));
+const EXE = 'C:\\Program Files\\Sanctum\\Sanctum.exe';
+const packaged = (argv, platform = 'win32', hasSwitch) => refusedDebugSwitch({ isPackaged: true, argv: [EXE, ...argv], platform, hasSwitch });
+
+test('the switches an installed app refuses are the ones that open it to a debugger', () => {
+  assert.deepEqual([...DEBUG_SWITCHES].sort(), ['inspect', 'inspect-brk', 'inspect-port', 'js-flags', 'remote-debugging-pipe', 'remote-debugging-port']);
+});
+
+test('an installed app started normally, or with a file or a profile, goes ahead', () => {
+  assert.equal(packaged([]), null);
+  assert.equal(packaged(['--user-data-dir=C:\\temp\\x', 'C:\\notes\\inspect.txt']), null);
+  assert.equal(packaged(['--enable-logging', '--lang=en-US']), null);
+  // Near misses are other switches.
+  assert.equal(packaged(['--inspector', '--inspect-publish-uid=http', '--remote-debugging-address=127.0.0.1', '--js-flagsx']), null);
+  // A path that starts with a slash is a path on a Mac.
+  assert.equal(packaged(['/inspect'], 'darwin'), null);
+});
+
+for (const name of ['remote-debugging-port', 'remote-debugging-pipe', 'inspect', 'inspect-brk', 'inspect-port', 'js-flags']) {
+  test(`an installed app refuses --${name}, however it's spelled`, () => {
+    for (const platform of ['win32', 'darwin', 'linux']) {
+      assert.equal(packaged([`--${name}`], platform), name, `bare, on ${platform}`);
+      assert.equal(packaged([`--${name}=0`], platform), name, `with a value, on ${platform}`);
+      assert.equal(packaged([`-${name}=1`], platform), name, `one dash, on ${platform}`);
+      assert.equal(packaged(['--user-data-dir=C:\\x', `--${name.toUpperCase()}=0`], platform), name, `in capitals, after another, on ${platform}`);
+    }
+    // Windows also takes a slash.
+    assert.equal(packaged([`/${name}=0`], 'win32'), name);
+  });
+}
+
+test('a switch the command line has, however it got there, is refused', () => {
+  const seen = [];
+  const hasSwitch = (name) => {
+    seen.push(name);
+    return name === 'remote-debugging-pipe';
+  };
+  assert.equal(packaged([], 'win32', hasSwitch), 'remote-debugging-pipe');
+  assert.ok(seen.includes('remote-debugging-pipe'));
+});
+
+test('an unpackaged run keeps every debug switch, for development', () => {
+  const argv = [EXE, '--remote-debugging-port=0', '--inspect', '--js-flags=--expose-gc'];
+  assert.equal(refusedDebugSwitch({ isPackaged: false, argv, platform: 'win32', hasSwitch: () => true }), null);
+  // Anything but a plain true is not packaged, as with devToolsAllowed.
+  assert.equal(refusedDebugSwitch({ isPackaged: 'yes', argv, platform: 'win32' }), null);
+  assert.equal(refusedDebugSwitch({ isPackaged: true, argv: 'nonsense', platform: 'win32' }), null);
+});
+
+test('main.js checks for them first, before the single-instance lock, any window, or the keystore', () => {
+  const main = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
+  const check = main.indexOf('refusedDebugSwitch({ isPackaged: app.isPackaged, argv: process.argv, platform: process.platform, hasSwitch: (name) => app.commandLine.hasSwitch(name) })');
+  assert.ok(check > 0, 'the check is there, with the real command line');
+  for (const later of ['requestSingleInstanceLock', 'new BrowserWindow(', 'createKeystore(', 'app.whenReady(', 'fixPackagedPath();']) {
+    assert.ok(main.indexOf(later) > check, `${later} comes after it`);
+  }
+  const after = main.slice(check, check + 600);
+  assert.match(after, /console\.error\(/, 'one line in the main log');
+  assert.match(after, /app\.exit\(1\);\s*return;/, 'and it exits at once, running nothing more of main.js');
+});
+
+test('every packaged build switches off run-as-node, NODE_OPTIONS and inspect, before a Mac build is signed', () => {
+  const { FuseVersion, FuseV1Options } = require('@electron/fuses');
+  const afterPack = require(path.join(__dirname, '..', 'build', 'afterPack.js'));
+  assert.deepEqual(afterPack.FUSES, {
+    version: FuseVersion.V1,
+    [FuseV1Options.RunAsNode]: false,
+    [FuseV1Options.EnableNodeOptionsEnvironmentVariable]: false,
+    [FuseV1Options.EnableNodeCliInspectArguments]: false
+  });
+  const source = fs.readFileSync(path.join(__dirname, '..', 'build', 'afterPack.js'), 'utf8');
+  const flip = source.indexOf('await flipFuses(');
+  assert.ok(flip > 0 && flip < source.indexOf("!== 'darwin') return"), 'flipped on every platform, then only a Mac goes on');
+  assert.ok(flip < source.indexOf('codesign --force'), 'and flipped before signing');
+});

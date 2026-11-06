@@ -10,7 +10,18 @@ const { safeFetchText, isAppPage } = require('./lib/url-rules');
 const { grepInWorker, globInWorker } = require('./lib/grep-runner');
 const { detectRepetitionLoop, splitOutputLines, quoteWindowsArg, encodePowerShell } = require('./lib/text-rules');
 const { killTree, startInOwnGroup, runShellCommand } = require('./lib/kill-tree');
-const { devToolsAllowed, applicationMenuTemplate } = require('./lib/window-rules');
+const { devToolsAllowed, applicationMenuTemplate, refusedDebugSwitch } = require('./lib/window-rules');
+
+// An installed Sanctum never runs under a debugger, which would reach the keys, the chats, and past
+// the PIN lock. Checked before anything else happens: no lock, no window, no keystore. app.exit
+// doesn't stop this file running, and the rest of it would take the single-instance lock, which on
+// the default profile would bring a running Sanctum's window forward. So nothing more of it runs.
+const debugSwitch = refusedDebugSwitch({ isPackaged: app.isPackaged, argv: process.argv, platform: process.platform, hasSwitch: (name) => app.commandLine.hasSwitch(name) });
+if (debugSwitch) {
+  console.error(`[sanctum] Not starting: the installed app doesn't run with --${debugSwitch}.`);
+  app.exit(1);
+  return; // main.js is CommonJS, so this leaves the file
+}
 const { createKeystore, retryTransient } = require('./lib/remote/keystore');
 const { createManager: createRemoteManager } = require('./lib/remote/manager');
 const remoteRelayClient = require('./lib/remote/relay-client');
