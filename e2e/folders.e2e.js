@@ -57,6 +57,7 @@ async function startOllama({ unloadDelayMs = 0 } = {}) {
       }
       res.flushHeaders();
       const reply = {
+        body,
         say: (content) => res.write(`${JSON.stringify({ message: { role: 'assistant', content } })}\n`),
         call: (name, args) => res.write(`${JSON.stringify({ message: { role: 'assistant', content: '', tool_calls: [{ function: { name, arguments: args } }] } })}\n`),
         finish: () => res.end(`${JSON.stringify({ message: { role: 'assistant', content: '' }, done: true, prompt_eval_count: 1, eval_count: 1 })}\n`)
@@ -802,29 +803,62 @@ test('from a laptop', async (t) => {
     assert.deepEqual(await home.page.evaluate((chatId) => state.chats[chatId].pathAllowlists, laptopProject), { [trio.laptopId]: [], [OTHER_LAPTOP]: [otherDir] }, 'and its access with it');
   });
 
-  await t.test("a laptop's folder is the default only while that laptop is available, and the prompt says so", async () => {
-    const id = await newChat(home, { ...project, projectFolders: { [trio.laptopId]: laptopDir }, pathAllowlists: { [trio.laptopId]: [laptopDir] } });
-    const facts = () => home.page.evaluate((chatId) => {
-      const c = state.chats[chatId];
-      const target = toolTarget('run_command', { command: 'x' }, c);
-      const named = toolTarget('run_command', { command: 'x', device: 'laptop' }, c);
-      return { device: target.device?.id ?? null, error: target.error ?? null, named: named.error ?? named.device?.id, folder: projectFolderPrompt(c), devices: devicesPrompt(c), home: RemoteRules.HOME_DEVICE };
-    }, id);
+  await t.test("with its only folder on a laptop that isn't available, a call is a clear error, and naming home with a full path works", async () => {
+    // Every command writes to a full path in this temp folder, so whatever happens, nothing can land
+    // anywhere else. A command that ran in a default place would still only write here.
+    const dir = path.join(root, 'only-on-laptop');
+    fs.mkdirSync(dir);
+    const marker = (name) => path.join(dir, name);
+    const into = (name) => `"${marker(name).replace(/\\/g, '/')}"`;
+    const UNAVAILABLE = `This chat's folder is on laptop, which isn't available right now. Wait for it to connect and allow control, or give device: "home" with a full path.`;
+    const id = await newChat(home, { ...project, planMode: false, noApproval: true, projectFolders: { [trio.laptopId]: laptopDir }, pathAllowlists: { [trio.laptopId]: [laptopDir] } });
+    // The model calls one tool, and what it gets back is read from its next request.
+    const callOnce = async (args) => {
+      await home.page.evaluate((chatId) => { submitToChat(state.chats[chatId], 'Go', []).catch(() => {}); }, id);
+      const first = await ollama.next();
+      first.call('run_command', args);
+      first.finish();
+      const second = await ollama.next();
+      const tool = second.body.messages.filter((m) => m.role === 'tool').at(-1);
+      second.say('Done.');
+      second.finish();
+      await waitFor('the reply to finish', () => home.page.evaluate((chatId) => !state.runningChats.has(chatId), id), 10000);
+      return JSON.parse(tool.content);
+    };
+    const prompts = () => home.page.evaluate((chatId) => ({ folder: projectFolderPrompt(state.chats[chatId]), devices: devicesPrompt(state.chats[chatId]) }), id);
     const hears = (want) => waitFor(`home to hear the switch is ${want}`, () => home.page.evaluate(([d, v]) => (remoteTools.control.get(d)?.allowed === true) === v, [trio.laptopId, want]), 10000);
+    const switchedOff = async () => {
+      const said = await callOnce({ command: `echo x > ${into('no-device.txt')}` });
+      assert.equal(said.error, UNAVAILABLE);
+      assert.equal(fs.existsSync(marker('no-device.txt')), false, 'nothing ran');
+      const { folder, devices } = await prompts();
+      assert.match(folder, /on the device "laptop", which isn't available right now/);
+      assert.ok(!/the project folder/i.test(folder), folder);
+      assert.ok(!folder.includes(laptopDir), 'and no path that could be taken for a place to work');
+      assert.equal(devices, null);
+      fs.rmSync(marker('no-device.txt'), { force: true });
+    };
 
-    let now = await facts();
-    assert.equal(now.device, now.home, 'switch off: home');
-    assert.equal(now.error, null, "the laptop's folder causes no error by itself");
-    assert.match(String(now.named), /turned off control|offline/, 'asking for it by name still gets the error');
-    assert.equal(now.folder, null, 'no folder is called the project folder');
-    assert.equal(now.devices, null);
+    await switchedOff();
+    const atHome = await callOnce({ command: `echo x > ${into('home-full.txt')}`, device: 'home', cwd: dir });
+    assert.equal(atHome.error, undefined, JSON.stringify(atHome));
+    assert.equal(fs.existsSync(marker('home-full.txt')), true, 'home, given a full cwd, runs there');
+    const blank = await callOnce({ command: `echo x > ${into('home-blank.txt')}`, device: 'home' });
+    assert.match(String(blank.error), /full path/);
+    assert.equal(fs.existsSync(marker('home-blank.txt')), false, 'a blank cwd at home is an error, not the home folder');
+    const relative = await callOnce({ command: `echo x > ${into('home-relative.txt')}`, device: 'home', cwd: 'sub' });
+    assert.ok(relative.error);
+    assert.equal(fs.existsSync(marker('home-relative.txt')), false);
 
+    // Switch on: the laptop's folder is the default, and the call goes there.
     assert.deepEqual(await laptop.remote('setControlAllowed', true), { ok: true });
     await hears(true);
-    now = await facts();
-    assert.equal(now.device, trio.laptopId, 'switch on: the laptop');
-    assert.ok(now.folder.includes(`PROJECT FOLDER: ${JSON.stringify(laptopDir)} (on the device "laptop")`), now.folder);
-    assert.ok(now.devices.includes(`the project folder at the path ${JSON.stringify(laptopDir)}`), now.devices);
+    const onLaptop = await callOnce({ command: `pwd > ${into('where.txt')}` });
+    assert.equal(onLaptop.error, undefined, JSON.stringify(onLaptop));
+    assert.match(fs.readFileSync(marker('where.txt'), 'utf8'), /laptop-folder/, "it ran in the laptop's folder");
+    const on = await prompts();
+    assert.ok(on.folder.includes(`PROJECT FOLDER: ${JSON.stringify(laptopDir)} (on the device "laptop")`), on.folder);
+    assert.ok(on.devices.includes(`the project folder at the path ${JSON.stringify(laptopDir)}`), on.devices);
     // With a folder at home too, home's is the project folder and the laptop's is only a folder there.
     const both = await newChat(home, { ...project, projectFolder: tree, pathAllowlist: [tree], projectFolders: { [trio.laptopId]: laptopDir } });
     const bothSaid = await home.page.evaluate((chatId) => devicesPrompt(state.chats[chatId]), both);
@@ -832,11 +866,17 @@ test('from a laptop', async (t) => {
     assert.ok(bothSaid.includes(`a folder at the path ${JSON.stringify(laptopDir)}`), bothSaid);
     assert.ok(!bothSaid.includes(`the project folder at the path ${JSON.stringify(laptopDir)}`));
 
+    // Switch off again: the error is back.
     assert.deepEqual(await laptop.remote('setControlAllowed', false), { ok: true });
     await hears(false);
-    now = await facts();
-    assert.equal(now.device, now.home, 'off again: home');
-    assert.equal(now.folder, null);
+    await switchedOff();
+
+    // A chat with no folders anywhere is as it always was: a blank cwd is home's own default.
+    const plain = await home.page.evaluate(() => {
+      const c = { modality: 'agent', projectFolders: {} };
+      return { target: toolTarget('run_command', { command: 'x' }, c).device?.id, fields: toolRunFields('run_command', { command: 'x' }, c, toolDevices()[0]) };
+    });
+    assert.deepEqual(plain, { target: 'home', fields: { fields: { command: 'x', cwd: '' } } });
 
     // The laptop says what that means, in one plain line.
     await watch(trio, id);
@@ -868,6 +908,7 @@ test('from a laptop', async (t) => {
   const closeOutput = (device) => device.page.evaluate(() => document.querySelector('.output-overlay [data-out-action="close"]').click());
 
   await t.test('Run on the laptop asks first, showing the whole code, the machine, and the folder, with the guard', async () => {
+    const framesBefore = (await home.frames()).length;
     await withCode(snippet);
     await clickRun(laptop);
     await confirmUp();
@@ -897,7 +938,7 @@ test('from a laptop', async (t) => {
     assert.equal(await textOf(laptop, '#run-confirm-code'), '', 'the pop-up took its words with it');
     await closeOutput(laptop);
     // Nothing went to home's tools for it.
-    assert.ok(!(await home.frames()).some((f) => f.type === 'tool-result' || f.type === 'tool-call'));
+    assert.ok(!(await home.frames()).slice(framesBefore).some((f) => f.type === 'tool-result' || f.type === 'tool-call'));
   });
 
   await t.test("in the laptop's folder for this chat, as home records it, without the switch, and Cancel runs nothing", async () => {

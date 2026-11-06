@@ -5769,6 +5769,8 @@ When the user asks you to do something destructive (delete files, etc.), trust t
 // is available. With more than one device in play the prompt says which machine it's on.
 function projectFolderPrompt(c) {
   const devices = toolDevices();
+  const missing = RemoteRules.unavailableFolderDevice(c, devices);
+  if (missing) return RemoteRules.unavailableFolderPrompt(pairedToolDevices().find((d) => d.id === missing)?.name);
   const folderDevice = RemoteRules.chatFolderDevice(c, devices);
   const elsewhere = folderDevice !== RemoteRules.HOME_DEVICE;
   const folder = elsewhere ? folderOn(c, folderDevice) : c.projectFolder;
@@ -7267,6 +7269,7 @@ function chatHasFolder(c) {
 // Why a device can't be used right now, in words for the model.
 function toolDeviceProblem(requested, picked) {
   const all = pairedToolDevices();
+  if (picked.folderUnavailable) return RemoteRules.folderUnavailableMessage(all.find((d) => d.id === picked.deviceId)?.name);
   const wanted = typeof requested === 'string' ? requested.trim().toLowerCase() : null;
   const device = picked.deviceId ? all.find((d) => d.id === picked.deviceId) : all.find((d) => d.name.toLowerCase() === wanted);
   if (!device) return picked.deviceId ? "This chat's folder is on a device that's no longer paired." : picked.error;
@@ -7642,7 +7645,9 @@ function noteLinesBelow(box, signal) {
 // { error }. A pop-up on any device shows these fields, and the code that runs the tool uses them.
 function toolRunFields(name, args, c, device) {
   const folder = folderOn(c, device.id) || '';
-  return RemoteRules.whatWillRun(name, args, { folder, root: folder || allowlistOn(c, device.id)[0] || '', os: device.os });
+  // At home with no folder of its own, in a chat whose folder is on a laptop, nowhere is a default.
+  const placeRequired = device.id === RemoteRules.HOME_DEVICE && !folder && RemoteRules.chatFolderDevice(c) !== RemoteRules.HOME_DEVICE;
+  return RemoteRules.whatWillRun(name, args, { folder, root: folder || allowlistOn(c, device.id)[0] || '', os: device.os, placeRequired });
 }
 
 // The machine to name. With only this PC in play there's nothing to tell apart, until someone may be

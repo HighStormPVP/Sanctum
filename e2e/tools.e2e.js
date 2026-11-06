@@ -674,17 +674,24 @@ test('tools on a laptop', async (t) => {
     assert.equal(await visible(laptop, '#remote-running'), false);
     await waitFor('the log to say so', () => readAudit(laptop).some((e) => e.event === 'ended' && e.reason === 'offline' && e.tool === 'run_command'), 5000);
 
-    await s.test('an offline laptop named in a call is an error at once, and its folder alone sends calls home', async () => {
-      const named = await runOne(id, 'run_command', { command: 'echo here > not-here.txt', cwd: homeDir, device: LAPTOP });
+    await s.test("an offline laptop is an error at once, named or as the chat's only folder, and naming home with a full path works", async () => {
+      // Each command writes to a full path in this test's temp folder, so even one that ran somewhere it
+      // shouldn't can only ever write here.
+      const into = (name) => `"${posix(path.join(homeDir, name))}"`;
+      const named = await runOne(id, 'run_command', { command: `echo here > ${into('not-here.txt')}`, cwd: homeDir, device: LAPTOP });
       assert.equal(named.error, `${LAPTOP} is offline`);
       assert.equal(fs.existsSync(path.join(homeDir, 'not-here.txt')), false, 'named, so it never lands at home');
-      // Task 14 ruling: a laptop's folder is the default only while that laptop is available. With it
-      // offline the chat works at home, and the prompt doesn't call the laptop's folder the project folder.
+      // Task 14 ruling: with the chat's only folder on that laptop, a call without a device is a clear error
+      // rather than work in home's default place, and the prompt says the folder's machine isn't available.
       const onLaptop = await agent({ projectFolder: undefined, pathAllowlist: [] });
-      assert.equal(await home.page.evaluate((chatId) => projectFolderPrompt(state.chats[chatId]), onLaptop), null);
-      const byFolder = await runOne(onLaptop, 'run_command', { command: 'echo here > went-home.txt', cwd: homeDir });
-      assert.equal(byFolder.error, undefined, JSON.stringify(byFolder));
-      assert.equal(fs.existsSync(path.join(homeDir, 'went-home.txt')), true);
+      const prompt = await home.page.evaluate((chatId) => projectFolderPrompt(state.chats[chatId]), onLaptop);
+      assert.ok(prompt.includes(`on the device "${LAPTOP}", which isn't available right now`), prompt);
+      const byFolder = await runOne(onLaptop, 'run_command', { command: `echo here > ${into('by-folder.txt')}` });
+      assert.equal(byFolder.error, `This chat's folder is on ${LAPTOP}, which isn't available right now. Wait for it to connect and allow control, or give device: "home" with a full path.`);
+      assert.equal(fs.existsSync(path.join(homeDir, 'by-folder.txt')), false, 'and nothing ran anywhere');
+      const atHome = await runOne(onLaptop, 'run_command', { command: `echo here > ${into('went-home.txt')}`, device: 'home', cwd: homeDir });
+      assert.equal(atHome.error, undefined, JSON.stringify(atHome));
+      assert.equal(fs.existsSync(path.join(homeDir, 'went-home.txt')), true, 'home, named, with a full cwd');
       assert.equal(await home.page.evaluate((deviceId) => remoteTools.control.has(deviceId), laptopId), false, 'what it said before doesn\'t count any more');
       assert.ok(beforeTheDrop.includes(`mcp__laptop_${LAPTOP}__stub__echo`), 'it was offered one of the laptop\'s tools');
       const gone = await offeredWhileConnected(id);

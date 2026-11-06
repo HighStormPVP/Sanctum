@@ -511,7 +511,7 @@ test('resolveDevice: then the home PC', () => {
 });
 
 test('resolveDevice: an unknown name is an error, and never falls back to home', () => {
-  for (const name of ['Nope', 'MacBoo', '__proto__', 'constructor', 'home']) {
+  for (const name of ['Nope', 'MacBoo', '__proto__', 'constructor']) {
     const answer = resolveDevice(name, { projectFolder: 'C:\\work' }, DEVICES);
     assert.ok(answer.error, name);
     assert.equal(answer.deviceId, undefined, name);
@@ -520,14 +520,28 @@ test('resolveDevice: an unknown name is an error, and never falls back to home',
   for (const value of [7, true, {}, [], ['Desk']]) assert.ok(resolveDevice(value, {}, DEVICES).error, JSON.stringify(value));
 });
 
-test("resolveDevice: a folder on a device that isn't available is no default, and causes no error by itself", () => {
-  assert.deepEqual(resolveDevice(undefined, { projectFolders: { cccc3333: '/gone' } }, DEVICES), { deviceId: HOME_DEVICE });
+test("resolveDevice: a chat whose only folders are on devices that aren't available is an error naming one, never home", () => {
+  const gone = resolveDevice(undefined, { projectFolders: { cccc3333: '/gone' } }, DEVICES);
+  assert.equal(gone.deviceId, 'cccc3333');
+  assert.equal(gone.folderUnavailable, true);
+  assert.ok(gone.error);
   assert.deepEqual(resolveDevice(undefined, { projectFolders: { cccc3333: '/gone', bbbb2222: '/work' } }, DEVICES), { deviceId: 'bbbb2222' }, 'the one that is available');
   // Its switch off is the same as gone: the laptop isn't in the list home passes.
   const homeOnly = DEVICES.slice(0, 1);
-  assert.deepEqual(resolveDevice(undefined, { projectFolders: { bbbb2222: '/work' } }, homeOnly), { deviceId: HOME_DEVICE });
+  assert.equal(resolveDevice(undefined, { projectFolders: { bbbb2222: '/work' } }, homeOnly).folderUnavailable, true);
   // Asking for it by name still gets the existing error.
   assert.ok(resolveDevice('Air', { projectFolders: { bbbb2222: '/work' } }, homeOnly).error);
+  // Naming home works, by its name or as "home".
+  for (const name of ['home', 'Home', ' HOME ', 'Desk']) assert.deepEqual(resolveDevice(name, { projectFolders: { bbbb2222: '/work' } }, homeOnly), { deviceId: HOME_DEVICE }, name);
+  // No folders anywhere, or one at home: home, as before.
+  assert.deepEqual(resolveDevice(undefined, {}, homeOnly), { deviceId: HOME_DEVICE });
+  assert.deepEqual(resolveDevice(undefined, { projectFolder: 'C:\\w', projectFolders: { bbbb2222: '/work' } }, homeOnly), { deviceId: HOME_DEVICE });
+  assert.equal(RemoteRules.unavailableFolderDevice({ projectFolders: { bbbb2222: '/work' } }, homeOnly), 'bbbb2222');
+  assert.equal(RemoteRules.unavailableFolderDevice({ projectFolders: { bbbb2222: '/work' } }, DEVICES), null);
+  assert.equal(RemoteRules.unavailableFolderDevice({ projectFolder: 'C:\\w', projectFolders: { bbbb2222: '/work' } }, homeOnly), null);
+  assert.equal(RemoteRules.unavailableFolderDevice({}, homeOnly), null);
+  const said = RemoteRules.folderUnavailableMessage('Air\u202e');
+  assert.equal(said, 'This chat\'s folder is on Air\\u202E, which isn\'t available right now. Wait for it to connect and allow control, or give device: "home" with a full path.');
   // And home's own folder comes first, available or not.
   assert.equal(RemoteRules.chatFolderDevice({ projectFolder: 'C:\\w', projectFolders: { bbbb2222: '/work' } }, DEVICES), HOME_DEVICE);
   assert.equal(RemoteRules.chatFolderDevice({ projectFolders: { bbbb2222: '/work' } }, DEVICES), 'bbbb2222');
@@ -1705,4 +1719,33 @@ test("a laptop's folder has to be that laptop's kind of path, since home can't l
   assert.match(problem('/x', 'plan9'), /doesn't know/);
   assert.match(problem('/a/\nb', 'linux'), /control character/);
   assert.match(problem('relative', 'linux'), /isn't a path/);
+});
+
+test('"home" always means the home PC, so no laptop can be called that', () => {
+  const named = RemoteRules.namedDevices({ homeName: 'Desk', homeOs: 'win32', homeShell: 'Bash', peers: [{ id: 'aaaa1111', name: 'home', role: 'laptop', connected: true, allowed: true }] });
+  assert.notEqual(named[1].name.toLowerCase(), 'home');
+  assert.match(named[1].name, /^home \(/);
+});
+
+test("with no folder on the machine it runs on, a command needs a full cwd and a file tool a full path", () => {
+  const run = (name, args, os = 'win32') => RemoteRules.whatWillRun(name, args, { folder: '', root: '', os, placeRequired: true });
+  assert.ok(run('run_command', { command: 'ls' }).error, 'blank');
+  assert.ok(run('run_command', { command: 'ls', cwd: '  ' }).error, 'blank');
+  assert.ok(run('run_command', { command: 'ls', cwd: 'sub' }).error, 'relative');
+  assert.deepEqual(run('run_command', { command: 'ls', cwd: 'C:\\tmp\\x' }).fields, { command: 'ls', cwd: 'C:\\tmp\\x' });
+  assert.deepEqual(run('run_command', { command: 'ls', cwd: '/tmp/x' }, 'linux').fields, { command: 'ls', cwd: '/tmp/x' });
+  assert.ok(run('read_file', { path: 'notes.txt' }).error);
+  assert.ok(run('read_file', { path: '/tmp/notes.txt' }).error, 'not a full path on Windows');
+  assert.deepEqual(run('read_file', { path: 'C:\\tmp\\n.txt' }).fields, { path: 'C:\\tmp\\n.txt' });
+  assert.ok(run('glob', { pattern: '*.js' }).error, 'nowhere to search');
+  // Without it, as at 38df63f: blank means the machine's own default.
+  assert.deepEqual(RemoteRules.whatWillRun('run_command', { command: 'ls' }, { folder: '', root: '', os: 'win32' }).fields, { command: 'ls', cwd: '' });
+});
+
+test("the prompt for a folder on a machine that isn't available says so, and calls nothing the project folder", () => {
+  const text = RemoteRules.unavailableFolderPrompt('laptop');
+  assert.match(text, /on the device "laptop"/);
+  assert.match(text, /isn't available right now/);
+  assert.match(text, /device: "home"/);
+  assert.ok(!/the project folder/i.test(text));
 });
