@@ -189,7 +189,13 @@ contextBridge.exposeInMainWorld('api', {
     setStartAtLogin:  (on)      => ipcRenderer.invoke('app:setStartAtLogin', on),
     getAvailabilitySettings: () => ipcRenderer.invoke('app:getAvailabilitySettings'),
     setSharing:       (sharing) => ipcRenderer.invoke('app:setSharing', sharing),
-    answerSuggestion: ()        => ipcRenderer.invoke('app:answerSuggestion')
+    answerSuggestion: ()        => ipcRenderer.invoke('app:answerSuggestion'),
+    // The window coming back from the tray or from minimized, so open pop-ups guard again.
+    onShown: (cb) => {
+      const wrapped = () => cb();
+      ipcRenderer.on('app:shown', wrapped);
+      return () => ipcRenderer.removeListener('app:shown', wrapped);
+    }
   },
 
   remote: {

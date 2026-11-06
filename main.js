@@ -5,7 +5,7 @@ const crypto = require('crypto');
 const os = require('os');
 const { exec, spawn } = require('child_process');
 const { McpManager } = require('./lib/mcp-manager');
-const { isWithinRoots, checkAgentPath, applyExactPatch, folderListing } = require('./lib/fs-rules');
+const { isWithinRoots, checkAgentPath, applyExactPatch, folderListing, createRootsProbe } = require('./lib/fs-rules');
 const { safeFetchText, isAppPage } = require('./lib/url-rules');
 const { grepInWorker, globInWorker } = require('./lib/grep-runner');
 const { detectRepetitionLoop, splitOutputLines, quoteWindowsArg, encodePowerShell } = require('./lib/text-rules');
@@ -62,6 +62,13 @@ function fixPackagedPath() {
     });
   } catch {}
 }
+// One Sanctum per profile. Electron keys this on userData, so instances with a --user-data-dir of their
+// own run side by side. A second launch, from a shortcut or a login start next to a manual one, hands
+// over to the first and goes before it opens a window, the keystore, or any connection.
+const ownsProfile = app.requestSingleInstanceLock();
+if (!ownsProfile) app.exit(0);
+app.on('second-instance', () => { if (app.isReady()) showMainWindow(); });
+
 fixPackagedPath();
 
 let mcpManager = null;
@@ -474,6 +481,7 @@ function mimeFor(filePath) {
 }
 
 app.whenReady().then(() => {
+  if (!ownsProfile) return;
   const menu = applicationMenuTemplate(app.isPackaged, process.platform);
   if (menu) Menu.setApplicationMenu(Menu.buildFromTemplate(menu));
   CACHE_DIR = path.join(app.getPath('userData'), 'media-cache');
@@ -628,6 +636,7 @@ let tray = null;
 let trayComing = null;
 let trayMenu = null;
 let trayNoteDue = false;
+let trayFailed = false;
 const STILL_RUNNING_TITLE = 'Sanctum is still running';
 const STILL_RUNNING_TEXT = 'A chat is shared, so Sanctum keeps running in the tray. Quit it from there.';
 const START_AT_LOGIN_UNPACKAGED = 'Starting when you log in works in the installed app.';
@@ -712,21 +721,36 @@ function trayWantedNow() {
 }
 
 // Sanctum sets no icon of its own, so the tray shows whatever the system shows for the app.
+// If the system won't give it one, there's nothing to bring a hidden window back, so closing quits as it
+// would with nothing shared, and a window already hidden comes back.
 function showTray() {
-  if (tray || trayComing) return;
-  trayComing = app.getFileIcon(process.execPath, { size: 'small' }).catch(() => nativeImage.createEmpty()).then((icon) => {
-    trayComing = null;
-    if (tray || !trayWantedNow()) return;
-    tray = new Tray(icon);
-    tray.setToolTip('Sanctum');
-    trayMenu = Menu.buildFromTemplate([
-      { label: 'Open Sanctum', click: showMainWindow },
-      { label: 'Quit', click: () => app.quit() }
-    ]);
-    tray.setContextMenu(trayMenu);
-    tray.on('click', showMainWindow);
-    if (trayNoteDue) noteStillRunning();
-  });
+  if (tray || trayComing || trayFailed) return;
+  trayComing = Promise.resolve()
+    .then(() => app.getFileIcon(process.execPath, { size: 'small' }))
+    .catch(() => nativeImage.createEmpty())
+    .then((icon) => {
+      trayComing = null;
+      if (tray || !trayWantedNow()) return;
+      // A test's way to have the system refuse the icon.
+      if (remoteTestFlags.has('tray-fails')) throw new Error('a test asked for no tray icon');
+      const made = new Tray(icon);
+      made.setToolTip('Sanctum');
+      trayMenu = Menu.buildFromTemplate([
+        { label: 'Open Sanctum', click: showMainWindow },
+        { label: 'Quit', click: () => app.quit() }
+      ]);
+      made.setContextMenu(trayMenu);
+      made.on('click', showMainWindow);
+      tray = made;
+      if (trayNoteDue) noteStillRunning();
+    })
+    .catch((e) => {
+      trayComing = null;
+      trayFailed = true;
+      trayMenu = null;
+      console.error(`[tray] Couldn't show a tray icon, so closing the window quits Sanctum: ${e?.message || e}`);
+      if (windowHidden()) showMainWindow();
+    });
 }
 
 function dropTray() {
@@ -770,7 +794,7 @@ function noteStillRunning() {
 // apart from the Dock: Sanctum stays in it, as Mac apps do, and clicking it brings the window back.
 function wireHideToTray(win) {
   win.on('close', (e) => {
-    if (!RemoteRules.closeHidesWindow({ sharing: availabilitySharing, quitting: appQuitting })) return;
+    if (trayFailed || !RemoteRules.closeHidesWindow({ sharing: availabilitySharing, quitting: appQuitting })) return;
     e.preventDefault();
     win.hide();
     applyAvailability();
@@ -778,6 +802,9 @@ function wireHideToTray(win) {
   });
   win.on('show', applyAvailability);
   win.on('hide', applyAvailability);
+  // Shown after hiding, or brought back from minimized. Nothing that went up meanwhile can have been read.
+  win.on('show', () => sendToLocalUi('app:shown'));
+  win.on('restore', () => sendToLocalUi('app:shown'));
   // Windows is shutting down or logging off, which a hidden window mustn't stand in the way of.
   win.on('session-end', () => { appQuitting = true; });
 }
@@ -809,8 +836,6 @@ ipcMain.handle('app:setStartAtLogin', (_e, on) => {
   } catch {
     return { ok: false, error: "Couldn't change that. Try again.", settings: availabilitySettings() };
   }
-  availability.startAtLogin = on === true;
-  saveAvailability();
   return { ok: true, settings: availabilitySettings() };
 });
 
@@ -3051,16 +3076,9 @@ ipcMain.handle('fs:read_file', async (_e, requestedPath, allowlist) => {
   } catch (e) { return { error: e.message }; }
 });
 
-// The places a folder browser can start from: each drive on Windows, or the root. A drive that doesn't
-// answer soon, like a mapped one that's gone, is left out rather than holding the list up.
-async function folderRoots() {
-  if (process.platform !== 'win32') return ['/'];
-  const probe = (letter) => Promise.race([
-    fs.promises.stat(`${letter}:\\`).then((st) => (st.isDirectory() ? `${letter}:\\` : null), () => null),
-    new Promise((resolve) => setTimeout(() => resolve(null), 1500))
-  ]);
-  return (await Promise.all('ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('').map(probe))).filter(Boolean);
-}
+// The places a folder browser can start from: each drive on Windows, or the root. lib/fs-rules.js says
+// how they're found and kept.
+const folderRoots = createRootsProbe({ stat: (p) => fs.promises.stat(p), platform: process.platform });
 
 // { foldersOnly } is the folder browser's listing: folders before the cap, and how many more there were.
 // { roots } adds where it can start from.

@@ -728,3 +728,31 @@ test('a folder listing for the folder browser filters to folders before it caps,
   assert.equal(names[0], 'dir000');
   assert.deepEqual(folderListing([dirent('b', true), dirent('a', true), dirent('z.txt', false)], 200), { names: ['a', 'b'], more: 0 });
 });
+
+test('the drive list is cached for 30 seconds, and a drive never has two probes running', async () => {
+  const { createRootsProbe } = lib('fs-rules.js');
+  let clock = 0;
+  const calls = new Map();
+  const hung = new Set(['Z']);
+  const stat = (p) => {
+    const letter = p[0];
+    calls.set(letter, (calls.get(letter) || 0) + 1);
+    if (hung.has(letter)) return new Promise(() => {});
+    if (letter === 'C' || letter === 'D') return Promise.resolve({ isDirectory: () => true });
+    return Promise.reject(new Error('ENOENT'));
+  };
+  const roots = createRootsProbe({ stat, platform: 'win32', now: () => clock, timeoutMs: 20, cacheMs: 30000 });
+  assert.deepEqual(await roots(), ['C:\\', 'D:\\'], 'a drive that never answers is left out');
+  assert.equal(calls.get('C'), 1);
+  clock += 29000;
+  assert.deepEqual(await roots(), ['C:\\', 'D:\\']);
+  assert.equal(calls.get('C'), 1, 'cached');
+  clock += 2000;
+  await roots();
+  assert.equal(calls.get('C'), 2, 'asked again once the 30 seconds are up');
+  assert.equal(calls.get('Z'), 1, 'but the one still hanging is not asked a second time');
+  const [a, b] = await Promise.all([(clock += 31000, roots()), roots()]);
+  assert.deepEqual(a, b);
+  assert.equal(calls.get('C'), 3, 'two lists at once share each probe');
+  assert.deepEqual(await createRootsProbe({ stat, platform: 'darwin' })(), ['/']);
+});

@@ -520,10 +520,18 @@ test('resolveDevice: an unknown name is an error, and never falls back to home',
   for (const value of [7, true, {}, [], ['Desk']]) assert.ok(resolveDevice(value, {}, DEVICES).error, JSON.stringify(value));
 });
 
-test('resolveDevice: a folder on a device that has gone is an error, and never falls back to home', () => {
-  const answer = resolveDevice(undefined, { projectFolders: { cccc3333: '/gone' } }, DEVICES);
-  assert.ok(answer.error);
-  assert.equal(answer.deviceId, 'cccc3333', 'says which one, so the caller can name it');
+test("resolveDevice: a folder on a device that isn't available is no default, and causes no error by itself", () => {
+  assert.deepEqual(resolveDevice(undefined, { projectFolders: { cccc3333: '/gone' } }, DEVICES), { deviceId: HOME_DEVICE });
+  assert.deepEqual(resolveDevice(undefined, { projectFolders: { cccc3333: '/gone', bbbb2222: '/work' } }, DEVICES), { deviceId: 'bbbb2222' }, 'the one that is available');
+  // Its switch off is the same as gone: the laptop isn't in the list home passes.
+  const homeOnly = DEVICES.slice(0, 1);
+  assert.deepEqual(resolveDevice(undefined, { projectFolders: { bbbb2222: '/work' } }, homeOnly), { deviceId: HOME_DEVICE });
+  // Asking for it by name still gets the existing error.
+  assert.ok(resolveDevice('Air', { projectFolders: { bbbb2222: '/work' } }, homeOnly).error);
+  // And home's own folder comes first, available or not.
+  assert.equal(RemoteRules.chatFolderDevice({ projectFolder: 'C:\\w', projectFolders: { bbbb2222: '/work' } }, DEVICES), HOME_DEVICE);
+  assert.equal(RemoteRules.chatFolderDevice({ projectFolders: { bbbb2222: '/work' } }, DEVICES), 'bbbb2222');
+  assert.equal(RemoteRules.chatFolderDevice({ projectFolders: { bbbb2222: '/work' } }, homeOnly), HOME_DEVICE);
 });
 
 test("resolveDevice does not read a device out of a chat's prototype", () => {
@@ -1532,12 +1540,12 @@ test('agent-audit.log keeps each long argument to its first 8 KB and its size, a
 // ---- Task 14: keeping the home PC available, folders, and the prompt ----
 
 test('availability settings are off unless the file says true, whatever else it holds', () => {
-  const off = { keepAwake: false, startAtLogin: false, suggestionAnswered: false, trayNoteShown: false };
+  const off = { keepAwake: false, suggestionAnswered: false, trayNoteShown: false };
   for (const raw of [undefined, null, 'x', 7, [], {}, { keepAwake: 'true' }, { keepAwake: 1 }, JSON.parse('{"__proto__":{"keepAwake":true}}')]) {
     assert.deepEqual(RemoteRules.cleanAvailability(raw), off, JSON.stringify(raw));
   }
   assert.deepEqual(RemoteRules.cleanAvailability({ keepAwake: true, startAtLogin: true, suggestionAnswered: true, trayNoteShown: true, other: 1 }),
-    { keepAwake: true, startAtLogin: true, suggestionAnswered: true, trayNoteShown: true });
+    { keepAwake: true, suggestionAnswered: true, trayNoteShown: true });
 });
 
 test('keep-awake is wanted only while the setting is on, a chat is shared, and Sanctum is not quitting', () => {
@@ -1653,6 +1661,11 @@ test('Up and into a folder, on either kind of machine', () => {
   assert.equal(into('C:\\Users', 'me', 'win32'), 'C:\\Users\\me');
   assert.equal(into('/', 'home', 'linux'), '/home');
   assert.equal(into('/home', 'me', 'darwin'), '/home/me');
+  for (const os of [null, undefined, 'plan9']) {
+    assert.equal(up('C:\\Users\\me', os), null, String(os));
+    assert.equal(up('/home/me', os), null, String(os));
+    assert.equal(into('C:\\Users', 'me', os), null, String(os));
+  }
 });
 
 // ---- Task 14, part 2: a laptop's own folder, recorded at home ----

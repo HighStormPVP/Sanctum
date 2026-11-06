@@ -674,13 +674,17 @@ test('tools on a laptop', async (t) => {
     assert.equal(await visible(laptop, '#remote-running'), false);
     await waitFor('the log to say so', () => readAudit(laptop).some((e) => e.event === 'ended' && e.reason === 'offline' && e.tool === 'run_command'), 5000);
 
-    await s.test('an offline laptop is an error at once, and nothing silently runs at home', async () => {
-      const named = await runOne(id, 'run_command', { command: 'echo here > not-here.txt', device: LAPTOP });
+    await s.test('an offline laptop named in a call is an error at once, and its folder alone sends calls home', async () => {
+      const named = await runOne(id, 'run_command', { command: 'echo here > not-here.txt', cwd: homeDir, device: LAPTOP });
       assert.equal(named.error, `${LAPTOP} is offline`);
+      assert.equal(fs.existsSync(path.join(homeDir, 'not-here.txt')), false, 'named, so it never lands at home');
+      // Task 14 ruling: a laptop's folder is the default only while that laptop is available. With it
+      // offline the chat works at home, and the prompt doesn't call the laptop's folder the project folder.
       const onLaptop = await agent({ projectFolder: undefined, pathAllowlist: [] });
-      const byFolder = await runOne(onLaptop, 'run_command', { command: 'echo here > not-here.txt' });
-      assert.equal(byFolder.error, `${LAPTOP} is offline`);
-      assert.equal(fs.existsSync(path.join(homeDir, 'not-here.txt')), false);
+      assert.equal(await home.page.evaluate((chatId) => projectFolderPrompt(state.chats[chatId]), onLaptop), null);
+      const byFolder = await runOne(onLaptop, 'run_command', { command: 'echo here > went-home.txt', cwd: homeDir });
+      assert.equal(byFolder.error, undefined, JSON.stringify(byFolder));
+      assert.equal(fs.existsSync(path.join(homeDir, 'went-home.txt')), true);
       assert.equal(await home.page.evaluate((deviceId) => remoteTools.control.has(deviceId), laptopId), false, 'what it said before doesn\'t count any more');
       assert.ok(beforeTheDrop.includes(`mcp__laptop_${LAPTOP}__stub__echo`), 'it was offered one of the laptop\'s tools');
       const gone = await offeredWhileConnected(id);

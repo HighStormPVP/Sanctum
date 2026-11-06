@@ -731,6 +731,7 @@
           </button>
           <div class="fb-roots" id="fb-roots"></div>
         </div>
+        <p class="fb-wait" id="fb-wait" hidden>Waiting for the home PC.</p>
         <p class="fb-path" id="fb-path"></p>
         <ul class="fb-list" id="fb-list" aria-label="Folders"></ul>
         <p class="fb-more" id="fb-more" hidden></p>
@@ -742,7 +743,7 @@
             <button type="button" class="remote-quiet-btn" id="fb-laptop-clear" hidden>Clear</button>
             <button type="button" class="ghost-btn" id="fb-laptop-choose">Choose on this laptop</button>
           </div>
-          <p class="setting-help">Where code from this chat runs when you press Run here, and where the home PC's tools work on this laptop.</p>
+          <p class="setting-help">When the home PC has no folder for this chat, the home PC's model works here while this laptop allows it.</p>
         </section>
       </div>
       <footer class="approval-footer">
@@ -774,6 +775,10 @@
         <section class="approval-section">
           <div class="approval-label">Folder</div>
           <pre class="approval-code" id="run-confirm-folder"></pre>
+        </section>
+        <section class="approval-section">
+          <div class="approval-label">Runs as</div>
+          <pre class="approval-code" id="run-confirm-lang"></pre>
         </section>
         <section class="approval-section">
           <div class="approval-label">Code</div>

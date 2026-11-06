@@ -3945,3 +3945,4 @@ textarea:focus-visible, input:focus-visible { outline: none; }
 .fb-laptop-path { flex: 1; min-width: 0; margin: 0; font-family: var(--font-mono); font-size: 12.5px; line-height: 1.5; color: var(--text-1); overflow-wrap: anywhere; }
 .fb-laptop-path.dim { color: var(--text-3); font-family: inherit; }
 .fb-laptop .setting-help { font-size: 12.5px; }
+.fb-wait { margin: 14px 0 0; font-size: 13px; color: var(--text-3); }

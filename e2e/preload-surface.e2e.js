@@ -20,7 +20,7 @@ const REMOTE_METHODS = [
   'send', 'setAddress', 'setControlAllowed', 'setPin', 'status', 'unlock'
 ];
 
-const APP_METHODS = ['answerSuggestion', 'getAvailabilitySettings', 'setKeepAwake', 'setSharing', 'setStartAtLogin'];
+const APP_METHODS = ['answerSuggestion', 'getAvailabilitySettings', 'onShown', 'setKeepAwake', 'setSharing', 'setStartAtLogin'];
 
 test('the preload surface', async (t) => {
   const pair = await startPair();

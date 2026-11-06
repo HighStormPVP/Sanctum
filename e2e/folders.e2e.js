@@ -14,7 +14,11 @@ const fs = require('node:fs');
 const http = require('node:http');
 const os = require('node:os');
 const path = require('node:path');
+const { spawn } = require('node:child_process');
 const { startRelay, launchDevice, pair, waitFor, sleep, PIN, MODEL, newChat, openChat, watch } = require('./harness.js');
+
+const ROOT = path.join(__dirname, '..');
+const ELECTRON = path.join(ROOT, 'node_modules', 'electron', 'dist', process.platform === 'win32' ? 'electron.exe' : 'electron');
 
 const FLAGS = 'log,no-stun,peek';
 const KEEP_AWAKE = 'Keep this PC awake while a chat is shared';
@@ -24,7 +28,7 @@ const LISTING_REFUSED = "The home PC's answer wasn't a folder listing, so it isn
 
 // A fake Ollama with one model said to be resident, so quitting's cleanup has one model to unload,
 // and the unloads can be counted. A chat request stays open until the test finishes it.
-async function startOllama() {
+async function startOllama({ unloadDelayMs = 0 } = {}) {
   const replies = [];
   const waiters = [];
   let unloads = 0;
@@ -38,10 +42,11 @@ async function startOllama() {
     req.on('end', () => {
       if (req.url === '/api/tags') return json(res, { models: [{ name: MODEL, model: MODEL, size: 1000000000 }] });
       if (req.url === '/api/ps') return json(res, { models: [{ name: 'resident:latest' }] });
-      if (req.url === '/api/show') return json(res, { model_info: { 'fake.context_length': 8192 }, details: {}, capabilities: ['completion'] });
+      if (req.url === '/api/show') return json(res, { model_info: { 'fake.context_length': 8192 }, details: {}, capabilities: ['completion', 'tools'] });
       if (req.url === '/api/generate') {
         if (JSON.parse(raw || '{}').keep_alive === 0) unloads += 1;
-        return json(res, {});
+        setTimeout(() => json(res, {}), unloadDelayMs);
+        return undefined;
       }
       if (req.url !== '/api/chat') return json(res, { models: [] });
       const body = JSON.parse(raw);
@@ -53,6 +58,7 @@ async function startOllama() {
       res.flushHeaders();
       const reply = {
         say: (content) => res.write(`${JSON.stringify({ message: { role: 'assistant', content } })}\n`),
+        call: (name, args) => res.write(`${JSON.stringify({ message: { role: 'assistant', content: '', tool_calls: [{ function: { name, arguments: args } }] } })}\n`),
         finish: () => res.end(`${JSON.stringify({ message: { role: 'assistant', content: '' }, done: true, prompt_eval_count: 1, eval_count: 1 })}\n`)
       };
       if (waiters.length) waiters.shift()(reply);
@@ -100,10 +106,10 @@ const peek = async (device, what, ...args) => {
   const said = await device.app.evaluate((_, [w, a]) => JSON.stringify(globalThis.__sanctumAvailability[w](...a) ?? null), [what, args]);
   return JSON.parse(said);
 };
-const mainWindowFacts = (device) => device.app.evaluate(({ BrowserWindow }) => {
+const mainWindowFacts = async (device) => JSON.parse(await device.app.evaluate(({ BrowserWindow }) => {
   const win = BrowserWindow.getAllWindows().find((w) => w.webContents.getURL().includes('index.html'));
-  return win ? { visible: win.isVisible(), destroyed: win.isDestroyed() } : null;
-});
+  return JSON.stringify(win ? { visible: win.isVisible(), destroyed: win.isDestroyed() } : null);
+}));
 const throttled = (device) => device.app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows().find((w) => w.webContents.getURL().includes('index.html')).webContents.getBackgroundThrottling());
 const closeMainWindow = (device) => device.app.evaluate(({ BrowserWindow }) => {
   BrowserWindow.getAllWindows().find((w) => w.webContents.getURL().includes('index.html')).close();
@@ -158,7 +164,7 @@ test('keeping the home PC available', async (t) => {
     assert.equal(await textOf(home, '#setting-start-at-login-note'), 'This works in the installed app.');
     assert.equal(await home.page.evaluate(() => document.querySelector('#setting-keep-awake').checked), false);
     assert.deepEqual(await loginCalls(home), [], 'the system was never asked, either way');
-    assert.ok(fs.existsSync(path.join(home.profile, 'availability.json')) === false || !JSON.parse(fs.readFileSync(path.join(home.profile, 'availability.json'), 'utf8')).startAtLogin);
+    assert.equal((await settingsOf(home)).startAtLogin, false, 'and nothing says it is on');
   });
 
   await t.test('keep-awake runs only while it is on and a chat is shared, stops with the last one, and never runs two', async () => {
@@ -257,6 +263,65 @@ test('keeping the home PC available', async (t) => {
     await sleep(300);
     assert.equal(ollama.unloads() - before, 1, 'the cleanup ran, once');
     assert.equal(JSON.parse(fs.readFileSync(path.join(home.profile, 'availability.json'), 'utf8')).trayNoteShown, true, 'and the note stays said');
+  });
+
+  await t.test('a second launch on the same profile hands over to the first and exits, and other profiles run alongside', async () => {
+    const home = await solo('single');
+    const beside = await solo('beside');
+    await shareOne(home);
+    await sharingIs(home, true);
+    await waitFor('the icon', () => peek(home, 'tray'), 5000);
+    await closeMainWindow(home);
+    await waitFor('hidden', async () => (await mainWindowFacts(home))?.visible === false, 5000);
+
+    const env = { ...process.env };
+    delete env.ELECTRON_RUN_AS_NODE;
+    const second = spawn(ELECTRON, [ROOT, `--user-data-dir=${home.profile}`], { env, stdio: 'ignore' });
+    const code = await new Promise((resolve) => {
+      const timer = setTimeout(() => { second.kill(); resolve('still running'); }, 20000);
+      second.once('exit', (c) => { clearTimeout(timer); resolve(c); });
+    });
+    assert.equal(code, 0, 'the second one went');
+    await waitFor('the first window shown', async () => (await mainWindowFacts(home))?.visible === true, 5000);
+    assert.equal(home.exited, false);
+    assert.equal(await beside.page.evaluate(() => typeof state), 'object', 'one with its own profile runs alongside');
+  });
+
+  await t.test("if the system won't give a tray icon, closing quits as if nothing were shared, and says why once", async () => {
+    const home = await launch('notray', ollama, { flags: `${FLAGS},tray-fails` });
+    made.push(home);
+    let said = '';
+    home.app.process().stderr.on('data', (chunk) => { said += chunk; });
+    assert.deepEqual(await home.remote('setAddress', relay.address), { ok: true });
+    await waitFor('Remote Control to be on', () => home.page.evaluate(() => remoteStatusNow().enabled === true));
+    await shareOne(home);
+    await sharingIs(home, true);
+    await waitFor('the line in the log', () => said.includes("[tray] Couldn't show a tray icon"), 5000);
+    assert.equal(await peek(home, 'tray'), false);
+    await closeMainWindow(home);
+    await exits(home);
+    assert.equal(said.split("[tray] Couldn't show a tray icon").length - 1, 1, 'said once');
+  });
+
+  await t.test('two Quits in a row, the second while the cleanup is running, clean up once', async () => {
+    const slow = await startOllama({ unloadDelayMs: 1500 });
+    t.after(() => slow.stop());
+    const home = await launch('twice', slow);
+    made.push(home);
+    assert.deepEqual(await home.remote('setAddress', relay.address), { ok: true });
+    await waitFor('Remote Control to be on', () => home.page.evaluate(() => remoteStatusNow().enabled === true));
+    await shareOne(home);
+    await sharingIs(home, true);
+    await waitFor('the icon', () => peek(home, 'tray'), 5000);
+    await closeMainWindow(home);
+    await waitFor('hidden', async () => (await mainWindowFacts(home))?.visible === false, 5000);
+    await peek(home, 'clickTrayMenu', 'Quit').catch(() => {});
+    await sleep(300);
+    assert.equal(slow.unloads(), 1, 'the cleanup is under way');
+    await home.app.evaluate(({ app }) => app.quit()).catch(() => {});
+    await exits(home);
+    await sleep(300);
+    assert.equal(slow.unloads(), 1, 'and ran once');
   });
 
   await t.test('the icon goes when the last chat is unshared, but not while the window is hidden', async () => {
@@ -545,7 +610,6 @@ test('from a laptop', async (t) => {
       window.__forged = null;
       actionToHome = (deviceId, chatId, kind, args, options) => (kind === 'list-dir' && window.__forged ? Promise.resolve(window.__forged) : window.__realActionToHome(deviceId, chatId, kind, args, options));
     });
-    t.after(() => laptop.page.evaluate(() => { actionToHome = window.__realActionToHome; }).catch(() => {}));
     const forge = (answer) => laptop.page.evaluate((a) => { window.__forged = a; }, answer);
 
     await forge({ ok: true, path: tree, entries: ['<img src=x onerror="window.__pwned=1">', 'line\nbreak', 'zero​width', 5, { name: 'x' }, '..', 'a/b', 'a\\b'], more: 0 });
@@ -557,6 +621,11 @@ test('from a laptop', async (t) => {
     assert.equal(await laptop.page.evaluate(() => window.__pwned), undefined);
     assert.deepEqual(await laptop.page.evaluate(() => [...document.querySelectorAll('#fb-list .fb-entry')].map((el) => el.disabled)), [false, true, false], 'a name with a line break can\'t be used');
 
+    // A drive's name is shown as text too, hidden characters and all.
+    await forge({ ok: true, path: tree, entries: [], more: 0, roots: ['C:\\', '/\u202Ex'] });
+    await laptop.page.evaluate(() => { remoteUi.folders.roots = []; });
+    await goTo('');
+    assert.deepEqual(await textsOf(laptop, '#fb-roots .fb-root'), ['C:\\', '/\\u202Ex']);
     await forge({ ok: true, path: tree, entries: Array.from({ length: 500 }, (_, i) => `d${i}`), more: 7 });
     await goTo(tree);
     assert.equal((await names()).length, 200);
@@ -571,6 +640,39 @@ test('from a laptop', async (t) => {
     await goTo(tree);
     assert.equal(await textOf(laptop, '#fb-error'), '<b>no</b>\\u202Etxt');
     assert.equal(await laptop.page.evaluate(() => document.querySelectorAll('#folder-browser-overlay b').length), 0);
+    await laptop.page.evaluate(() => {
+      closeFolderBrowser();
+      window.__forged = null;
+      actionToHome = window.__realActionToHome;
+    });
+  });
+
+  await t.test("while home's kind of machine isn't known, Up, choosing and going in do nothing, and it says so", async () => {
+    const id = await newChat(home, { ...project, projectFolder: tree, pathAllowlist: [tree] });
+    await watch(trio, id);
+    const saved = await laptop.page.evaluate((h) => { const os = mirror.homes.get(h).info.os; mirror.homes.get(h).info.os = null; return os; }, trio.homeId);
+    await laptop.page.evaluate(() => pickProjectFolder());
+    await waitFor('the browser', browserOpen, 5000);
+    await settled();
+    assert.equal(await visible(laptop, '#fb-wait'), true);
+    assert.equal(await textOf(laptop, '#fb-wait'), 'Waiting for the home PC.');
+    assert.deepEqual(await laptop.page.evaluate(() => ['#fb-up', '#fb-choose'].map((sel) => document.querySelector(sel).disabled)), [true, true]);
+    assert.ok(await laptop.page.evaluate(() => [...document.querySelectorAll('#fb-list .fb-entry')].every((el) => el.disabled)));
+    const asked = (await laptop.frames()).length;
+    await laptop.page.evaluate(() => {
+      const fb = remoteUi.folders;
+      [...document.querySelectorAll('#fb-list .fb-entry')][0].click();
+      document.querySelector('#fb-up').click();
+      document.querySelector('#fb-choose').click();
+      return fb.busy;
+    });
+    await sleep(500);
+    assert.equal((await laptop.frames()).length, asked, 'nothing was asked of home');
+    assert.equal(await shownPath(), tree);
+    // Home's details arrive, as they do in a snapshot, and it works again.
+    await laptop.page.evaluate(([h, os]) => { mirror.homes.get(h).info.os = os; paintFolderBrowser(); }, [trio.homeId, saved]);
+    assert.equal(await visible(laptop, '#fb-wait'), false);
+    assert.equal(await laptop.page.evaluate(() => document.querySelector('#fb-choose').disabled), false);
     await laptop.page.evaluate(() => closeFolderBrowser());
   });
 
@@ -617,12 +719,6 @@ test('from a laptop', async (t) => {
     await waitFor('the laptop to show it', async () => (await textOf(laptop, '#fb-laptop-path')) === laptopDir, 5000);
     assert.equal(await visible(laptop, '#fb-laptop-clear'), true);
 
-    // The model at home is told where that is, as a quoted path.
-    const prompt = await home.page.evaluate(([chatId, device]) => {
-      const c = state.chats[chatId];
-      return projectFolderPrompt({ ...c, projectFolder: undefined, projectFolders: { [device]: c.projectFolders[device] } });
-    }, [id, trio.laptopId]);
-    assert.ok(prompt.includes(JSON.stringify(laptopDir)), prompt);
     await laptop.page.evaluate(() => closeFolderBrowser());
   });
 
@@ -706,6 +802,50 @@ test('from a laptop', async (t) => {
     assert.deepEqual(await home.page.evaluate((chatId) => state.chats[chatId].pathAllowlists, laptopProject), { [trio.laptopId]: [], [OTHER_LAPTOP]: [otherDir] }, 'and its access with it');
   });
 
+  await t.test("a laptop's folder is the default only while that laptop is available, and the prompt says so", async () => {
+    const id = await newChat(home, { ...project, projectFolders: { [trio.laptopId]: laptopDir }, pathAllowlists: { [trio.laptopId]: [laptopDir] } });
+    const facts = () => home.page.evaluate((chatId) => {
+      const c = state.chats[chatId];
+      const target = toolTarget('run_command', { command: 'x' }, c);
+      const named = toolTarget('run_command', { command: 'x', device: 'laptop' }, c);
+      return { device: target.device?.id ?? null, error: target.error ?? null, named: named.error ?? named.device?.id, folder: projectFolderPrompt(c), devices: devicesPrompt(c), home: RemoteRules.HOME_DEVICE };
+    }, id);
+    const hears = (want) => waitFor(`home to hear the switch is ${want}`, () => home.page.evaluate(([d, v]) => (remoteTools.control.get(d)?.allowed === true) === v, [trio.laptopId, want]), 10000);
+
+    let now = await facts();
+    assert.equal(now.device, now.home, 'switch off: home');
+    assert.equal(now.error, null, "the laptop's folder causes no error by itself");
+    assert.match(String(now.named), /turned off control|offline/, 'asking for it by name still gets the error');
+    assert.equal(now.folder, null, 'no folder is called the project folder');
+    assert.equal(now.devices, null);
+
+    assert.deepEqual(await laptop.remote('setControlAllowed', true), { ok: true });
+    await hears(true);
+    now = await facts();
+    assert.equal(now.device, trio.laptopId, 'switch on: the laptop');
+    assert.ok(now.folder.includes(`PROJECT FOLDER: ${JSON.stringify(laptopDir)} (on the device "laptop")`), now.folder);
+    assert.ok(now.devices.includes(`the project folder at the path ${JSON.stringify(laptopDir)}`), now.devices);
+    // With a folder at home too, home's is the project folder and the laptop's is only a folder there.
+    const both = await newChat(home, { ...project, projectFolder: tree, pathAllowlist: [tree], projectFolders: { [trio.laptopId]: laptopDir } });
+    const bothSaid = await home.page.evaluate((chatId) => devicesPrompt(state.chats[chatId]), both);
+    assert.ok(bothSaid.includes(`the project folder at the path ${JSON.stringify(tree)}`), bothSaid);
+    assert.ok(bothSaid.includes(`a folder at the path ${JSON.stringify(laptopDir)}`), bothSaid);
+    assert.ok(!bothSaid.includes(`the project folder at the path ${JSON.stringify(laptopDir)}`));
+
+    assert.deepEqual(await laptop.remote('setControlAllowed', false), { ok: true });
+    await hears(false);
+    now = await facts();
+    assert.equal(now.device, now.home, 'off again: home');
+    assert.equal(now.folder, null);
+
+    // The laptop says what that means, in one plain line.
+    await watch(trio, id);
+    await laptop.page.evaluate(() => pickProjectFolder());
+    await waitFor('the browser', browserOpen, 5000);
+    assert.equal(await textOf(laptop, '.fb-laptop .setting-help'), "When the home PC has no folder for this chat, the home PC's model works here while this laptop allows it.");
+    await laptop.page.evaluate(() => closeFolderBrowser());
+  });
+
   // ---- Run on a code block ----
 
   const markerFile = path.join(markers, 'runs.jsonl');
@@ -733,6 +873,7 @@ test('from a laptop', async (t) => {
     await confirmUp();
     assert.equal(await textOf(laptop, '#run-confirm-machine'), `This laptop, ${laptopName}`);
     assert.equal(await textOf(laptop, '#run-confirm-folder'), 'This chat has no folder on this laptop, so it runs in a temporary folder.');
+    assert.equal(await textOf(laptop, '#run-confirm-lang'), 'JavaScript (Node)', 'and what it runs as');
     assert.equal(await textOf(laptop, '#run-confirm-code'), snippet);
     assert.ok((await textOf(laptop, '#run-confirm-desc')).includes(homeName));
     assert.equal(await textOf(laptop, '#run-confirm-run'), 'Run on this laptop');
@@ -827,6 +968,119 @@ test('from a laptop', async (t) => {
     assert.equal(await visible(laptop, '.output-overlay'), false);
     assert.equal(runs().length, count);
     assert.equal((await laptop.remote('unlock', PIN)).ok, true);
+  });
+
+  const runNow = () => laptop.page.evaluate(() => document.querySelector('#run-confirm-run').click());
+  const panelGone = () => waitFor('the panel to go', () => laptop.page.evaluate(() => !document.querySelector('.output-overlay')), 5000);
+
+  await t.test('a lock takes down output panels from home chats, and Rerun runs nothing while locked and asks first otherwise', async () => {
+    await laptop.page.evaluate(() => { remoteAsks.guardMs = 0; });
+    const { rid } = await withCode(snippet);
+    await clickRun(laptop);
+    await confirmUp();
+    await runNow();
+    await outputDone(laptop);
+    const count = runs().length;
+    await laptop.page.evaluate(() => { window.__panel = document.querySelector('.output-overlay'); });
+
+    await laptop.page.evaluate(() => window.__panel.querySelector('[data-out-action="rerun"]').click());
+    await confirmUp();
+    assert.equal(await textOf(laptop, '#run-confirm-code'), snippet, 'Rerun shows the code again');
+    await laptop.page.evaluate(() => document.querySelector('#run-confirm-cancel').click());
+    await sleep(300);
+    assert.equal(runs().length, count, 'Cancel ran nothing');
+
+    await laptop.remote('lock');
+    await panelGone();
+    assert.equal(await laptop.page.evaluate(() => window.__panel.querySelector('[data-terminal]').textContent), '', 'and what it printed with it');
+    await laptop.page.evaluate(() => document.querySelector('#remote-pin-later').click());
+    assert.equal(await laptop.page.evaluate(() => remoteChatsHidden()), true);
+    await laptop.page.evaluate(() => window.__panel.querySelector('[data-out-action="rerun"]').click());
+    await sleep(1000);
+    assert.equal(runs().length, count, 'nothing ran');
+    assert.equal(await visible(laptop, '#run-confirm-overlay'), false);
+    // A panel opened straight from page code while locked runs nothing either, and doesn't stay.
+    await laptop.page.evaluate(([k, body]) => openOutputModal({ code: body, lang: 'js', filename: 'x.js', chatKey: k, machine: 'x' }), [rid, snippet]);
+    await sleep(800);
+    assert.equal(runs().length, count);
+    assert.equal(await laptop.page.evaluate(() => Boolean(document.querySelector('.output-overlay'))), false);
+    assert.equal((await laptop.remote('unlock', PIN)).ok, true);
+  });
+
+  await t.test('a Run confirmation or an output panel goes with its chat, and can run nothing after', async () => {
+    await laptop.page.evaluate(() => { remoteAsks.guardMs = 0; });
+    const first = await withCode(snippet);
+    await clickRun(laptop);
+    await confirmUp();
+    await setShared(home, first.id, false);
+    await waitFor('the confirmation to go', async () => !(await visible(laptop, '#run-confirm-overlay')), 5000);
+    await runNow();
+
+    const second = await withCode(snippet);
+    await clickRun(laptop);
+    await confirmUp();
+    await runNow();
+    await outputDone(laptop);
+    const count = runs().length;
+    await laptop.page.evaluate(() => { window.__panel = document.querySelector('.output-overlay'); });
+    await home.page.evaluate((chatId) => deleteChat(chatId), second.id);
+    await panelGone();
+    await laptop.page.evaluate(() => window.__panel.querySelector('[data-out-action="rerun"]').click());
+    await sleep(800);
+    assert.equal(runs().length, count);
+    assert.equal(await visible(laptop, '#run-confirm-overlay'), false);
+  });
+
+  await t.test('the Run confirmation guards again when the window comes back from minimized', async () => {
+    await laptop.page.evaluate(() => { remoteAsks.guardMs = 800; });
+    await withCode(snippet);
+    await clickRun(laptop);
+    await confirmUp();
+    await sleep(1000);
+    const count = runs().length;
+    await laptop.app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows().find((w) => w.webContents.getURL().includes('index.html')).minimize());
+    await waitFor('minimized', () => laptop.app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows().find((w) => w.webContents.getURL().includes('index.html')).isMinimized()), 5000);
+    await laptop.app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows().find((w) => w.webContents.getURL().includes('index.html')).restore());
+    await runNow();
+    await sleep(300);
+    assert.equal(runs().length, count, 'too soon after it came back');
+    assert.equal(await visible(laptop, '#run-confirm-overlay'), true);
+    await sleep(900);
+    await runNow();
+    await outputDone(laptop);
+    assert.equal(runs().length, count + 1);
+    await closeOutput(laptop);
+  });
+
+  await t.test("a home pop-up that arrived while hidden guards again once the window is shown", async () => {
+    const dir = path.join(root, 'while-hidden');
+    fs.mkdirSync(dir);
+    const marker = path.join(dir, 'approved.txt');
+    const id = await newChat(home, { ...project, planMode: false, approvalMode: true, projectFolder: dir, pathAllowlist: [dir] });
+    await openChat(home, id);
+    await closeMainWindow(home);
+    await waitFor('home to hide', async () => (await mainWindowFacts(home))?.visible === false, 5000);
+    await home.page.evaluate((chatId) => { submitToChat(state.chats[chatId], 'Go', []).catch(() => {}); }, id);
+    const first = await ollama.next();
+    first.call('run_command', { command: 'echo yes > approved.txt', cwd: dir });
+    first.finish();
+    await waitFor('the pop-up, painted while hidden', () => home.page.evaluate(() => document.querySelector('#approval-overlay').dataset.shown === 'yes'), 10000);
+    await sleep(1200);
+
+    await peek(home, 'clickTrayIcon');
+    await waitFor('home shown', async () => (await mainWindowFacts(home))?.visible === true, 5000);
+    await home.page.evaluate(() => document.querySelector('#approval-approve').click());
+    await sleep(300);
+    assert.equal(fs.existsSync(marker), false, 'nothing ran: nobody could have read it yet');
+    assert.equal(await visible(home, '#approval-overlay'), true);
+
+    await sleep(900);
+    await home.page.evaluate(() => document.querySelector('#approval-approve').click());
+    const second = await ollama.next();
+    second.say('Done.');
+    second.finish();
+    await waitFor('the command to run', () => fs.existsSync(marker), 10000);
+    await waitFor('the reply to finish', () => home.page.evaluate((chatId) => !state.runningChats.has(chatId), id), 10000);
   });
 
 });

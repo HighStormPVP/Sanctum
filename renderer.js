@@ -5765,11 +5765,14 @@ When the user asks you to do something destructive (delete files, etc.), trust t
 
 // Any folder can hold quotes or text that reads like instructions, a laptop's most of all, since that
 // device chose it. RemoteRules puts it in the prompt as a quoted path.
+// Only the default device's folder is "the project folder", and that's a laptop's only while the laptop
+// is available. With more than one device in play the prompt says which machine it's on.
 function projectFolderPrompt(c) {
-  const folderDevice = RemoteRules.chatFolderDevice(c);
+  const devices = toolDevices();
+  const folderDevice = RemoteRules.chatFolderDevice(c, devices);
   const elsewhere = folderDevice !== RemoteRules.HOME_DEVICE;
   const folder = elsewhere ? folderOn(c, folderDevice) : c.projectFolder;
-  const onDevice = elsewhere ? pairedToolDevices().find((d) => d.id === folderDevice) : null;
+  const onDevice = devices.length > 1 ? devices.find((d) => d.id === folderDevice) : null;
   return RemoteRules.projectFolderPrompt({ folder, deviceName: onDevice?.name, shell: elsewhere ? onDevice?.shell : shellNameHere() });
 }
 
@@ -6494,6 +6497,8 @@ const remoteUi = {
   sharingReported: null,     // what the main process was last told about whether a chat is shared
   availability: null,        // the keep-awake and start-at-login settings, as the main process has them
   folders: null,             // the home folder browser, while it's open
+  runConfirmKey: null,       // the chat the Run confirmation is for
+  outputs: new Map(),        // an output panel from a home chat -> { key, close }
   runConfirm: null           // takes down the Run confirmation, while it's up
 };
 
@@ -6535,6 +6540,7 @@ function wireRemoteUi() {
   wireRemotePinScreen();
   wireAvailabilitySettings();
   wireFolderBrowser();
+  window.api.app.onShown(() => { for (const arm of [...remoteAsks.rearm]) arm(); });
   $('#remote-running-off')?.addEventListener('click', turnOffLaptopControl);
   $('#remote-reset-ok')?.addEventListener('click', () => { $('#remote-reset-overlay').hidden = true; });
   $('#remote-reset-devices')?.addEventListener('click', () => {
@@ -6545,6 +6551,7 @@ function wireRemoteUi() {
 
 function paintRemoteUi() {
   reportSharing();
+  takeDownGoneRemoteRuns();
   paintRemoteSwitch(currentChat());
   paintPinScreen();
   paintRemoteIndicators();
@@ -7328,7 +7335,7 @@ function devicesPrompt(c) {
     const isHome = d.id === RemoteRules.HOME_DEVICE;
     const folder = folderOn(c, d.id);
     const facts = [DEVICE_OS_LABELS.get(d.os) || 'unknown system', `shell ${d.shell}`];
-    if (folder) facts.push(`project folder at the path ${RemoteRules.promptPath(folder)}`);
+    if (folder) facts.push(`${d.id === fallback ? 'the project folder' : 'a folder'} at the path ${RemoteRules.promptPath(folder)}`);
     if (d.id === fallback) facts.push('the default');
     return `- "${d.name}"${isHome ? ' (the home PC, where you are running)' : ''}: ${facts.join(', ')}`;
   });
@@ -7456,11 +7463,12 @@ const ASK_MODALS = {
   approval: { overlay: '#approval-overlay', choices: [['#approval-deny', false], ['#approval-approve', true]], words: ['#approval-name', '#approval-desc', '#approval-body'] },
   plan: { overlay: '#plan-approval-overlay', choices: [['#plan-approval-deny', false], ['#plan-approval-approve', true]], words: ['#plan-approval-desc', '#plan-approval-body'] },
   path: { overlay: '#path-expand-overlay', choices: [['#pe-deny', 'deny'], ['#pe-once', 'once'], ['#pe-folder', 'folder']], words: ['#pe-desc', '#pe-tool-name', '#pe-device', '#pe-requested-path', '#pe-current-folder'] },
-  run: { overlay: '#run-confirm-overlay', choices: [['#run-confirm-cancel', false], ['#run-confirm-run', true]], words: ['#run-confirm-desc', '#run-confirm-machine', '#run-confirm-folder', '#run-confirm-code'] }
+  run: { overlay: '#run-confirm-overlay', choices: [['#run-confirm-cancel', false], ['#run-confirm-run', true]], words: ['#run-confirm-desc', '#run-confirm-machine', '#run-confirm-folder', '#run-confirm-lang', '#run-confirm-code'] }
 };
 
 const remoteAsks = {
   guardMs: ASK_GUARD_MS,
+  rearm: new Set(),    // for each pop-up on screen, starts its guard again from its next paint
   // At home.
   open: new Map(),     // id -> { id, kind, chatId, refusal, frame, notShown, sentTo, asked, unheld, offered, timer, takeDown, turnOver, over, resolve }
   answers: new Map(),  // chatId -> who answered for the tool call under way, for its line in the log
@@ -7539,13 +7547,24 @@ function wireAskModal(kind, answer, onlyRefuse = false) {
   overlay.hidden = false;
   buttons[0].el.focus();
   const unmarkBoxes = markAskBoxes(overlay);
-  let frame = requestAnimationFrame(() => {
+  // Painted is when it could first be read. Frames can run in a window that's in the tray or minimized,
+  // so when it comes back the paint is waited for again, and the guard starts over.
+  let frame = 0;
+  const arm = () => {
+    cancelAnimationFrame(frame);
+    shownAt = Infinity;
+    delete overlay.dataset.shown;
     frame = requestAnimationFrame(() => {
-      shownAt = performance.now();
-      overlay.dataset.shown = 'yes';
+      frame = requestAnimationFrame(() => {
+        shownAt = performance.now();
+        overlay.dataset.shown = 'yes';
+      });
     });
-  });
+  };
+  arm();
+  remoteAsks.rearm.add(arm);
   return () => {
+    remoteAsks.rearm.delete(arm);
     cancelAnimationFrame(frame);
     delete overlay.dataset.shown;
     overlay.hidden = true;
@@ -8308,7 +8327,7 @@ function wireFolderBrowser() {
   $('#fb-x')?.addEventListener('click', closeFolderBrowser);
   $('#fb-up')?.addEventListener('click', () => {
     const fb = remoteUi.folders;
-    const up = fb?.listing && RemoteRules.parentFolder(fb.listing.path, fb.os);
+    const up = fb?.listing && !fb.busy && RemoteRules.parentFolder(fb.listing.path, fb.os);
     if (up) browseHomeFolder(up);
   });
   $('#fb-choose')?.addEventListener('click', chooseHomeFolder);
@@ -8326,7 +8345,11 @@ function wireFolderBrowser() {
 function openFolderBrowser(c) {
   if (remoteChatsHidden() || !c?.remote) return;
   const { deviceId, chatId } = c.remote;
-  remoteUi.folders = { key: c.id, deviceId, chatId, os: mirror.homes.get(deviceId)?.info?.os || null, listing: null, roots: [], turn: 0, busy: false, error: '' };
+  remoteUi.folders = {
+    key: c.id, deviceId, chatId, listing: null, roots: [], turn: 0, busy: false, error: '',
+    // What kind of machine home is, as it said. Until it has, nothing joins or splits a path.
+    get os() { return mirror.homes.get(deviceId)?.info?.os || null; }
+  };
   $('#fb-home').textContent = RemoteRules.revealHidden(homeName(deviceId)).text;
   $('#folder-browser-overlay').hidden = false;
   paintFolderBrowser();
@@ -8380,10 +8403,12 @@ function paintFolderBrowser() {
   if (!fb) return;
   const listing = fb.listing;
   $('#fb-path').textContent = listing ? RemoteRules.revealHidden(listing.path).text : '';
-  $('#fb-up').disabled = fb.busy || !listing || !RemoteRules.parentFolder(listing.path, fb.os);
-  $('#fb-choose').disabled = fb.busy || !listing;
+  const known = !!fb.os;
+  $('#fb-wait').hidden = known;
+  $('#fb-up').disabled = fb.busy || !known || !listing || !RemoteRules.parentFolder(listing.path, fb.os);
+  $('#fb-choose').disabled = fb.busy || !known || !listing;
   $('#fb-roots').replaceChildren(...fb.roots.map((root) => {
-    const btn = remoteEl('button', 'fb-root', root);
+    const btn = remoteEl('button', 'fb-root', RemoteRules.revealHidden(root).text);
     btn.type = 'button';
     btn.disabled = fb.busy;
     btn.addEventListener('click', () => browseHomeFolder(root));
@@ -8393,9 +8418,12 @@ function paintFolderBrowser() {
   const rows = (listing?.entries || []).map((entry) => {
     const btn = remoteEl('button', 'fb-entry', entry.shown);
     btn.type = 'button';
-    btn.disabled = fb.busy || !entry.usable;
+    btn.disabled = fb.busy || !known || !entry.usable;
     if (!entry.usable) btn.title = "This name has a control character, so it can't be used.";
-    btn.addEventListener('click', () => browseHomeFolder(RemoteRules.childFolder(listing.path, entry.name, fb.os)));
+    btn.addEventListener('click', () => {
+      const into = RemoteRules.childFolder(listing.path, entry.name, fb.os);
+      if (into) browseHomeFolder(into);
+    });
     const row = remoteEl('li');
     row.append(btn);
     return row;
@@ -8448,7 +8476,7 @@ async function sendLaptopFolder(fb, path) {
 
 async function chooseHomeFolder() {
   const fb = remoteUi.folders;
-  if (!fb?.listing || fb.busy) return;
+  if (!fb?.listing || fb.busy || !fb.os) return;
   const turn = ++fb.turn;
   fb.busy = true;
   fb.error = '';
@@ -8484,26 +8512,60 @@ function laptopFolderOf(c) {
   return RemoteRules.isChosenFolder(folders[own]) ? folders[own] : null;
 }
 
-function confirmLaptopRun(c, run) {
-  if (remoteChatsHidden() || remoteUi.runConfirm) return;
+// What Run here would run, in words, as main.js's runners will run it.
+const RUN_LANG_LABELS = new Map([
+  ['py', 'Python'], ['python', 'Python'], ['js', 'JavaScript (Node)'], ['javascript', 'JavaScript (Node)'], ['mjs', 'JavaScript (Node)'],
+  ['ts', 'TypeScript'], ['typescript', 'TypeScript'], ['ps1', 'PowerShell'], ['powershell', 'PowerShell'],
+  ['sh', 'Shell'], ['bash', 'Shell'], ['bat', 'Batch (cmd)'], ['cmd', 'Batch (cmd)']
+]);
+
+// Only while that chat is still here, shared from its home, and the chats aren't hidden by a lock.
+function remoteRunAllowed(key) {
+  return !remoteChatsHidden() && !!state.chats[key]?.remote;
+}
+
+// Also asked again before Rerun in an output panel. onRun, if given, is what runs instead of a new
+// panel, and is handed the folder this confirmation showed.
+function confirmLaptopRun(c, run, onRun) {
+  if (!c?.remote || !remoteRunAllowed(c.id) || remoteUi.runConfirm) return;
+  const key = c.id;
   const folder = laptopFolderOf(c);
   const machine = thisDeviceName();
   $('#run-confirm-desc').textContent = `The code came from a chat on ${RemoteRules.revealHidden(homeName(c.remote.deviceId)).text}. It runs here, not on the home PC.`;
   $('#run-confirm-machine').textContent = `This laptop, ${machine}`;
   $('#run-confirm-folder').textContent = folder ? RemoteRules.revealHidden(folder).text : 'This chat has no folder on this laptop, so it runs in a temporary folder.';
   $('#run-confirm-folder').classList.toggle('dim', !folder);
+  $('#run-confirm-lang').textContent = RUN_LANG_LABELS.get((run.lang || '').toLowerCase()) || (run.lang || 'Unknown');
   $('#run-confirm-code').textContent = run.code;
+  remoteUi.runConfirmKey = key;
   remoteUi.runConfirm = wireAskModal('run', (value) => {
     takeDownRunConfirm();
-    if (value !== true || remoteChatsHidden()) return;
-    openOutputModal({ ...run, cwd: folder || undefined, machine });
+    if (value !== true || !remoteRunAllowed(key)) return;
+    if (onRun) onRun(folder || undefined);
+    else openOutputModal({ ...run, cwd: folder || undefined, machine, chatKey: key });
   });
 }
 
 function takeDownRunConfirm() {
   const takeDown = remoteUi.runConfirm;
   remoteUi.runConfirm = null;
+  remoteUi.runConfirmKey = null;
   if (takeDown) takeDown();
+}
+
+// A lock takes down every Run that came from a home chat, and what it printed. A chat that has gone
+// takes its own. Closing a panel stops what it was running.
+function takeDownRemoteRuns(which = () => true) {
+  if (remoteUi.runConfirm && which(remoteUi.runConfirmKey)) takeDownRunConfirm();
+  for (const [overlay, panel] of [...remoteUi.outputs]) {
+    if (!which(panel.key)) continue;
+    overlay.querySelector('[data-terminal]')?.replaceChildren();
+    panel.close();
+  }
+}
+
+function takeDownGoneRemoteRuns() {
+  takeDownRemoteRuns((key) => !state.chats[key]?.remote);
 }
 
 // ============== ACTING FROM A LAPTOP ==============
@@ -9956,6 +10018,8 @@ function applyMirrorSnapshot(deviceId, home, frame) {
     }
   }
   home.info = ChatMirror.cleanHome(frame.home);
+  // Which kind of machine it is decides how the folder browser joins paths.
+  if (remoteUi.folders?.deviceId === deviceId) paintFolderBrowser();
   home.clockOffset = Number.isFinite(frame.now) ? frame.now - Date.now() : 0;
   home.expected = frame.seq + 1;
   const transfer = Number.isSafeInteger(frame.transfer) ? frame.transfer : null;
@@ -10021,6 +10085,8 @@ function dropRemoteChat(key) {
   if (!c) return;
   letGoOfAsksOfChat(key, 'That question closed, because its chat is no longer shared.');
   delete state.chats[key];
+  takeDownGoneRemoteRuns();
+  if (remoteUi.folders?.key === key) closeFolderBrowser();
   state.order = state.order.filter(id => id !== key);
   state.runningChats.delete(key);
   const wasOpen = state.activeId === key;
@@ -10069,7 +10135,7 @@ function reflectRemoteLock() {
   if (hidden) {
     hideHeldAsks();
     closeFolderBrowser();
-    takeDownRunConfirm();
+    takeDownRemoteRuns();
     const c = currentChat();
     if (c?.remote) {
       mirror.resumeId = state.activeId;
@@ -10335,6 +10401,7 @@ function wireCodeBlockActions() {
       const c = currentChat();
       // A preview runs in a sandboxed frame, not on the machine, so only a real run asks first.
       if (c?.remote && !isPreviewLang(run.lang)) confirmLaptopRun(c, run);
+      else if (c?.remote && isPreviewLang(run.lang) && remoteChatsHidden()) return;
       else if (!c?.remote || !remoteChatsHidden()) openOutputModal({ ...run, machine: thisDeviceName() });
     }
   });
@@ -10567,8 +10634,10 @@ function isPreviewLang(lang) {
   return langKey === 'html' || langKey === 'htm';
 }
 
-// machine is where it runs, named in the panel. cwd is only for a laptop, running in its folder there.
-function openOutputModal({ code, lang, filename, cwd, machine = thisDeviceName() }) {
+// machine is where it runs, named in the panel. cwd and chatKey are only for a laptop, running code from
+// a home chat in its folder there: such a panel goes with a lock or with its chat, and asks before Rerun.
+function openOutputModal({ code, lang, filename, cwd, machine = thisDeviceName(), chatKey = null }) {
+  let runCwd = cwd;
   const langKey = (lang || '').toLowerCase();
   const isHtml = isPreviewLang(langKey);
 
@@ -10630,8 +10699,10 @@ function openOutputModal({ code, lang, filename, cwd, machine = thisDeviceName()
     overlay.classList.add('is-closing');
     setTimeout(() => overlay.remove(), 160);
     document.removeEventListener('keydown', onEsc);
+    remoteUi.outputs.delete(overlay);
     if (activeTaskId) { window.api.shell.runCodeKill(activeTaskId).catch(() => {}); }
   };
+  if (chatKey) remoteUi.outputs.set(overlay, { key: chatKey, close });
   const onEsc = (ev) => { if (ev.key === 'Escape') { ev.preventDefault(); close(); } };
   document.addEventListener('keydown', onEsc);
 
@@ -10651,8 +10722,13 @@ function openOutputModal({ code, lang, filename, cwd, machine = thisDeviceName()
         window.api.shell.runCodeKill(activeTaskId).catch(() => {});
       }
       if (action === 'rerun') {
-        overlay.querySelector('[data-terminal]').textContent = '';
-        startRun();
+        const again = (folder) => {
+          runCwd = folder;
+          overlay.querySelector('[data-terminal]').textContent = '';
+          startRun();
+        };
+        if (chatKey) confirmLaptopRun(state.chats[chatKey], { code, lang, filename }, again);
+        else again(runCwd);
       }
     }
   });
@@ -10684,6 +10760,12 @@ function openOutputModal({ code, lang, filename, cwd, machine = thisDeviceName()
   };
 
   const startRun = async () => {
+    // Every way in, the first run, Rerun, or page code opening a panel, stops here while locked or once the
+    // chat has gone, and the panel goes with it.
+    if (chatKey && !remoteRunAllowed(chatKey)) {
+      close();
+      return;
+    }
     activeTaskId = null;
     setStatus('running', 'running');
     stopBtn.disabled = false;
@@ -10691,7 +10773,7 @@ function openOutputModal({ code, lang, filename, cwd, machine = thisDeviceName()
     const startedAt = Date.now();
     machineEl.textContent = `Running on ${machine}`;
     try {
-      await window.api.shell.runCode({ lang: langKey, code, cwd }, (chunk) => {
+      await window.api.shell.runCode({ lang: langKey, code, cwd: runCwd }, (chunk) => {
         if (chunk.kind === 'start') {
           activeTaskId = chunk.taskId;
           cmdEl.textContent = chunk.command || '';
