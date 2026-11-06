@@ -2010,20 +2010,71 @@ test('pop-ups on every device', async (t) => {
       });
     }
 
-    await s.test('a key press queued while a large pop-up is drawn doesn\'t answer it', async () => {
+    await s.test('a key press queued while a large pop-up is drawn doesn\'t answer it, even on Approve', async () => {
       const { fileB, finishA, finishB } = await smallThenLarge('queued-key', 6);
       await pastTheGuard();
       const p = await mouseAt(home, YES.approval);
       const session = await cdp(home);
       const key = (type) => session.send('Input.dispatchKeyEvent', { type, key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, text: type === 'keyDown' ? '\r' : undefined });
-      await Promise.all([...(await press(home, p, 1)), key('keyDown'), key('keyUp')]);
+      await home.page.evaluate(() => {
+        window.__focusAtKey = [];
+        document.addEventListener('keydown', () => window.__focusAtKey.push(document.activeElement?.id), { capture: true, once: true });
+      });
+      // A's Approve, then a press on the same spot, which is B's Approve by the time it's handled and
+      // takes the focus there, then Enter. All of it waits while B is drawn.
+      await Promise.all([...(await press(home, p, 1)), ...(await press(home, p, 1)), key('keyDown'), key('keyUp')]);
       await finishA();
       await waitFor('the second to be painted', () => painted(home, OVERLAY.approval), 60000);
       await sleep(500);
+      assert.deepEqual(await home.page.evaluate(() => window.__focusAtKey), ['approval-approve'], 'the key reached Approve, so it could only have failed by approving');
       assert.equal(await visible(home, OVERLAY.approval), true, 'neither approved nor refused by it');
       assert.equal(fs.existsSync(fileB), false);
       await click(home, NO.approval);
       await finishB();
+    });
+
+    await s.test('a touch held from before a pop-up appeared doesn\'t approve it when it lifts, however long it was held', async () => {
+      const session = await cdp(home);
+      await session.send('Emulation.setTouchEmulationEnabled', { enabled: true, maxTouchPoints: 1 });
+      const touch = (type, p) => session.send('Input.dispatchTouchEvent', { type, touchPoints: p ? [{ x: p.x, y: p.y }] : [] });
+      try {
+        for (const hold of [900, 1500, 2500]) {
+          const a = await shared();
+          const b = await shared();
+          const finishA = await modelCalls(a, 'run_command', { command: `echo a >> touch-a-${hold}.txt` });
+          await appears(home, 'approval');
+          await appears(laptop, 'approval');
+          const finishB = await modelCalls(b, 'run_command', { command: `echo b >> touch-b-${hold}.txt` });
+          await waitFor('the second to reach the laptop', async () => (await heldCount(laptop)) === 2, 5000);
+          await pastTheGuard();
+          const p = await centre(home, YES.approval);
+          await touch('touchStart', p);
+          await click(laptop, NO.approval);
+          await showing(home, `touch-b-${hold}.txt`);
+          await sleep(hold);
+          await touch('touchEnd');
+          await finishA();
+          await sleep(400);
+          assert.equal(lineCount(path.join(homeDir, `touch-b-${hold}.txt`)), 0, `held ${hold} ms: B didn't run`);
+          assert.equal(await visible(home, OVERLAY.approval), true);
+          await click(home, NO.approval);
+          assert.match((await finishB()).error, /denied/);
+        }
+
+        // A touch that starts and ends on it, after the guard, still approves.
+        const id = await shared();
+        const finish = await modelCalls(id, 'run_command', { command: 'echo x >> touch-ok.txt' });
+        await appears(home, 'approval');
+        await pastTheGuard();
+        const p = await centre(home, YES.approval);
+        await touch('touchStart', p);
+        await sleep(80);
+        await touch('touchEnd');
+        assert.equal((await finish()).exitCode, 0);
+        assert.equal(lineCount(path.join(homeDir, 'touch-ok.txt')), 1);
+      } finally {
+        await session.send('Emulation.setTouchEmulationEnabled', { enabled: false });
+      }
     });
 
     await s.test('a click after the guard on a large pop-up still approves', async () => {

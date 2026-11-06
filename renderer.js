@@ -7538,7 +7538,10 @@ function wireAskModal(kind, answer, onlyRefuse = false) {
     el.addEventListener('click', onClick);
     el.hidden = onlyRefuse && value !== refusal;
   }
-  for (const type of ['pointerdown', 'mousedown', 'touchstart']) document.addEventListener(type, onPress, true);
+  // pointerdown is when contact begins, for a mouse, a finger, or a pen. On touch, Chromium's stand-in
+  // mousedown only arrives when the finger lifts, so it would make a touch held from before this pop-up
+  // look like a press on it.
+  document.addEventListener('pointerdown', onPress, true);
   document.addEventListener('keydown', onKeyDown, true);
   document.addEventListener('keypress', onKeyRest, true);
   document.addEventListener('keyup', onKeyRest, true);
@@ -7563,7 +7566,7 @@ function wireAskModal(kind, answer, onlyRefuse = false) {
       el.removeEventListener('click', onClick);
       el.hidden = false;
     }
-    for (const type of ['pointerdown', 'mousedown', 'touchstart']) document.removeEventListener(type, onPress, true);
+    document.removeEventListener('pointerdown', onPress, true);
     document.removeEventListener('keydown', onKeyDown, true);
     document.removeEventListener('keypress', onKeyRest, true);
     document.removeEventListener('keyup', onKeyRest, true);
