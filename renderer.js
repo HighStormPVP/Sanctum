@@ -6494,7 +6494,6 @@ const remoteUi = {
   sharingReported: null,     // what the main process was last told about whether a chat is shared
   availability: null,        // the keep-awake and start-at-login settings, as the main process has them
   folders: null,             // the home folder browser, while it's open
-  laptopFolders: new Map(),  // a home chat's key -> this laptop's folder for it
   runConfirm: null           // takes down the Run confirmation, while it's up
 };
 
@@ -8313,6 +8312,10 @@ function wireFolderBrowser() {
     if (up) browseHomeFolder(up);
   });
   $('#fb-choose')?.addEventListener('click', chooseHomeFolder);
+  $('#fb-laptop-choose')?.addEventListener('click', chooseLaptopFolder);
+  $('#fb-laptop-clear')?.addEventListener('click', () => {
+    if (remoteUi.folders) sendLaptopFolder(remoteUi.folders, '');
+  });
   $('#folder-browser-overlay')?.addEventListener('keydown', (e) => {
     if (e.key !== 'Escape') return;
     e.stopPropagation();
@@ -8339,7 +8342,7 @@ function closeFolderBrowser() {
   // Hidden is still in the page, and a lock means none of it is.
   $('#fb-list').replaceChildren();
   $('#fb-roots').replaceChildren();
-  for (const id of ['#fb-path', '#fb-home', '#fb-more', '#fb-error']) $(id).textContent = '';
+  for (const id of ['#fb-path', '#fb-home', '#fb-more', '#fb-error', '#fb-laptop-path']) $(id).textContent = '';
 }
 
 // '' asks home to start at its default place for this chat.
@@ -8405,6 +8408,42 @@ function paintFolderBrowser() {
   more.textContent = listing?.more ? `${listing.more} more ${listing.more === 1 ? 'folder' : 'folders'} not shown.` : '';
   const error = $('#fb-error');
   error.textContent = fb.error;
+  const mine = laptopFolderOf(state.chats[fb.key]);
+  const laptopPath = $('#fb-laptop-path');
+  laptopPath.textContent = mine ? RemoteRules.revealHidden(mine).text : 'None chosen';
+  laptopPath.classList.toggle('dim', !mine);
+  $('#fb-laptop-choose').disabled = fb.busy;
+  $('#fb-laptop-clear').hidden = !mine;
+  $('#fb-laptop-clear').disabled = fb.busy;
+}
+
+// This laptop's own folder for the chat, from the normal system dialog here. It's checked here first,
+// by the same rule home uses, then sent, and shown once the mirror brings it back.
+async function chooseLaptopFolder() {
+  const fb = remoteUi.folders;
+  if (!fb || fb.busy) return;
+  const picked = await window.api.files.pickFolder().catch(() => null);
+  if (remoteUi.folders !== fb || !picked) return;
+  const problem = typeof picked.path === 'string' ? RemoteRules.laptopFolderProblem(picked.path, window.api.platform) : FOLDER_NAME_REFUSED;
+  if (problem || !picked.path) {
+    fb.error = problem || FOLDER_NAME_REFUSED;
+    paintFolderBrowser();
+    return;
+  }
+  sendLaptopFolder(fb, picked.path);
+}
+
+async function sendLaptopFolder(fb, path) {
+  if (fb.busy) return;
+  const turn = ++fb.turn;
+  fb.busy = true;
+  fb.error = '';
+  paintFolderBrowser();
+  const answer = await actionToHome(fb.deviceId, fb.chatId, 'set-laptop-folder', { path });
+  if (remoteUi.folders !== fb || fb.turn !== turn) return;
+  fb.busy = false;
+  if (!answer.ok) fb.error = RemoteRules.revealHidden(answer.error || REMOTE_ACTION_FAILED).text;
+  paintFolderBrowser();
 }
 
 async function chooseHomeFolder() {
@@ -8435,9 +8474,14 @@ function thisDeviceName() {
   return RemoteRules.revealHidden(remoteStatusNow().name || '').text || 'this PC';
 }
 
-// This laptop's folder for a chat at home, if this laptop knows of one.
+// This laptop's folder for a chat at home. Home is the record, so it's read from the mirrored chat,
+// under the id home knows this laptop by, and survives a restart here. A home could send anything, so
+// it's only used if it's a folder path that could have been chosen, and the Run confirmation shows it.
 function laptopFolderOf(c) {
-  return remoteUi.laptopFolders.get(c?.id) || null;
+  const own = remoteStatusNow().deviceId;
+  const folders = c?.projectFolders;
+  if (typeof own !== 'string' || !folders || typeof folders !== 'object' || !Object.hasOwn(folders, own)) return null;
+  return RemoteRules.isChosenFolder(folders[own]) ? folders[own] : null;
 }
 
 function confirmLaptopRun(c, run) {
@@ -8509,7 +8553,7 @@ function auditRemoteAction(deviceId, frame, allowed, answer) {
     else if (frame.kind === 'set-mode') details = { mode: args.mode };
     else if (frame.kind === 'set-toggle') details = { name: args.name, value: args.value };
     else if (frame.kind === 'new-chat') details = { modality: args.modality, model: args.model };
-    else if (frame.kind === 'list-dir' || frame.kind === 'set-folder') details = { path: args.path };
+    else if (frame.kind === 'list-dir' || frame.kind === 'set-folder' || frame.kind === 'set-laptop-folder') details = { path: args.path };
   }
   const short = (value, max) => (typeof value === 'string' ? value.slice(0, max) : undefined);
   window.api.audit.log({
@@ -8564,6 +8608,7 @@ function runRemoteAction(deviceId, frame) {
     case 'delete': deleteChat(c.id); return { ok: true };
     case 'list-dir': return remoteListDir(c, args.path);
     case 'set-folder': return remoteSetFolder(c, args.path);
+    case 'set-laptop-folder': return remoteSetLaptopFolder(deviceId, c, args.path);
     default: return { ok: false, error: REMOTE_ACTION_REFUSED };
   }
 }
@@ -8680,6 +8725,32 @@ async function remoteSetFolder(c, path) {
   renderIfOpen(c);
   renderChatList();
   return { ok: true, path: listed.path };
+}
+
+// The sending laptop's own folder for this chat, which only that laptop can set, filed under the id
+// it's connected as. Home can't look at that disk, so RemoteRules checks the text against the kind of
+// machine the laptop said it is. The mirror takes it back to the laptop, which runs code there.
+function remoteSetLaptopFolder(deviceId, c, path) {
+  if (c.modality !== 'agent') return { ok: false, error: 'Only a project has a folder.' };
+  const problem = RemoteRules.laptopFolderProblem(path, remoteTools.control.get(deviceId)?.os);
+  if (problem) return { ok: false, error: problem };
+  setLaptopFolder(c, deviceId, path);
+  renderIfOpen(c);
+  renderChatList();
+  return { ok: true, path };
+}
+
+// As setProjectFolder does at home: the old folder's access on that laptop ends with it.
+function setLaptopFolder(c, deviceId, folder) {
+  const folders = c.projectFolders && typeof c.projectFolders === 'object' ? c.projectFolders : {};
+  const previous = Object.hasOwn(folders, deviceId) ? folders[deviceId] : null;
+  if (previous && c.pathAllowlists && Object.hasOwn(c.pathAllowlists, deviceId)) {
+    c.pathAllowlists[deviceId] = c.pathAllowlists[deviceId].filter((p) => p !== previous);
+  }
+  if (folder) folders[deviceId] = folder;
+  else delete folders[deviceId];
+  c.projectFolders = folders;
+  saveToStorage();
 }
 
 // Queued words that aren't going to be sent, back to whoever typed them. Not to the device that
@@ -9845,6 +9916,8 @@ function applyMirrorOps(deviceId, home, chatId, ops) {
   }
   const c = existing || addRemoteChat(deviceId, chatId);
   const { resync } = ChatMirror.applyOps(c, ops);
+  // What it says about this laptop's folder is shown as soon as it arrives.
+  if (remoteUi.folders?.key === c.id) paintFolderBrowser();
   if (resync) requestMirrorSnapshot(deviceId, home);
   try {
     if (!resync) paintRemoteOps(c, ops);

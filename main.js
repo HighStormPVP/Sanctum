@@ -403,6 +403,9 @@ function createWindow() {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
+      // Never slowed when hidden or minimized. The chat loop, the mirror and laptop tools all run in
+      // this page, and a minimized window that crawled was a slowdown the owner noticed.
+      backgroundThrottling: false,
       devTools: devToolsAllowed(app.isPackaged)
     }
   });
@@ -609,8 +612,9 @@ const remoteTestFlags = new Set(app.isPackaged ? [] : String(process.env.SANCTUM
 
 // =================== KEEPING THIS PC AVAILABLE ===================
 // A laptop can only reach shared chats while Sanctum is running here. So while a chat is shared,
-// closing the window hides it to the tray, the window keeps working at full speed while hidden, and
-// two settings can keep this PC awake and start Sanctum at login. The page says whether a chat is
+// closing the window hides it to the tray, where it keeps working at full speed (it's never
+// throttled, see createWindow), and two settings can keep this PC awake and start Sanctum at
+// login. The page says whether a chat is
 // shared, since chats live there. Page code could lie about that, and the most a lie does is keep
 // a tray icon up or let this PC sleep.
 //
@@ -701,11 +705,6 @@ function applyAvailability() {
   }
   if (trayWantedNow()) showTray();
   else dropTray();
-  // A hidden or minimized window is otherwise slowed to a timer a second, and the chat loop, the
-  // mirror and laptop tools all run in it. The page can be gone before its window is, which is when
-  // it last says nothing's shared.
-  const contents = mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents : null;
-  if (contents && !contents.isDestroyed()) contents.setBackgroundThrottling(!availabilitySharing);
 }
 
 function trayWantedNow() {

@@ -1654,3 +1654,42 @@ test('Up and into a folder, on either kind of machine', () => {
   assert.equal(into('/', 'home', 'linux'), '/home');
   assert.equal(into('/home', 'me', 'darwin'), '/home/me');
 });
+
+// ---- Task 14, part 2: a laptop's own folder, recorded at home ----
+
+test('set-laptop-folder has the same strict shape as set-folder, and an empty path clears', () => {
+  for (const path of ['C:\\work\\project', 'D:/a b/c', '/Users/someone/project', '']) {
+    assert.equal(isAllowedAction(action('set-laptop-folder', { path })), true, JSON.stringify(path));
+  }
+  const refused = [
+    action('set-laptop-folder'),
+    action('set-laptop-folder', {}),
+    action('set-laptop-folder', { path: 'relative/path' }),
+    action('set-laptop-folder', { path: '/a/b\nc' }),
+    action('set-laptop-folder', { path: '/a/b\u2028c' }),
+    action('set-laptop-folder', { path: '\\\\server\\share' }),
+    action('set-laptop-folder', { path: '/a/../b' }),
+    action('set-laptop-folder', { path: 7 }),
+    // No frame gets to say whose folder it is: home files it under the device that sent it.
+    action('set-laptop-folder', { path: '/a', device: 'home' }),
+    action('set-laptop-folder', { path: '/a', deviceId: 'abcdefghijklmnop' }),
+    action('set-laptop-folder', { path: '/a', projectFolders: { home: '/a' } }),
+    action('set-laptop-folder', { path: '/a' }, { deviceId: 'abcdefghijklmnop' })
+  ];
+  for (const frame of refused) assert.equal(isAllowedAction(frame), false, JSON.stringify(frame));
+});
+
+test("a laptop's folder has to be that laptop's kind of path, since home can't look at its disk", () => {
+  const problem = RemoteRules.laptopFolderProblem;
+  assert.equal(problem('C:\\work\\project', 'win32'), null);
+  assert.equal(problem('/Users/me/project', 'darwin'), null);
+  assert.equal(problem('/home/me/project', 'linux'), null);
+  assert.equal(problem('', 'win32'), null, 'clearing it');
+  assert.equal(problem('', undefined), null, 'clearing needs nothing known');
+  assert.match(problem('/Users/me/project', 'win32'), /Windows/);
+  assert.match(problem('C:\\work', 'darwin'), /isn't a path/);
+  assert.match(problem('/x', undefined), /doesn't know/);
+  assert.match(problem('/x', 'plan9'), /doesn't know/);
+  assert.match(problem('/a/\nb', 'linux'), /control character/);
+  assert.match(problem('relative', 'linux'), /isn't a path/);
+});

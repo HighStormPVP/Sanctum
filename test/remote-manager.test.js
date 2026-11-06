@@ -4652,3 +4652,10 @@ test('refreshStatus tells listeners again, without using up what status() report
   laptop.manager.refreshStatus();
   assert.equal(laptop.statuses.length, before + 1);
 });
+
+test("status says this device's own id, the one the other end knows it by", async (t) => {
+  const { home, laptop } = await connected(t);
+  assert.equal(laptop.manager.status().deviceId, laptop.id);
+  assert.equal(home.manager.status().deviceId, home.id);
+  assert.ok(home.entry(laptop.id), 'and it is the id home lists that laptop under');
+});

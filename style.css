@@ -3939,3 +3939,9 @@ textarea:focus-visible, input:focus-visible { outline: none; }
 
 /* Where a code block ran, in the output panel's footer. */
 .output-foot-machine { flex-shrink: 0; color: var(--text-2); }
+/* This laptop's own folder, under the home list: the same quiet label and path, one plain action. */
+.fb-laptop { margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--border-1); }
+.fb-laptop-row { display: flex; align-items: center; gap: 8px; margin: 6px 0 4px; }
+.fb-laptop-path { flex: 1; min-width: 0; margin: 0; font-family: var(--font-mono); font-size: 12.5px; line-height: 1.5; color: var(--text-1); overflow-wrap: anywhere; }
+.fb-laptop-path.dim { color: var(--text-3); font-family: inherit; }
+.fb-laptop .setting-help { font-size: 12.5px; }

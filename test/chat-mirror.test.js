@@ -508,3 +508,34 @@ test('cleanHome takes nothing else, in any shape', () => {
   assert.equal({}.polluted, undefined);
   assert.ok(!JSON.stringify(home).includes('secret'));
 });
+
+// ---- Task 14, part 2: each device's folder, so a laptop can read its own ----
+
+test("each device's folder is mirrored, and a hostile home can't put anything else there", () => {
+  const chat = baseChat();
+  chat.projectFolders = { abcdefghijklmnop: 'C:\\work\\laptop', qrstuvwxyz234567: '/Users/me/other', bad: '/x', ABCDEFGHIJKLMNOP: '/caps', empty234567abcde: '', tooLongxxxxxxxxxx: '/x' };
+  const snap = snapshotChat(chat);
+  assert.deepEqual(snap.projectFolders, { abcdefghijklmnop: 'C:\\work\\laptop', qrstuvwxyz234567: '/Users/me/other' }, 'only real device ids, and only text');
+
+  const copy = { messages: [] };
+  applyOps(copy, diffChat(null, snap));
+  assert.deepEqual(copy.projectFolders, snap.projectFolders);
+
+  // A change goes as a meta op, and a hostile one is cleaned the same way.
+  const changed = { ...chat, projectFolders: { abcdefghijklmnop: '/new' } };
+  applyOps(copy, diffChat(snap, snapshotChat(changed)));
+  assert.deepEqual(copy.projectFolders, { abcdefghijklmnop: '/new' });
+  applyOps(copy, [{ type: 'meta', set: { projectFolders: { abcdefghijklmnop: 5, ['__proto__']: '/x', zzzzzzzzzzzzzzzz: '/ok' } } }]);
+  assert.deepEqual(copy.projectFolders, { zzzzzzzzzzzzzzzz: '/ok' });
+  assert.equal(Object.getPrototypeOf(copy.projectFolders), Object.prototype);
+  applyOps(copy, [{ type: 'meta', set: { projectFolders: 'nope' } }]);
+  assert.equal(copy.projectFolders, undefined, 'not a map, so no folders');
+  applyOps(copy, [{ type: 'meta', set: { projectFolders: { zzzzzzzzzzzzzzzz: '/ok' } } }, { type: 'meta', unset: ['projectFolders'] }]);
+  assert.equal(copy.projectFolders, undefined);
+
+  // No folders, no field.
+  assert.equal('projectFolders' in snapshotChat({ ...chat, projectFolders: {} }), false);
+  const many = {};
+  for (let i = 0; i < 100; i++) many[String(i).padStart(16, 'a').replace(/[0189]/g, 'b')] = '/x';
+  assert.ok(Object.keys(snapshotChat({ ...chat, projectFolders: many }).projectFolders || {}).length <= 64);
+});
