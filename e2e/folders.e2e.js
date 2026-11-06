@@ -288,8 +288,8 @@ test('keeping the home PC available', async (t) => {
     assert.equal(await beside.page.evaluate(() => typeof state), 'object', 'one with its own profile runs alongside');
   });
 
-  await t.test("if the system won't give a tray icon, closing quits as if nothing were shared, and says why once", async () => {
-    const home = await launch('notray', ollama, { flags: `${FLAGS},tray-fails` });
+  for (const [flag, what] of [['tray-fails', 'no tray'], ['tray-icon-rejects', 'no icon'], ['tray-icon-empty', 'an empty icon']]) await t.test(`if the system gives ${what}, closing quits as if nothing were shared, and says why once`, async () => {
+    const home = await launch('notray', ollama, { flags: `${FLAGS},${flag}` });
     made.push(home);
     let said = '';
     home.app.process().stderr.on('data', (chunk) => { said += chunk; });
@@ -603,7 +603,7 @@ test('from a laptop', async (t) => {
     assert.equal((await laptop.remote('unlock', PIN)).ok, true);
   });
 
-  await t.test('whatever a home sends for a listing is checked: markup is text, odd names are shown or left out, other shapes are refused', async () => {
+  await t.test('whatever a home sends for a listing is checked: markup is text, odd names are shown or left out, other shapes are refused', async (s) => {
     const id = await newChat(home, { ...project, projectFolder: tree, pathAllowlist: [tree] });
     await watch(trio, id);
     await laptop.page.evaluate(() => {
@@ -611,6 +611,11 @@ test('from a laptop', async (t) => {
       window.__forged = null;
       actionToHome = (deviceId, chatId, kind, args, options) => (kind === 'list-dir' && window.__forged ? Promise.resolve(window.__forged) : window.__realActionToHome(deviceId, chatId, kind, args, options));
     });
+    // However this test ends, the real one is back for the tests after it.
+    s.after(() => laptop.page.evaluate(() => {
+      window.__forged = null;
+      if (window.__realActionToHome) actionToHome = window.__realActionToHome;
+    }).catch(() => {}));
     const forge = (answer) => laptop.page.evaluate((a) => { window.__forged = a; }, answer);
 
     await forge({ ok: true, path: tree, entries: ['<img src=x onerror="window.__pwned=1">', 'line\nbreak', 'zero​width', 5, { name: 'x' }, '..', 'a/b', 'a\\b'], more: 0 });
@@ -641,11 +646,7 @@ test('from a laptop', async (t) => {
     await goTo(tree);
     assert.equal(await textOf(laptop, '#fb-error'), '<b>no</b>\\u202Etxt');
     assert.equal(await laptop.page.evaluate(() => document.querySelectorAll('#folder-browser-overlay b').length), 0);
-    await laptop.page.evaluate(() => {
-      closeFolderBrowser();
-      window.__forged = null;
-      actionToHome = window.__realActionToHome;
-    });
+    await laptop.page.evaluate(() => closeFolderBrowser());
   });
 
   await t.test("while home's kind of machine isn't known, Up, choosing and going in do nothing, and it says so", async () => {
@@ -813,26 +814,44 @@ test('from a laptop', async (t) => {
     const UNAVAILABLE = `This chat's folder is on laptop, which isn't available right now. Wait for it to connect and allow control, or give device: "home" with a full path.`;
     const id = await newChat(home, { ...project, planMode: false, noApproval: true, projectFolders: { [trio.laptopId]: laptopDir }, pathAllowlists: { [trio.laptopId]: [laptopDir] } });
     // The model calls one tool, and what it gets back is read from its next request.
-    const callOnce = async (args) => {
-      await home.page.evaluate((chatId) => { submitToChat(state.chats[chatId], 'Go', []).catch(() => {}); }, id);
+    // The device argument each machine-touching tool is offered in the request, or null if none is.
+    const offeredDevices = (body) => {
+      const out = {};
+      for (const name of ['run_command', 'read_file', 'write_file', 'list_dir', 'apply_patch', 'glob', 'grep', 'task_list']) {
+        const tool = body.tools.find((t) => t.function.name === name);
+        if (tool) out[name] = tool.function.parameters.properties.device?.enum ?? null;
+      }
+      return out;
+    };
+    let lastOffered = null;
+    const callOnce = async (args, chatId = id) => {
+      await home.page.evaluate((cid) => { submitToChat(state.chats[cid], 'Go', []).catch(() => {}); }, chatId);
       const first = await ollama.next();
+      lastOffered = offeredDevices(first.body);
+      // Like a model that keeps to its schema: it only names a device the request offers.
+      if (args.device !== undefined) assert.ok(lastOffered.run_command?.includes(args.device), `device "${args.device}" isn't in the schema: ${JSON.stringify(lastOffered.run_command)}`);
       first.call('run_command', args);
       first.finish();
       const second = await ollama.next();
       const tool = second.body.messages.filter((m) => m.role === 'tool').at(-1);
       second.say('Done.');
       second.finish();
-      await waitFor('the reply to finish', () => home.page.evaluate((chatId) => !state.runningChats.has(chatId), id), 10000);
+      await waitFor('the reply to finish', () => home.page.evaluate((cid) => !state.runningChats.has(cid), chatId), 10000);
       return JSON.parse(tool.content);
+    };
+    const offeredOnly = (want) => {
+      for (const [name, values] of Object.entries(lastOffered)) assert.deepEqual(values, want, name);
     };
     const prompts = () => home.page.evaluate((chatId) => ({ folder: projectFolderPrompt(state.chats[chatId]), devices: devicesPrompt(state.chats[chatId]) }), id);
     const hears = (want) => waitFor(`home to hear the switch is ${want}`, () => home.page.evaluate(([d, v]) => (remoteTools.control.get(d)?.allowed === true) === v, [trio.laptopId, want]), 10000);
     const switchedOff = async () => {
       const said = await callOnce({ command: `echo x > ${into('no-device.txt')}` });
       assert.equal(said.error, UNAVAILABLE);
+      offeredOnly(['home']);
       assert.equal(fs.existsSync(marker('no-device.txt')), false, 'nothing ran');
       const { folder, devices } = await prompts();
-      assert.match(folder, /on the device "laptop", which isn't available right now/);
+      assert.match(folder, /folder is on laptop, which isn't available right now/);
+      assert.ok(!folder.includes('"laptop"'), 'the laptop is never offered as a value while it is away');
       assert.ok(!/the project folder/i.test(folder), folder);
       assert.ok(!folder.includes(laptopDir), 'and no path that could be taken for a place to work');
       assert.equal(devices, null);
@@ -855,6 +874,7 @@ test('from a laptop', async (t) => {
     await hears(true);
     const onLaptop = await callOnce({ command: `pwd > ${into('where.txt')}` });
     assert.equal(onLaptop.error, undefined, JSON.stringify(onLaptop));
+    offeredOnly(['home', 'laptop']);
     assert.match(fs.readFileSync(marker('where.txt'), 'utf8'), /laptop-folder/, "it ran in the laptop's folder");
     const on = await prompts();
     assert.ok(on.folder.includes(`PROJECT FOLDER: ${JSON.stringify(laptopDir)} (on the device "laptop")`), on.folder);
@@ -870,6 +890,12 @@ test('from a laptop', async (t) => {
     assert.deepEqual(await laptop.remote('setControlAllowed', false), { ok: true });
     await hears(false);
     await switchedOff();
+
+    // No folders, and no laptop available: no device argument at all, as before Remote Control.
+    const noFolders = await newChat(home, { ...project, planMode: false, noApproval: true });
+    const plainRun = await callOnce({ command: `echo x > ${into('no-folders.txt')}`, cwd: dir }, noFolders);
+    assert.equal(plainRun.error, undefined, JSON.stringify(plainRun));
+    offeredOnly(null);
 
     // A chat with no folders anywhere is as it always was: a blank cwd is home's own default.
     const plain = await home.page.evaluate(() => {
@@ -1091,6 +1117,64 @@ test('from a laptop', async (t) => {
     await outputDone(laptop);
     assert.equal(runs().length, count + 1);
     await closeOutput(laptop);
+  });
+
+  await t.test('an HTML preview from a home chat goes with a lock or its chat, and Reload draws nothing while locked', async () => {
+    const page = '<!DOCTYPE html><p>from home</p>';
+    const id = await shareOne(home);
+    await home.page.evaluate(([chatId, body]) => {
+      state.chats[chatId].messages.push({ role: 'user', content: 'A page' }, { role: 'assistant', content: '```html\n' + body + '\n```' });
+      saveToStorage();
+    }, [id, page]);
+    await watch(trio, id);
+    await waitFor('the preview button', () => laptop.page.evaluate(() => Boolean(document.querySelector('#thread button[data-cb-action="output"]'))), 5000);
+    await laptop.page.evaluate(() => {
+      window.__previews = 0;
+      const real = showPreview;
+      showPreview = (...args) => { window.__previews += 1; return real(...args); };
+    });
+    const openPreview = async () => {
+      await clickRun(laptop);
+      await waitFor('the preview', () => laptop.page.evaluate(() => Boolean(document.querySelector('.output-modal-preview'))), 5000);
+      await laptop.page.evaluate(() => { window.__panel = document.querySelector('.output-modal-preview').closest('.output-overlay'); });
+    };
+
+    await openPreview();
+    assert.equal(await laptop.page.evaluate(() => window.__previews), 1);
+    await laptop.remote('lock');
+    await panelGone();
+    assert.equal(await laptop.page.evaluate(() => window.__panel.querySelector('.output-iframe').getAttribute('src')), 'about:blank', "and the home's page with it");
+    await laptop.page.evaluate(() => document.querySelector('#remote-pin-later').click());
+    await laptop.page.evaluate(() => window.__panel.querySelector('[data-out-action="reload"]').click());
+    await sleep(500);
+    assert.equal(await laptop.page.evaluate(() => window.__previews), 1, 'Reload drew nothing');
+    assert.equal((await laptop.remote('unlock', PIN)).ok, true);
+
+    await watch(trio, id);
+    await openPreview();
+    await setShared(home, id, false);
+    await panelGone();
+    await laptop.page.evaluate(() => window.__panel.querySelector('[data-out-action="reload"]').click());
+    await sleep(500);
+    assert.equal(await laptop.page.evaluate(() => window.__previews), 2, 'and nothing once its chat has gone');
+  });
+
+  await t.test("removing a laptop drops its folders from every chat, so calls route as if they'd never been there", async () => {
+    const other = await launch('laptop-b', ollama);
+    t.after(() => other.stop());
+    await pair(home, other, relay.address);
+    const otherId = await waitFor('the second laptop at home', async () => (await home.remote('status')).devices.find((d) => d.name === 'laptop-b')?.id, 15000);
+    const id = await newChat(home, { ...project, projectFolders: { [otherId]: laptopDir }, pathAllowlists: { [otherId]: [laptopDir] } });
+    const before = await home.page.evaluate((chatId) => toolTarget('run_command', { command: 'x' }, state.chats[chatId]).error, id);
+    assert.match(String(before), /isn't available right now/, 'while it is paired and away, its folder is the reason');
+
+    assert.deepEqual(await home.remote('removeDevice', otherId), { ok: true });
+    await waitFor('its folder to go', () => home.page.evaluate(([chatId, dev]) => !Object.hasOwn(state.chats[chatId].projectFolders || {}, dev), [id, otherId]), 10000);
+    assert.equal(await home.page.evaluate(([chatId, dev]) => Object.hasOwn(state.chats[chatId].pathAllowlists || {}, dev), [id, otherId]), false);
+    const after = await home.page.evaluate((chatId) => { const t = toolTarget('run_command', { command: 'x' }, state.chats[chatId]); return { device: t.device?.id ?? null, error: t.error ?? null }; }, id);
+    assert.deepEqual(after, { device: 'home', error: null }, 'no "no longer paired" error: home, as if it had never had a folder there');
+    // The laptop that stays paired keeps its folders.
+    assert.ok(await home.page.evaluate((dev) => Object.values(state.chats).some((c) => c.projectFolders && Object.hasOwn(c.projectFolders, dev)), trio.laptopId));
   });
 
   await t.test("a home pop-up that arrived while hidden guards again once the window is shown", async () => {

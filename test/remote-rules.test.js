@@ -562,13 +562,18 @@ test('local-only tools get no device argument', () => {
   }
 });
 
-test('tools that touch a machine get a device argument naming each device, without changing the original', () => {
+test('tools that touch a machine get a device argument, "home" first and then each laptop, without changing the original', () => {
   for (const name of ['read_file', 'list_dir', 'write_file', 'apply_patch', 'glob', 'grep', 'run_command', 'run_command_async', 'task_status', 'task_list', 'task_kill']) {
     const def = toolDef(name);
     const before = JSON.stringify(def);
-    const added = addDeviceArgument(def, ['Desk', 'MacBook']);
+    const added = addDeviceArgument(def, ['MacBook']);
     assert.equal(JSON.stringify(def), before, 'the shared definition is left alone');
-    assert.deepEqual(added.function.parameters.properties.device.enum, ['Desk', 'MacBook'], name);
+    assert.deepEqual(added.function.parameters.properties.device.enum, ['home', 'MacBook'], name);
+    assert.match(added.function.parameters.properties.device.description, /'home' is the home PC/);
+    assert.deepEqual(addDeviceArgument(def, []).function.parameters.properties.device.enum, ['home'], 'home alone, when only home can be named');
+    assert.deepEqual(addDeviceArgument(def, ['home', 'MacBook']).function.parameters.properties.device.enum, ['home', 'MacBook'], 'never twice');
+    // It has to suit every provider, Gemini included: what the laptop-tool cleaner would make of it is itself.
+    assert.deepEqual(RemoteRules.cleanSchema(added.function.parameters, 0), added.function.parameters, name);
     assert.equal(added.function.parameters.properties.device.type, 'string');
     assert.ok(!added.function.parameters.required.includes('device'), 'it has a default');
     assert.deepEqual(added.function.parameters.properties.path, { type: 'string' }, name);
@@ -1744,8 +1749,31 @@ test("with no folder on the machine it runs on, a command needs a full cwd and a
 
 test("the prompt for a folder on a machine that isn't available says so, and calls nothing the project folder", () => {
   const text = RemoteRules.unavailableFolderPrompt('laptop');
-  assert.match(text, /on the device "laptop"/);
+  assert.match(text, /folder is on laptop, which/);
+  assert.ok(!text.includes('"laptop"'), "a name the schema doesn't offer isn't given as one to use");
   assert.match(text, /isn't available right now/);
   assert.match(text, /device: "home"/);
   assert.ok(!/the project folder/i.test(text));
+});
+
+test('a device argument exists whenever a laptop can be named or the chat has a folder away from home', () => {
+  const home = { id: HOME_DEVICE, name: 'Desk' };
+  const air = { id: 'bbbb2222', name: 'Air' };
+  const names = RemoteRules.deviceArgumentNames;
+  assert.equal(names([home], {}), null, 'no folders and no laptops: none, as before');
+  assert.equal(names([home], { projectFolder: 'C:\\w' }), null);
+  assert.deepEqual(names([home], { projectFolders: { bbbb2222: '/work' } }), [], 'a folder on a laptop that is away: "home" can be named');
+  assert.deepEqual(names([home, air], {}), ['Air']);
+  assert.deepEqual(names([home, air], { projectFolders: { bbbb2222: '/work' } }), ['Air']);
+  assert.equal(names([home], { projectFolders: { bbbb2222: '' } }), null);
+});
+
+test('the devices prompt says what leaving device out does, default or not', () => {
+  const lines = ['- "home": the home PC (Desk), where you are running: Windows, shell Bash, the default', '- "Air": macOS, shell Bash'];
+  const withDefault = RemoteRules.devicesPromptText(lines, true);
+  assert.match(withDefault, /Leave it out to use the default\./);
+  const without = RemoteRules.devicesPromptText(lines, false);
+  assert.ok(!/Leave it out/.test(without), without);
+  assert.match(without, /no default, so name the device in every call/);
+  for (const text of [withDefault, without]) assert.ok(text.startsWith('DEVICES:') && text.includes(lines[1]));
 });

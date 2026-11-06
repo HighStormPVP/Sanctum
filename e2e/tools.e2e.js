@@ -177,7 +177,8 @@ test('tools on a laptop', async (t) => {
   const endsSoon = (pid, what) => waitFor(what, () => !isAlive(pid), 10000);
 
   await t.test('before the switch is on, only the home PC is a device, and a chat is as it always was', async () => {
-    const id = await agent();
+    // No folder away from home, so nothing about it has changed since before Remote Control.
+    const id = await agent({ projectFolders: {}, pathAllowlists: {} });
     await go(id);
     const first = await ollama.next();
     const run = first.body.tools.find((tool) => tool.function.name === 'run_command');
@@ -228,11 +229,11 @@ test('tools on a laptop', async (t) => {
     const first = await ollama.next();
     const offered = new Map(first.body.tools.map((tool) => [tool.function.name, tool.function]));
     for (const name of ['read_file', 'list_dir', 'write_file', 'glob', 'grep', 'run_command', 'run_command_async', 'task_status', 'task_list', 'task_kill']) {
-      assert.deepEqual(offered.get(name).parameters.properties.device.enum, [homeName, LAPTOP], name);
+      assert.deepEqual(offered.get(name).parameters.properties.device.enum, ['home', LAPTOP], name);
     }
     for (const name of ['calc', 'mcp_list_servers', 'mcp_add_server']) assert.equal(offered.get(name).parameters.properties.device, undefined, name);
     const prompt = first.body.messages.find((m) => m.role === 'system' && m.content.includes('DEVICES')).content;
-    assert.ok(prompt.includes(`"${homeName}"`));
+    assert.ok(prompt.includes(`- "home": the home PC (${homeName})`), 'home as the schema offers it, and by its name');
     assert.ok(prompt.includes(`"${LAPTOP}"`));
     assert.match(prompt, /Bash|Cmd/);
     assert.ok(prompt.includes(JSON.stringify(laptopDir)), 'each device\'s folder is listed, as a quoted path');
@@ -372,7 +373,8 @@ test('tools on a laptop', async (t) => {
       await go(id);
       const next = await ollama.next();
       assert.ok(!next.body.tools.some((tool) => tool.function.name.includes('laptop')));
-      assert.equal(next.body.tools.find((tool) => tool.function.name === 'run_command').function.parameters.properties.device, undefined);
+      // The chat's folder is on the laptop, so "home" can still be named, and only "home".
+      assert.deepEqual(next.body.tools.find((tool) => tool.function.name === 'run_command').function.parameters.properties.device.enum, ['home']);
       next.say('Fine.');
       next.finish();
       await stopped(id);
@@ -685,7 +687,7 @@ test('tools on a laptop', async (t) => {
       // rather than work in home's default place, and the prompt says the folder's machine isn't available.
       const onLaptop = await agent({ projectFolder: undefined, pathAllowlist: [] });
       const prompt = await home.page.evaluate((chatId) => projectFolderPrompt(state.chats[chatId]), onLaptop);
-      assert.ok(prompt.includes(`on the device "${LAPTOP}", which isn't available right now`), prompt);
+      assert.ok(prompt.includes(`folder is on ${LAPTOP}, which isn't available right now`), prompt);
       const byFolder = await runOne(onLaptop, 'run_command', { command: `echo here > ${into('by-folder.txt')}` });
       assert.equal(byFolder.error, `This chat's folder is on ${LAPTOP}, which isn't available right now. Wait for it to connect and allow control, or give device: "home" with a full path.`);
       assert.equal(fs.existsSync(path.join(homeDir, 'by-folder.txt')), false, 'and nothing ran anywhere');

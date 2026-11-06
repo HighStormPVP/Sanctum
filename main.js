@@ -725,15 +725,18 @@ function trayWantedNow() {
 // would with nothing shared, and a window already hidden comes back.
 function showTray() {
   if (tray || trayComing || trayFailed) return;
+  // A test's ways to have the system refuse: no icon, an empty one, or no tray.
+  const refuse = (what) => remoteTestFlags.has(what);
   trayComing = Promise.resolve()
-    .then(() => app.getFileIcon(process.execPath, { size: 'small' }))
-    .catch(() => nativeImage.createEmpty())
+    .then(() => (refuse('tray-icon-rejects') ? Promise.reject(new Error('a test asked for no icon')) : app.getFileIcon(process.execPath, { size: 'small' })))
     .then((icon) => {
       trayComing = null;
       if (tray || !trayWantedNow()) return;
-      // A test's way to have the system refuse the icon.
-      if (remoteTestFlags.has('tray-fails')) throw new Error('a test asked for no tray icon');
-      const made = new Tray(icon);
+      // An empty image makes a tray icon nobody can see, which is no way back to the window.
+      const image = refuse('tray-icon-empty') ? nativeImage.createEmpty() : icon;
+      if (!image || image.isEmpty()) throw new Error('the system gave no icon for Sanctum');
+      if (refuse('tray-fails')) throw new Error('a test asked for no tray icon');
+      const made = new Tray(image);
       made.setToolTip('Sanctum');
       trayMenu = Menu.buildFromTemplate([
         { label: 'Open Sanctum', click: showMainWindow },

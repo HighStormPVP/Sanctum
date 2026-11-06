@@ -5775,7 +5775,8 @@ function projectFolderPrompt(c) {
   const elsewhere = folderDevice !== RemoteRules.HOME_DEVICE;
   const folder = elsewhere ? folderOn(c, folderDevice) : c.projectFolder;
   const onDevice = devices.length > 1 ? devices.find((d) => d.id === folderDevice) : null;
-  return RemoteRules.projectFolderPrompt({ folder, deviceName: onDevice?.name, shell: elsewhere ? onDevice?.shell : shellNameHere() });
+  const deviceName = onDevice && (onDevice.id === RemoteRules.HOME_DEVICE ? 'home' : onDevice.name);
+  return RemoteRules.projectFolderPrompt({ folder, deviceName, shell: elsewhere ? onDevice?.shell : shellNameHere() });
 }
 
 const PLAN_MODE_PROMPT = `PLAN MODE IS ACTIVE.
@@ -5834,7 +5835,7 @@ function buildTools(modality, webEnabled, modelId, chat) {
       tools.push(...state.mcpTools);
     }
   }
-  return tools.length ? addDeviceTools(tools, modality, readOnly) : null;
+  return tools.length ? addDeviceTools(tools, modality, readOnly, chat) : null;
 }
 
 // Safe coercion for tool-call argument extraction. Models sometimes return
@@ -6501,6 +6502,7 @@ const remoteUi = {
   folders: null,             // the home folder browser, while it's open
   runConfirmKey: null,       // the chat the Run confirmation is for
   outputs: new Map(),        // an output panel from a home chat -> { key, close }
+  wholeDevices: null,        // every paired device, from the last status that listed them all
   runConfirm: null           // takes down the Run confirmation, while it's up
 };
 
@@ -7313,12 +7315,14 @@ function auditedDeviceName(name, args, c) {
 
 // ---- What the model is told ----
 
-function addDeviceTools(tools, modality, readOnly) {
+// A device argument whenever there's a laptop to name, or the chat's folder is on one: then "home" is
+// always there to name too, which is what the error for a laptop that's away tells the model to do.
+function addDeviceTools(tools, modality, readOnly, chat) {
   const devices = toolDevices();
-  if (devices.length < 2) return tools;
-  const names = devices.map((d) => d.name);
+  const names = RemoteRules.deviceArgumentNames(devices, chat);
+  if (!names) return tools;
   const out = tools.map((tool) => RemoteRules.addDeviceArgument(tool, names));
-  if (modality === 'agent' && !readOnly) {
+  if (devices.length > 1 && modality === 'agent' && !readOnly) {
     const taken = new Set(out.map((tool) => tool.function.name));
     for (const name of taken) remoteTools.mcpSeen.delete(name);
     for (const entry of RemoteRules.laptopToolDefs({ devices, paired: pairedToolDevices(), control: remoteTools.control, taken })) {
@@ -7333,20 +7337,18 @@ function devicesPrompt(c) {
   if ((c.modality !== 'agent' && c.modality !== 'code') || !modelSupportsTools(c.model)) return null;
   const devices = toolDevices();
   if (devices.length < 2) return null;
-  const fallback = RemoteRules.resolveDevice(undefined, c, devices).deviceId;
+  const picked = RemoteRules.resolveDevice(undefined, c, devices);
+  const fallback = picked.error ? null : picked.deviceId;
   const lines = devices.map((d) => {
     const isHome = d.id === RemoteRules.HOME_DEVICE;
     const folder = folderOn(c, d.id);
     const facts = [DEVICE_OS_LABELS.get(d.os) || 'unknown system', `shell ${d.shell}`];
     if (folder) facts.push(`${d.id === fallback ? 'the project folder' : 'a folder'} at the path ${RemoteRules.promptPath(folder)}`);
     if (d.id === fallback) facts.push('the default');
-    return `- "${d.name}"${isHome ? ' (the home PC, where you are running)' : ''}: ${facts.join(', ')}`;
+    // Home is named as the schema offers it, "home". Its own name is only said.
+    return isHome ? `- "home": the home PC (${d.name}), where you are running: ${facts.join(', ')}` : `- "${d.name}": ${facts.join(', ')}`;
   });
-  return `DEVICES: you can work on more than one machine.
-
-${lines.join('\n')}
-
-File, command, and task tools take a \`device\` argument naming one of these. Leave it out to use the default. Systems and shells can differ, so write commands and paths for the device they run on. Web tools always run on the home PC. A call never moves to another device by itself. If a device can't be reached you get an error. A call that fails partway may have partly run, so check before repeating it.`;
+  return RemoteRules.devicesPromptText(lines, !!fallback);
 }
 
 // ---- Calling a laptop ----
@@ -8565,6 +8567,8 @@ function takeDownRemoteRuns(which = () => true) {
   for (const [overlay, panel] of [...remoteUi.outputs]) {
     if (!which(panel.key)) continue;
     overlay.querySelector('[data-terminal]')?.replaceChildren();
+    const iframe = overlay.querySelector('.output-iframe');
+    if (iframe) iframe.src = 'about:blank';
     panel.close();
   }
 }
@@ -9356,6 +9360,7 @@ function mirrorOnStatus(status) {
   for (const id of mirror.laptops.keys()) {
     if (!devices.some(d => d.id === id && d.role === 'laptop' && d.connected)) dropLaptop(id);
   }
+  dropRemovedDevicesFolders(status);
   // A device that has been removed isn't coming back for them.
   for (const id of mirror.undelivered.keys()) {
     if (!devices.some(d => d.id === id)) mirror.undelivered.delete(id);
@@ -9365,6 +9370,38 @@ function mirrorOnStatus(status) {
   paintRemoteComposer();
   paintRemoteUi();
   syncOpenAsks();
+}
+
+// A device that has gone from the list for good keeps no folder in any chat, so a removed laptop's old
+// folder doesn't turn every call into a "no longer paired" error. Only a list that can be trusted to be
+// whole counts: Remote Control on, unlocked, with its storage, and the same for the list before it. A
+// locked or switched-off status lists nobody, and that isn't everybody being removed.
+function dropRemovedDevicesFolders(status) {
+  const whole = status?.enabled === true && status.locked !== true && status.storageAvailable !== false && Array.isArray(status.devices);
+  const known = whole ? new Set(status.devices.map((d) => d.id)) : null;
+  const before = remoteUi.wholeDevices;
+  remoteUi.wholeDevices = known;
+  if (!known || !before) return;
+  const gone = [...before].filter((id) => !known.has(id));
+  if (!gone.length) return;
+  let changed = false;
+  for (const c of Object.values(state.chats)) {
+    if (c.remote) continue;
+    for (const field of ['projectFolders', 'pathAllowlists']) {
+      if (!c[field] || typeof c[field] !== 'object') continue;
+      for (const id of gone) {
+        if (Object.hasOwn(c[field], id)) {
+          delete c[field][id];
+          changed = true;
+        }
+      }
+    }
+  }
+  if (changed) {
+    saveToStorage();
+    renderChatList();
+    if (currentChat() && !currentChat().remote) renderActiveChat();
+  }
 }
 
 function mirrorOnFrame(deviceId, frame) {
@@ -10407,7 +10444,7 @@ function wireCodeBlockActions() {
       // A preview runs in a sandboxed frame, not on the machine, so only a real run asks first.
       if (c?.remote && !isPreviewLang(run.lang)) confirmLaptopRun(c, run);
       else if (c?.remote && isPreviewLang(run.lang) && remoteChatsHidden()) return;
-      else if (!c?.remote || !remoteChatsHidden()) openOutputModal({ ...run, machine: thisDeviceName() });
+      else if (!c?.remote || !remoteChatsHidden()) openOutputModal({ ...run, machine: thisDeviceName(), chatKey: c?.remote ? c.id : null });
     }
   });
 }
@@ -10645,6 +10682,9 @@ function openOutputModal({ code, lang, filename, cwd, machine = thisDeviceName()
   let runCwd = cwd;
   const langKey = (lang || '').toLowerCase();
   const isHtml = isPreviewLang(langKey);
+  // A preview from a home chat draws that home's page, so it waits for the lock to lift, and for a chat
+  // that's still here. A run checks the same thing as it starts.
+  if (isHtml && chatKey && !remoteRunAllowed(chatKey)) return;
 
   const overlay = document.createElement('div');
   overlay.className = 'modal-overlay output-overlay';
@@ -10716,6 +10756,7 @@ function openOutputModal({ code, lang, filename, cwd, machine = thisDeviceName()
     const action = ev.target.closest('button[data-out-action]')?.dataset.outAction;
     if (action === 'close') close();
     if (action === 'reload' && isHtml) {
+      if (chatKey && !remoteRunAllowed(chatKey)) return;
       const iframe = overlay.querySelector('.output-iframe');
       if (iframe) showPreview(iframe, code);
     }
