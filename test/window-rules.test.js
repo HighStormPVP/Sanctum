@@ -115,3 +115,26 @@ test('every packaged build switches off run-as-node, NODE_OPTIONS and inspect, b
   assert.ok(flip > 0 && flip < source.indexOf("!== 'darwin') return"), 'flipped on every platform, then only a Mac goes on');
   assert.ok(flip < source.indexOf('codesign --force'), 'and flipped before signing');
 });
+
+test('after flipping, afterPack reads the fuses back and stops the build if any of the three is still on', async () => {
+  const { FuseV1Options } = require('@electron/fuses');
+  const { FuseState } = require('@electron/fuses/dist/constants');
+  const { fusesLeftOn } = require(path.join(__dirname, '..', 'build', 'afterPack.js'));
+  const off = { version: '1', [FuseV1Options.RunAsNode]: FuseState.DISABLE, [FuseV1Options.EnableNodeOptionsEnvironmentVariable]: FuseState.DISABLE, [FuseV1Options.EnableNodeCliInspectArguments]: FuseState.DISABLE, [FuseV1Options.GrantFileProtocolExtraPrivileges]: FuseState.ENABLE };
+  assert.deepEqual(fusesLeftOn(off), []);
+  assert.deepEqual(fusesLeftOn({ ...off, [FuseV1Options.RunAsNode]: FuseState.ENABLE }), ['RunAsNode']);
+  // Anything but off is on: a fuse the binary doesn't have, or one left to Electron's default.
+  assert.deepEqual(fusesLeftOn({ ...off, [FuseV1Options.EnableNodeOptionsEnvironmentVariable]: FuseState.INHERIT }), ['EnableNodeOptionsEnvironmentVariable']);
+  assert.deepEqual(fusesLeftOn({ ...off, [FuseV1Options.EnableNodeCliInspectArguments]: FuseState.REMOVED }), ['EnableNodeCliInspectArguments']);
+  const { [FuseV1Options.RunAsNode]: _gone, ...missing } = off;
+  assert.deepEqual(fusesLeftOn(missing), ['RunAsNode']);
+  assert.deepEqual(fusesLeftOn(null), ['RunAsNode', 'EnableNodeOptionsEnvironmentVariable', 'EnableNodeCliInspectArguments']);
+
+  const source = fs.readFileSync(path.join(__dirname, '..', 'build', 'afterPack.js'), 'utf8');
+  const flip = source.indexOf('await flipFuses(');
+  const read = source.indexOf('await getCurrentFuseWire(');
+  assert.ok(read > flip && flip > 0, 'read back after flipping');
+  assert.ok(read < source.indexOf('codesign --force'), 'and before signing');
+  const lineStart = source.lastIndexOf('\n', read);
+  assert.match(source.slice(lineStart, read + 300), /fusesLeftOn\(await getCurrentFuseWire\(binary\)\);\s*if \(stillOn\.length\) throw new Error/, 'a fuse left on stops the build');
+});

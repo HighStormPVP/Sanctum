@@ -1064,8 +1064,8 @@ test('a paired home can send anything: only the expected rendering comes of it',
 // ---- What the relay sees ----
 
 // Stands between the devices and the relay, and keeps a copy of every message the Worker is sent
-// and every message it sends, pairing included. The path holds the secret, so only what follows
-// it is kept.
+// and every message it sends, pairing included, and of each upgrade request: its path and all its
+// headers. The path holds the secret, so only what follows it is kept.
 async function startRecordingProxy(relayAddress) {
   const WebSocket = require('ws');
   const target = new URL(relayAddress);
@@ -1074,7 +1074,9 @@ async function startRecordingProxy(relayAddress) {
   const frames = [];
   const sockets = new Set();
   server.on('connection', (down, req) => {
-    const route = req.url.split('/').slice(2).join('/');
+    const afterSecret = req.url.split('/').slice(2).join('/');
+    const route = afterSecret.split('?')[0];
+    frames.push({ route, from: 'device', upgrade: true, bytes: Buffer.from(JSON.stringify({ method: req.method, path: afterSecret, headers: req.rawHeaders })) });
     const up = new WebSocket(`${target.protocol}//${target.host}${req.url}`, { perMessageDeflate: false });
     const waiting = [];
     sockets.add(up);
@@ -1150,7 +1152,7 @@ function readableIn(frames, needles) {
       for (const { needle, forms: list } of forms) {
         if (hits.has(needle)) continue;
         const form = list.find((f) => view.includes(f));
-        if (form) hits.set(needle, { form, route: frame.route, from: frame.from });
+        if (form) hits.set(needle, { form, route: frame.route, from: frame.from, upgrade: frame.upgrade === true });
       }
     }
   }
@@ -1159,6 +1161,8 @@ function readableIn(frames, needles) {
 
 const TRAFFIC_MARKER = 'TRAFFIC-MARKER-5d0c2f9e';
 const TRAFFIC_TITLE = 'TRAFFIC-TITLE-b7e4a1c2';
+// Twelve digits, so finding it in random base64 by chance is out of the question.
+const TRAFFIC_PIN = '904172358613';
 
 test('the relay sees no chat, code, command, folder, or title, in any form', async (t) => {
   const relay = await startRelay();
@@ -1202,7 +1206,7 @@ test('the relay sees no chat, code, command, folder, or title, in any form', asy
     }
   }
 
-  const { code } = await pairDevices(home, laptop, proxy.address);
+  const { code } = await pairDevices(home, laptop, proxy.address, { pin: TRAFFIC_PIN });
   await waitFor('the session on both ends', async () => (await home.entry())?.connected && (await laptop.entry())?.connected);
   const homeId = (await laptop.entry()).id;
   const laptopId = (await home.entry()).id;
@@ -1272,6 +1276,11 @@ test('the relay sees no chat, code, command, folder, or title, in any form', asy
   t.diagnostic(`the relay saw ${frames.length} messages, ${bytes} bytes, on ${[...routes].map((r) => r.replace(/[a-z2-7]{16}$/, '<id>')).sort().join(', ')}`);
   for (const route of ['pair/host', 'pair/guest', `device/${homeId}`, `device/${laptopId}`]) assert.ok(routes.has(route), `the recording has ${route}`);
   assert.ok(bytes > 10000, `the recording has ${bytes} bytes`);
+  const upgrades = frames.filter((f) => f.upgrade);
+  for (const route of ['pair/host', 'pair/guest', `device/${homeId}`, `device/${laptopId}`]) {
+    assert.ok(upgrades.some((f) => f.route === route), `the upgrade request for ${route} is recorded`);
+  }
+  assert.ok(upgrades.every((f) => /sec-websocket-key/i.test(f.bytes.toString())), 'with its headers');
   const routing = readableIn(frames, [homeId, laptopId]);
   assert.ok(routing.has(homeId) && routing.has(laptopId), 'the search finds the device ids the relay routes by');
 
@@ -1279,7 +1288,7 @@ test('the relay sees no chat, code, command, folder, or title, in any form', asy
     marker: TRAFFIC_MARKER,
     'pairing code': code,
     'pairing code in lower case': code.toLowerCase(),
-    PIN,
+    PIN: TRAFFIC_PIN,
     'home folder': homeDir,
     'laptop folder': laptopDir,
     'home folder name': path.basename(homeDir),
@@ -1288,6 +1297,10 @@ test('the relay sees no chat, code, command, folder, or title, in any form', asy
     command: `echo ${TRAFFIC_MARKER}`
   };
   const hits = readableIn(frames, Object.values(secrets));
-  const found = Object.entries(secrets).filter(([, value]) => hits.has(value)).map(([name, value]) => `${name} as ${JSON.stringify(hits.get(value).form)} in a message ${hits.get(value).from === 'relay' ? 'from' : 'to'} the relay on ${hits.get(value).route.replace(/[a-z2-7]{16}$/, '<id>')}`);
+  const found = Object.entries(secrets).filter(([, value]) => hits.has(value)).map(([name, value]) => {
+    const hit = hits.get(value);
+    const where = hit.upgrade ? 'the upgrade request' : `a message ${hit.from === 'relay' ? 'from' : 'to'} the relay`;
+    return `${name} as ${JSON.stringify(hit.form)} in ${where} on ${hit.route.replace(/[a-z2-7]{16}$/, '<id>')}`;
+  });
   assert.deepEqual(found, [], `the relay could read these:\n  ${found.join('\n  ')}`);
 });

@@ -20,3 +20,9 @@ class_name = "PairingSlot"
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["Mailbox", "PairingSlot"]
+
+# Workers Logs stay off, and each deploy sets them off again. The secret is in every request's
+# URL path, so a log of requests would be a log of the secret. test/no-relay-address.test.js
+# checks this. Don't add Logpush or a tail Worker either.
+[observability]
+enabled = false

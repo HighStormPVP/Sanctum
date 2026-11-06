@@ -17,7 +17,7 @@ It can't see:
 - files or folder paths
 - the pairing code, the PIN, or any API key
 
-Pairing uses a password-authenticated exchange, so the relay can pass the pairing messages but can't learn the code or test guesses at it.
+Pairing uses a password-authenticated exchange, so the relay can pass the pairing messages but can't learn the code from them, or test guesses at it offline. Like anyone else with the secret, it could try guesses one at a time while a code is waiting, and each wrong one counts towards the limit of five, after which the code is cancelled.
 
 It can see:
 
@@ -87,7 +87,7 @@ You need the Cloudflare account on the Workers Paid plan, Node 22 or later, and 
 
 6. Put the address together: `wss://`, the host it printed, `/`, and the secret.
 
-`relay/.wrangler` and `.dev.vars` are ignored by git, so local Wrangler files stay out of the repo.
+`relay/.wrangler`, `.dev.vars` and `.dev.vars.*`, and `.env` are ignored by git, here and in `relay/`, so local Wrangler files stay out of the repo.
 
 ## Giving Sanctum the address
 
@@ -98,6 +98,8 @@ Sanctum has no way to build the address in, so it's pasted on each device.
 ## Logs: leave them off
 
 **Don't turn on Workers Logs, Logpush, or any other request logging for this Worker.** The secret is in the address path, so a log of requests is a log of the secret. `wrangler tail` shows the same request URLs live, so don't run it either. The relay itself never logs.
+
+Workers Logs are off in the config: `relay/wrangler.toml` has `enabled = false` under `[observability]`, and each deploy sends that setting with the Worker. Turning logging on would mean editing that line, and `test/no-relay-address.test.js` fails if it's changed. Whether a deploy also switches off logs that were turned on in the dashboard is one of the live checks.
 
 If logging is ever turned on by mistake, turn it off and rotate the secret.
 

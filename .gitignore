@@ -10,3 +10,7 @@ Thumbs.db
 relay/.wrangler
 .dev.vars
 relay/.dev.vars
+.dev.vars.*
+relay/.dev.vars.*
+.env
+relay/.env
