@@ -644,6 +644,30 @@ test('runShellCommand has a time limit, which ends the process', async () => {
 
 const { McpClient } = lib('mcp-client.js');
 
+test('starting an MCP client through a shell keeps its arguments apart, with no deprecation warning', { skip: process.platform !== 'win32' && 'only Windows starts them through a shell' }, async (t) => {
+  const write = scripts(t);
+  const server = write('stub server.js', `
+    const say = (m) => process.stdout.write(JSON.stringify(m) + '\\n');
+    require('readline').createInterface({ input: process.stdin }).on('line', (line) => {
+      const m = JSON.parse(line);
+      if (m.method === 'initialize') say({ jsonrpc: '2.0', id: m.id, result: { serverInfo: { argv: process.argv.slice(2) } } });
+      else if (m.method === 'tools/list') say({ jsonrpc: '2.0', id: m.id, result: { tools: [] } });
+    });
+  `);
+  const file = server.split('" "')[1].slice(0, -1);
+  const runner = write('runner.js', `
+    const { McpClient } = require(${JSON.stringify(path.join(__dirname, '..', 'lib', 'mcp-client.js'))});
+    const client = new McpClient({ name: 'stub', command: process.execPath, args: [${JSON.stringify(file)}, 'one two', 'three'], env: {} });
+    client.start().then(async () => {
+      console.log(JSON.stringify(client.serverInfo.argv));
+      await client.stop();
+    });
+  `).split('" "')[1].slice(0, -1);
+  const { stdout, stderr } = require('node:child_process').spawnSync(process.execPath, [runner], { encoding: 'utf8', timeout: 15000 });
+  assert.deepEqual(JSON.parse(stdout), ['one two', 'three']);
+  assert.doesNotMatch(stderr, /DEP0190/);
+});
+
 test('stopping an MCP client that ignores its stdin closing has ended it by the time it settles', async (t) => {
   const write = scripts(t);
   const server = write('stub-server.js', `

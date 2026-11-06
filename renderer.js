@@ -5711,10 +5711,10 @@ const TOOL_DEFS = {
   list_dir:   { type: 'function', function: { name: 'list_dir',  description: 'List entries of a directory. Returns up to 200 items each with name/kind/size.', parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] } } },
   write_file: { type: 'function', function: { name: 'write_file', description: 'Overwrite a file with the given content. Creates parent directories. REQUIRES USER APPROVAL — do not call lightly.', parameters: { type: 'object', properties: { path: { type: 'string' }, content: { type: 'string' } }, required: ['path', 'content'] } } },
   apply_patch: { type: 'function', function: { name: 'apply_patch', description: 'Apply a single search-and-replace edit to a file. `find` must match exactly and uniquely (include surrounding context to disambiguate). `replace` can be empty to delete the matched chunk. REQUIRES USER APPROVAL.', parameters: { type: 'object', properties: { path: { type: 'string' }, find: { type: 'string' }, replace: { type: 'string' } }, required: ['path', 'find', 'replace'] } } },
-  run_command: { type: 'function', function: { name: 'run_command', description: 'Run a shell command. Returns {stdout, stderr, exitCode}. REQUIRES USER APPROVAL on every call.', parameters: { type: 'object', properties: { command: { type: 'string' }, cwd: { type: 'string', description: 'Working directory (optional, defaults to home).' } }, required: ['command'] } } },
+  run_command: { type: 'function', function: { name: 'run_command', description: 'Run a shell command. Returns {stdout, stderr, exitCode}. REQUIRES USER APPROVAL on every call.', parameters: { type: 'object', properties: { command: { type: 'string' }, cwd: { type: 'string', description: 'Working directory (optional). Defaults to the project folder. A relative path is taken from the project folder.' } }, required: ['command'] } } },
   glob: { type: 'function', function: { name: 'glob', description: 'Find files matching a glob pattern under the project folder. Supports `*` (any chars except /), `**` (any chars including /), `?` (one char). Returns paths relative to the project root. Skips node_modules, .git, dist, build, etc. by default. Capped at 500 matches.', parameters: { type: 'object', properties: { pattern: { type: 'string', description: 'Glob pattern, e.g. "src/**/*.ts" or "**/*.test.js"' } }, required: ['pattern'] } } },
   grep: { type: 'function', function: { name: 'grep', description: 'Search file CONTENTS using a regex. Walks the project tree, skips binaries and large files, returns {file, line, text} matches. Capped at 100 matches across at most 10000 files.', parameters: { type: 'object', properties: { pattern: { type: 'string', description: 'JavaScript regex pattern (no slashes, no flags — pass case_insensitive separately).' }, glob: { type: 'string', description: 'Optional glob to restrict the search (e.g. "**/*.py").' }, case_insensitive: { type: 'boolean', description: 'Match case-insensitively.' } }, required: ['pattern'] } } },
-  run_command_async: { type: 'function', function: { name: 'run_command_async', description: 'Start a shell command in the BACKGROUND. Returns a task_id immediately so you can continue working while it runs. Use task_status(task_id) to poll progress and stdout/stderr, task_kill(task_id) to stop it. REQUIRES USER APPROVAL on every call.', parameters: { type: 'object', properties: { command: { type: 'string' }, cwd: { type: 'string', description: 'Working directory (optional).' } }, required: ['command'] } } },
+  run_command_async: { type: 'function', function: { name: 'run_command_async', description: 'Start a shell command in the BACKGROUND. Returns a task_id immediately so you can continue working while it runs. Use task_status(task_id) to poll progress and stdout/stderr, task_kill(task_id) to stop it. REQUIRES USER APPROVAL on every call.', parameters: { type: 'object', properties: { command: { type: 'string' }, cwd: { type: 'string', description: 'Working directory (optional). Defaults to the project folder. A relative path is taken from the project folder.' } }, required: ['command'] } } },
   task_status: { type: 'function', function: { name: 'task_status', description: 'Check on a background task started with run_command_async. Returns {status, exitCode, stdout, stderr, runtime_seconds}. Status is "running" | "done" | "killed" | "error".', parameters: { type: 'object', properties: { task_id: { type: 'string' } }, required: ['task_id'] } } },
   task_list: { type: 'function', function: { name: 'task_list', description: 'List all background tasks in this session with their current status.', parameters: { type: 'object', properties: {} } } },
   task_kill: { type: 'function', function: { name: 'task_kill', description: 'Kill a running background task by id. No-op if already done.', parameters: { type: 'object', properties: { task_id: { type: 'string' } }, required: ['task_id'] } } },
@@ -5859,10 +5859,7 @@ function buildTools(modality, webEnabled, modelId, chat) {
 // nested objects, numbers, or null where a string is expected — turn that
 // into something usable instead of letting "[object Object]" leak into the UI.
 function toStringArg(v) {
-  if (v == null) return '';
-  if (typeof v === 'string') return v;
-  if (typeof v === 'number' || typeof v === 'boolean') return String(v);
-  try { return JSON.stringify(v); } catch { return ''; }
+  return RemoteRules.toolArgText(v);
 }
 
 function summarizeArgs(name, args) {
@@ -5912,6 +5909,31 @@ async function executeTool(name, args, c, offeredTools) {
   return res;
 }
 
+// Whether the chat's mode forbids this tool right now, and what to say if so. Before a pop-up, and
+// again after every answer, because a mode can change on another device while one is open.
+//
+// Plan Mode: write-class tools are blocked at the executor until the user approves an exit_plan_mode
+// call. Reads/searches/fetches/inspections pass through unchanged so the model can ground its plan in
+// real evidence. exit_plan_mode itself isn't touched by any of these: it's the formal gate that lets
+// the chat leave Plan Mode.
+async function modeRefusal(name, args, c) {
+  const refuse = async (status, error, summary) => {
+    await window.api.audit.log({ ts: new Date().toISOString(), chat: c.id, model: c.model, tool: name, args, status, ok: false });
+    return { result: { error }, summary, ok: false };
+  };
+  if (c?.planMode && name !== 'exit_plan_mode' && AgentRules.blockedInPlanMode(name)) {
+    return refuse('blocked-planmode', 'Plan Mode is on — write tools are blocked. Call exit_plan_mode(plan) to surface your plan to the user for approval; on approve the chat flips to Approval Mode and you can execute.', 'plan-mode');
+  }
+  // Read-only enforcement (defence in depth — buildTools already strips these).
+  if (c?.readOnly && AgentRules.blockedInReadOnly(name)) {
+    return refuse('blocked-readonly', 'this chat is in Read-Only mode — write/patch/shell are disabled', 'read-only');
+  }
+  if (c?.noFetch && name === 'web_fetch') {
+    return refuse('blocked-nofetch', 'this chat has No-Fetch mode on — web_fetch is disabled (use web_search results instead)', 'no-fetch');
+  }
+  return null;
+}
+
 async function executeToolImpl(name, args, c, offeredTools) {
   if (!AgentRules.wasOffered(name, offeredTools)) {
     await window.api.audit.log({ ts: new Date().toISOString(), chat: c?.id, model: c?.model, tool: name, args, status: 'blocked-not-offered', ok: false });
@@ -5933,17 +5955,8 @@ async function executeToolImpl(name, args, c, offeredTools) {
     approvalDecision = 'pre-approved';
   }
 
-  // Plan Mode: write-class tools are blocked at the executor until the user
-  // approves an exit_plan_mode call. Reads/searches/fetches/inspections pass
-  // through unchanged so the model can ground its plan in real evidence.
-  // exit_plan_mode itself is handled below — it's the formal gate that lets
-  // the chat leave Plan Mode.
-  if (c?.planMode && name !== 'exit_plan_mode') {
-    if (AgentRules.blockedInPlanMode(name)) {
-      await window.api.audit.log({ ts: new Date().toISOString(), chat: c.id, model: c.model, tool: name, args, status: 'blocked-planmode', ok: false });
-      return { result: { error: 'Plan Mode is on — write tools are blocked. Call exit_plan_mode(plan) to surface your plan to the user for approval; on approve the chat flips to Approval Mode and you can execute.' }, summary: 'plan-mode', ok: false };
-    }
-  }
+  const blocked = await modeRefusal(name, args, c);
+  if (blocked) return blocked;
 
   // exit_plan_mode: surface the plan to the user; on approve flip the chat
   // from Plan Mode to Approval Mode and return success; on reject return an
@@ -5957,6 +5970,8 @@ async function executeToolImpl(name, args, c, offeredTools) {
       return { result: { error: 'exit_plan_mode needs a non-empty `plan` argument with the plan text to show the user.' }, summary: 'bad args', ok: false };
     }
     const approved = await requestPlanApproval(planText, c);
+    const blockedNow = approved ? await modeRefusal(name, args, c) : null;
+    if (blockedNow) return blockedNow;
     if (!approved) {
       await window.api.audit.log({ ts: new Date().toISOString(), chat: c.id, model: c.model, tool: name, args: { planLen: planText.length }, status: 'plan-rejected', ok: false });
       if (askWasUnanswered(c)) return toolError("Nobody answered, at the home PC or on any connected device, so the plan wasn't approved. Stay in Plan Mode.", 'no answer');
@@ -5975,17 +5990,6 @@ async function executeToolImpl(name, args, c, offeredTools) {
     return { result: { ok: true, message: 'Plan approved by user. The chat is now in Approval Mode — proceed to execute the plan step by step. Each write tool call will pop a per-call approval modal.' }, summary: 'plan approved', ok: true };
   }
 
-  // Read-only enforcement (defence in depth — buildTools already strips these).
-  if (c?.readOnly && AgentRules.blockedInReadOnly(name)) {
-    await window.api.audit.log({ ts: new Date().toISOString(), chat: c.id, model: c.model, tool: name, args, status: 'blocked-readonly', ok: false });
-    return { result: { error: 'this chat is in Read-Only mode — write/patch/shell are disabled' }, summary: 'read-only', ok: false };
-  }
-  // No-fetch enforcement.
-  if (c?.noFetch && name === 'web_fetch') {
-    await window.api.audit.log({ ts: new Date().toISOString(), chat: c.id, model: c.model, tool: name, args, status: 'blocked-nofetch', ok: false });
-    return { result: { error: 'this chat has No-Fetch mode on — web_fetch is disabled (use web_search results instead)' }, summary: 'no-fetch', ok: false };
-  }
-
   // Every gate above is the home PC's own, and applies wherever the call was going. Only now does
   // it matter which machine that is.
   const target = toolTarget(name, args, c);
@@ -5993,6 +5997,12 @@ async function executeToolImpl(name, args, c, offeredTools) {
     await window.api.audit.log({ ts: new Date().toISOString(), chat: c?.id, model: c?.model, tool: name, args, status: 'blocked-no-device', ok: false });
     return toolError(target.error, 'no device');
   }
+  const run = toolRunFields(name, args, c, target.device);
+  if (run.error) {
+    await window.api.audit.log({ ts: new Date().toISOString(), chat: c?.id, model: c?.model, tool: name, args, status: 'blocked-bad-args', ok: false });
+    return toolError(run.error, 'bad args');
+  }
+  const { fields } = run;
   // The list is prefix-matched and was written with one machine in mind, so `git` there doesn't
   // quietly allow `git clean -fdx` on another computer. A call that lands on a laptop always asks.
   if (target.remote) skipApproval = false;
@@ -6000,8 +6010,7 @@ async function executeToolImpl(name, args, c, offeredTools) {
   if (skipAllApprovals) {
     approvalDecision = 'no-approval-mode';
   } else if (!skipApproval && (alwaysGated || forceApproval) && name !== 'calc') {
-    const willRun = whatWillRun(name, args, c, target.device.id);
-    const ok = await requestApproval(name, willRun, c, askMachine(target, c));
+    const ok = await requestApproval(name, fields, c, askMachine(target, c));
     approvalDecision = ok ? 'approved' : 'denied';
     if (!ok) {
       await window.api.audit.log({ ts: new Date().toISOString(), chat: c?.id, model: c?.model, tool: name, args, status: 'denied', ok: false });
@@ -6011,9 +6020,11 @@ async function executeToolImpl(name, args, c, offeredTools) {
     // The chat may have been stopped or deleted while the pop-up was open.
     if (c && !state.chats[c.id]) return { result: { error: 'this chat was deleted' }, summary: 'stopped', ok: false };
     if (c && state.runningChats.get(c.id)?.abortRequested) return { result: { error: 'stopped by user' }, summary: 'stopped', ok: false };
+    const blockedNow = await modeRefusal(name, args, c);
+    if (blockedNow) return blockedNow;
     // What was approved is what was on the pop-up. Anything that has moved since, such as the chat's
     // folder, would make this something else.
-    if (JSON.stringify(whatWillRun(name, args, c, target.device.id)) !== JSON.stringify(willRun)) {
+    if (JSON.stringify(toolRunFields(name, args, c, target.device).fields) !== JSON.stringify(fields)) {
       return toolError("What that would do changed while it was waiting for an answer, so it didn't run. Ask again if it's still wanted.", 'changed');
     }
   } else if (!skipApproval) {
@@ -6021,9 +6032,8 @@ async function executeToolImpl(name, args, c, offeredTools) {
   }
 
   const machine = askMachine(target, c);
-  const text = (key) => toStringArg(args?.[key]);
   try {
-    if (target.remote) return await runToolOnDevice(name, args, c, target);
+    if (target.remote) return await runToolOnDevice(name, args, c, target, fields);
     if (name === 'web_search') {
       const q = toStringArg(args?.query);
       if (!q) return { result: { error: 'web_search needs a string `query`' }, summary: 'bad args', ok: false };
@@ -6050,31 +6060,29 @@ async function executeToolImpl(name, args, c, offeredTools) {
     }
     const allow = c?.pathAllowlist || [];
     if (name === 'read_file') {
-      const res = await runWithPathExpansion(name, args, allow, (a) => window.api.fs.readFile(text('path'), a), c, machine);
+      const res = await runWithPathExpansion(name, args, allow, (a) => window.api.fs.readFile(fields.path, a), c, machine);
       if (res.error) return { result: { error: res.error }, summary: 'failed', ok: false };
       return { result: { path: res.path, content: res.content }, summary: `${(res.size / 1024).toFixed(1)} KB`, ok: true };
     }
     if (name === 'list_dir') {
-      const res = await runWithPathExpansion(name, args, allow, (a) => window.api.fs.listDir(text('path'), a), c, machine);
+      const res = await runWithPathExpansion(name, args, allow, (a) => window.api.fs.listDir(fields.path, a), c, machine);
       if (res.error) return { result: { error: res.error }, summary: 'failed', ok: false };
       const n = (res.entries || []).length;
       return { result: { path: res.path, entries: res.entries }, summary: `${n} item${n === 1 ? '' : 's'}`, ok: true };
     }
     if (name === 'write_file') {
-      const res = await runWithPathExpansion(name, args, allow, (a) => window.api.fs.writeFile(text('path'), text('content'), a), c, machine);
+      const res = await runWithPathExpansion(name, args, allow, (a) => window.api.fs.writeFile(fields.path, fields.content, a), c, machine);
       if (res.error) return { result: { error: res.error }, summary: 'failed', ok: false };
       return { result: { path: res.path, bytes: res.bytes }, summary: `${res.bytes} B written`, ok: true };
     }
     if (name === 'apply_patch') {
-      const res = await runWithPathExpansion(name, args, allow, (a) => window.api.fs.applyPatch(text('path'), text('find'), text('replace'), a), c, machine);
+      const res = await runWithPathExpansion(name, args, allow, (a) => window.api.fs.applyPatch(fields.path, fields.find, fields.replace, a), c, machine);
       if (res.error) return { result: { error: res.error }, summary: 'failed', ok: false };
       return { result: { path: res.path, before_lines: res.before_lines, after_lines: res.after_lines }, summary: 'patched', ok: true };
     }
     if (name === 'run_command') {
-      // Default cwd to the project folder when the agent didn't specify one —
-      // saves the model from having to remember to set it on every call.
-      const effectiveCwd = text('cwd') || c?.projectFolder || undefined;
-      const res = await window.api.shell.run(text('command'), effectiveCwd);
+      // toolRunFields has settled where: its own cwd, or the project folder if it gave none.
+      const res = await window.api.shell.run(fields.command, fields.cwd || undefined);
       const summary = res.timedOut ? 'timeout' : (res.exitCode === 0 ? `exit 0 · ${res.stdout.length} B` : `exit ${res.exitCode}`);
       return { result: res, summary, ok: res.exitCode === 0 };
     }
@@ -6103,8 +6111,7 @@ async function executeToolImpl(name, args, c, offeredTools) {
       return walkResult({ matches: res.matches }, res, n);
     }
     if (name === 'run_command_async') {
-      const effectiveCwd = text('cwd') || c?.projectFolder || undefined;
-      const res = await window.api.shell.runAsync(text('command'), effectiveCwd, allow);
+      const res = await window.api.shell.runAsync(fields.command, fields.cwd || undefined, allow);
       if (res.error) return { result: { error: res.error }, summary: 'failed', ok: false };
       return { result: { task_id: res.taskId, command: res.command, cwd: res.cwd, message: `Started in background as ${res.taskId}. Use task_status to check on it.` }, summary: `${res.taskId} started`, ok: true };
     }
@@ -6205,12 +6212,12 @@ function requestPathExpansion(toolName, requestedPath, c, device = null) {
 
 const PATH_ASK_WORDS = "The agent wants to read or write a path that's outside this chat's project folder.";
 
-function paintPathAsk({ tool, args, machine, from = '', tooLarge = false }) {
+function paintPathAsk({ tool, args, machine, from = '', notShown = false }) {
   $('#pe-desc').textContent = from + PATH_ASK_WORDS;
-  $('#pe-too-long').hidden = !tooLarge;
-  $('#pe-too-long p').textContent = ASK_TOO_LONG;
-  $('#pe-path-row').hidden = tooLarge;
-  $('#pe-folder-row').hidden = tooLarge;
+  $('#pe-not-shown').hidden = !notShown;
+  $('#pe-not-shown p').textContent = ASK_NOT_SHOWN;
+  $('#pe-path-row').hidden = notShown;
+  $('#pe-folder-row').hidden = notShown;
   $('#pe-tool-name').textContent = tool;
   $('#pe-requested-path').textContent = args.path || '(unknown)';
   $('#pe-current-folder').textContent = args.folder || '(none — no project folder set)';
@@ -6238,6 +6245,8 @@ async function runWithPathExpansion(toolName, args, allow, runFn, c, device = nu
     askWasUnanswered(c);
     return res;
   }
+  const blocked = await modeRefusal(toolName, args, c);
+  if (blocked) return { ...blocked, error: blocked.result.error };
 
   let toAdd;
   if (decision === 'once') {
@@ -6283,12 +6292,12 @@ const PLAN_ASK_WORDS = 'The agent is proposing this plan. On Approve the chat fl
 
 // On another device. The words are a home PC's, so they stay words: no markdown can make part of a
 // plan look like something else, or leave part of it out.
-function paintPlanAskFromHome({ args, machine, from, tooLarge }) {
+function paintPlanAskFromHome({ args, machine, from, notShown }) {
   $('#plan-approval-desc').textContent = from + PLAN_ASK_WORDS;
   const body = $('#plan-approval-body');
   body.textContent = '';
   body.append(askRow('Machine', machine));
-  body.append(tooLarge ? askTooLongRow() : askRow('Plan', args.plan));
+  body.append(notShown ? askNotShownRow() : askRow('Plan', args.plan));
 }
 
 function askRow(label, text) {
@@ -6297,9 +6306,9 @@ function askRow(label, text) {
   return row;
 }
 
-function askTooLongRow() {
+function askNotShownRow() {
   const row = remoteEl('section', 'approval-section');
-  row.append(remoteEl('p', 'ask-too-long', ASK_TOO_LONG));
+  row.append(remoteEl('p', 'ask-not-shown', ASK_NOT_SHOWN));
   return row;
 }
 
@@ -6309,7 +6318,7 @@ function requestApproval(toolName, args, c, device = null) {
   return openAsk({
     kind: 'approval', c, tool: toolName, args, device,
     // With agents running in several chats, say which one is asking.
-    paint: () => paintApprovalAsk({ tool: toolName, args, machine: device?.name, from: c && c.id !== state.activeId ? `From the chat "${c.title || 'New chat'}". ` : '' })
+    paint: () => paintApprovalAsk({ tool: toolName, args, machine: device?.name, from: c && c.id !== state.activeId ? `From the chat "${RemoteRules.revealHidden(c.title || 'New chat').text}". ` : '' })
   });
 }
 
@@ -6324,7 +6333,7 @@ const APPROVAL_ASK_WORDS = {
   list_dir:    'The model wants to list a directory.'
 };
 
-function paintApprovalAsk({ tool, args, machine, from = '', tooLarge = false }) {
+function paintApprovalAsk({ tool, args, machine, from = '', notShown = false }) {
   $('#approval-name').textContent = tool;
   const words = Object.hasOwn(APPROVAL_ASK_WORDS, tool) ? APPROVAL_ASK_WORDS[tool] : 'The model wants to perform an action.';
   const desc = machine ? words.replace(/on your (machine|disk)/, () => `on ${machine}`) : words;
@@ -6332,7 +6341,7 @@ function paintApprovalAsk({ tool, args, machine, from = '', tooLarge = false }) 
   const named = machine
     ? `<section class="approval-section"><div class="approval-label">Machine</div><pre class="approval-code" id="approval-device">${escapeHtml(machine)}</pre></section>`
     : '';
-  $('#approval-body').innerHTML = named + (tooLarge ? `<section class="approval-section"><p class="ask-too-long">${escapeHtml(ASK_TOO_LONG)}</p></section>` : renderApprovalBody(tool, args));
+  $('#approval-body').innerHTML = named + (notShown ? `<section class="approval-section"><p class="ask-not-shown">${escapeHtml(ASK_NOT_SHOWN)}</p></section>` : renderApprovalBody(tool, args));
 }
 
 function renderApprovalBody(toolName, args) {
@@ -7395,7 +7404,7 @@ function finishToolCall(deviceId, frame) {
 
 // A tool on a laptop, named fields only, so nothing a model made up travels with it. Which device
 // is the home PC's business, and stays here.
-async function runToolOnDevice(name, args, c, target) {
+async function runToolOnDevice(name, args, c, target, fields) {
   const { device } = target;
   const allow = allowlistOn(c, device.id);
   const folder = folderOn(c, device.id);
@@ -7407,11 +7416,11 @@ async function runToolOnDevice(name, args, c, target) {
     return typeof out.result?.error === 'string' ? { ...out, error: out.result.error } : out;
   }, c, device);
   let out;
-  if (name === 'read_file' || name === 'list_dir') out = await withAccess({ path: text('path') });
-  else if (name === 'write_file') out = await withAccess({ path: text('path'), content: text('content') });
-  else if (name === 'apply_patch') out = await withAccess({ path: text('path'), find: text('find'), replace: text('replace') });
-  else if (name === 'run_command') out = await callDevice(device, name, { command: text('command'), cwd: text('cwd') || folder || undefined }, c);
-  else if (name === 'run_command_async') out = await callDevice(device, name, { command: text('command'), cwd: text('cwd') || folder || undefined, allowlist: allow }, c);
+  if (name === 'read_file' || name === 'list_dir') out = await withAccess({ path: fields.path });
+  else if (name === 'write_file') out = await withAccess({ path: fields.path, content: fields.content });
+  else if (name === 'apply_patch') out = await withAccess({ path: fields.path, find: fields.find, replace: fields.replace });
+  else if (name === 'run_command') out = await callDevice(device, name, { command: fields.command, cwd: fields.cwd || undefined }, c);
+  else if (name === 'run_command_async') out = await callDevice(device, name, { command: fields.command, cwd: fields.cwd || undefined, allowlist: allow }, c);
   else if (name === 'glob' || name === 'grep') {
     if (!text('pattern')) return toolError('pattern required', 'bad args');
     if (!root) return toolError(`no project folder set on ${device.name}: ${name} needs a root`, 'no root');
@@ -7449,9 +7458,10 @@ function noteToolsLeftOut(deviceId, count) {
 //
 // On a laptop it's an entry in remoteAsks.held, by home PC and id together, until that home PC says
 // it's over or can't be reached. Held isn't shown: it stays off the page while chats are hidden.
-const ASK_KEY_GUARD_MS = 800;
+const ASK_GUARD_MS = 800;
 const ASK_HELD_MAX = 20;
-const ASK_TOO_LONG = 'This is too long to show here. To approve it, answer on the home PC.';
+const ASK_UNHELD_REMEMBERED_MAX = 256;
+const ASK_NOT_SHOWN = 'This is too long or too unusual to show here. To approve it, answer on the home PC.';
 // The first choice of each is the refusal, and it's where focus starts. `words` is what's emptied
 // when it comes down, because a hidden element is still in the page, and a lock means nothing is.
 const ASK_MODALS = {
@@ -7461,34 +7471,61 @@ const ASK_MODALS = {
 };
 
 const remoteAsks = {
-  keyGuardMs: ASK_KEY_GUARD_MS,
+  guardMs: ASK_GUARD_MS,
   // At home.
-  open: new Map(),     // id -> { id, kind, chatId, refusal, frame, tooLarge, sentTo, asked, offered, timer, takeDown, turnOver, over, resolve }
+  open: new Map(),     // id -> { id, kind, chatId, refusal, frame, notShown, sentTo, asked, unheld, offered, timer, takeDown, turnOver, over, resolve }
   answers: new Map(),  // chatId -> who answered for the tool call under way, for its line in the log
   // On the laptop.
   held: new Map(),     // `${deviceId}:${id}` -> what cleanAsk kept, and { key, deviceId, chatKey, queued, answered, takeDown, turnOver }
-  saidTooMany: new Set() // home PCs whose extra pop-ups have been mentioned
+  unheld: new Map()    // deviceId -> ids of its open pop-ups that couldn't be held here, which is what the toast is about
 };
 
 // Puts a pop-up on the screen, at home or on a laptop. `answer` gets the value of whichever choice
 // is made, and what comes back takes it down again.
 //
-// It can appear while someone is in the middle of typing. So for a moment Enter and Space do nothing
-// at all, and a key already held down never counts. Focus goes on the refusal, and goes back to where
-// it was afterwards.
+// It can appear under someone's hands, because another device has just answered the one before it.
+// So until remoteAsks.guardMs has passed, every choice but the refusal ignores whatever reaches it,
+// and a click only counts if its press started after this pop-up appeared. Enter and Space do nothing
+// at all until that long after the pop-up, and after the last key pressed, so someone still typing
+// isn't answering. A key held down never counts. Escape and a click on the refusal always work. Focus
+// goes on the refusal, and goes back to where it was afterwards.
 function wireAskModal(kind, answer, onlyRefuse = false) {
   const { overlay: selector, choices, words } = ASK_MODALS[kind];
   const overlay = $(selector);
   const refusal = choices[0][1];
-  const buttons = choices.map(([button, value]) => ({ el: $(button), value, onClick: () => answer(value) }));
-  const cameFrom = document.activeElement;
   const openedAt = Date.now();
-  const onGuard = (e) => {
-    if (e.key !== 'Enter' && e.key !== ' ') return;
-    if (e.repeat || Date.now() - openedAt < remoteAsks.keyGuardMs) {
-      e.preventDefault();
-      e.stopImmediatePropagation();
+  let lastKeyAt = openedAt;
+  let keyLetThrough = null;
+  let pressedSinceOpen = false;
+  const buttons = choices.map(([button, value]) => ({
+    el: $(button),
+    value,
+    onClick: (e) => {
+      if (value !== refusal && (Date.now() - openedAt < remoteAsks.guardMs || (e.detail > 0 && !pressedSinceOpen))) return;
+      answer(value);
     }
+  }));
+  const cameFrom = document.activeElement;
+  const onPress = () => { pressedSinceOpen = true; };
+  const stop = (e) => {
+    e.preventDefault();
+    e.stopImmediatePropagation();
+  };
+  const onKeyDown = (e) => {
+    if (e.key === 'Escape') return;
+    const quietFor = Date.now() - lastKeyAt;
+    lastKeyAt = Date.now();
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    if (e.repeat || quietFor < remoteAsks.guardMs) {
+      keyLetThrough = null;
+      stop(e);
+    } else {
+      keyLetThrough = e.key;
+    }
+  };
+  // A key's press and release go together, or Space could never work: its release acts on the button.
+  const onKeyRest = (e) => {
+    if ((e.key === 'Enter' || e.key === ' ') && keyLetThrough !== e.key) stop(e);
   };
   const onKey = (e) => { if (e.key === 'Escape') answer(refusal); };
   const onBackdrop = (e) => { if (e.target === overlay) answer(refusal); };
@@ -7496,19 +7533,27 @@ function wireAskModal(kind, answer, onlyRefuse = false) {
     el.addEventListener('click', onClick);
     el.hidden = onlyRefuse && value !== refusal;
   }
-  for (const type of ['keydown', 'keypress', 'keyup']) document.addEventListener(type, onGuard, true);
+  document.addEventListener('pointerdown', onPress, true);
+  document.addEventListener('keydown', onKeyDown, true);
+  document.addEventListener('keypress', onKeyRest, true);
+  document.addEventListener('keyup', onKeyRest, true);
   document.addEventListener('keydown', onKey);
   overlay.addEventListener('click', onBackdrop);
   overlay.hidden = false;
   buttons[0].el.focus();
+  const unmarkBoxes = markAskBoxes(overlay);
   return () => {
     overlay.hidden = true;
+    unmarkBoxes();
     for (const element of words) $(element).textContent = '';
     for (const { el, onClick } of buttons) {
       el.removeEventListener('click', onClick);
       el.hidden = false;
     }
-    for (const type of ['keydown', 'keypress', 'keyup']) document.removeEventListener(type, onGuard, true);
+    document.removeEventListener('pointerdown', onPress, true);
+    document.removeEventListener('keydown', onKeyDown, true);
+    document.removeEventListener('keypress', onKeyRest, true);
+    document.removeEventListener('keyup', onKeyRest, true);
     document.removeEventListener('keydown', onKey);
     overlay.removeEventListener('click', onBackdrop);
     // A lock has put its own screen up, and that keeps the focus.
@@ -7516,30 +7561,56 @@ function wireAskModal(kind, answer, onlyRefuse = false) {
   };
 }
 
+// Goes over the boxes of a pop-up that's on the screen. What can't be seen becomes codes, with a line
+// above to say so, in the pop-up only. And a box whose content doesn't fit says how much more there
+// is, because a second command under a screenful of blank lines looks like no second command at all.
+function markAskBoxes(overlay) {
+  const plain = overlay.querySelector('.plan-approval-body');
+  const boxes = [...overlay.querySelectorAll('.approval-code, .approval-diff')];
+  if (plain && !boxes.length) boxes.push(plain);
+  const listening = new AbortController();
+  for (const box of boxes) {
+    // Looked at whole first, since a long diff is many thousand pieces and almost never has any.
+    let found = false;
+    const walker = RemoteRules.revealHidden(box.textContent).found ? document.createTreeWalker(box, NodeFilter.SHOW_TEXT) : null;
+    const nodes = [];
+    while (walker?.nextNode()) nodes.push(walker.currentNode);
+    for (const node of nodes) {
+      const parts = RemoteRules.hiddenParts(node.nodeValue);
+      if (!parts.some((part) => part.code)) continue;
+      found = true;
+      node.replaceWith(...parts.map((part) => (part.code ? remoteEl('span', 'ask-code', part.text) : document.createTextNode(part.text))));
+    }
+    if (found) box.before(remoteEl('p', 'ask-hidden-note', 'This has hidden characters, shown here as codes.'));
+    if (box.scrollHeight > box.clientHeight) noteLinesBelow(box, listening.signal);
+  }
+  return () => {
+    listening.abort();
+    overlay.querySelectorAll('.ask-hidden-note, .ask-more-lines').forEach((note) => note.remove());
+  };
+}
+
+function noteLinesBelow(box, signal) {
+  const note = remoteEl('p', 'ask-more-lines');
+  box.after(note);
+  const style = getComputedStyle(box);
+  const line = parseFloat(style.lineHeight) || parseFloat(style.fontSize) * 1.5 || 18;
+  const paint = () => {
+    const lines = Math.round((box.scrollHeight - box.clientHeight - box.scrollTop) / line);
+    note.hidden = lines <= 0;
+    note.textContent = `${lines} more ${lines === 1 ? 'line' : 'lines'} below`;
+  };
+  box.addEventListener('scroll', paint, { passive: true, signal });
+  paint();
+}
+
 // ---- At home ----
 
-// Where a tool will really run and what with, read the way the code that runs it reads it. It's what
-// a pop-up shows, here and on every other device, so there's no summary that could say otherwise.
-function whatWillRun(name, args, c, deviceId) {
-  const text = (key) => toStringArg(args?.[key]);
-  const fields = (...keys) => Object.fromEntries(keys.map((key) => [key, text(key)]));
-  const folder = folderOn(c, deviceId) || '';
-  switch (name) {
-    case 'run_command':
-    case 'run_command_async': return { command: text('command'), cwd: text('cwd') || folder };
-    case 'write_file': return fields('path', 'content');
-    case 'apply_patch': return fields('path', 'find', 'replace');
-    case 'read_file':
-    case 'list_dir': return fields('path');
-    case 'web_search': return fields('query');
-    case 'web_fetch': return fields('url');
-    case 'glob': return { pattern: text('pattern'), root: folder || allowlistOn(c, deviceId)[0] || '' };
-    case 'grep': return { pattern: text('pattern'), root: folder || allowlistOn(c, deviceId)[0] || '', glob: text('glob'), case_insensitive: !!args?.case_insensitive };
-    case 'task_status':
-    case 'task_kill': return fields('task_id');
-    case 'task_list': return {};
-    default: return args && typeof args === 'object' ? args : {};
-  }
+// What a tool will really do on that machine, from what this chat knows about it: { fields } or
+// { error }. A pop-up on any device shows these fields, and the code that runs the tool uses them.
+function toolRunFields(name, args, c, device) {
+  const folder = folderOn(c, device.id) || '';
+  return RemoteRules.whatWillRun(name, args, { folder, root: folder || allowlistOn(c, device.id)[0] || '', os: device.os });
 }
 
 // The machine to name. With only this PC in play there's nothing to tell apart, until someone may be
@@ -7557,8 +7628,8 @@ function openAsk({ kind, c, tool, args, device = null, paint }) {
     const id = crypto.randomUUID();
     const frame = RemoteRules.askFrame({ id, kind, chatId: c?.id ?? null, tool, args, device: device?.name ?? pairedToolDevices()[0].name });
     const ask = {
-      id, kind, chatId: c?.id ?? null, refusal, frame, tooLarge: frame.tooLarge === true,
-      sentTo: new Set(), asked: new Set(), offered: false, timer: null, takeDown: null, turnOver: null, over: false, resolve
+      id, kind, chatId: c?.id ?? null, refusal, frame, notShown: frame.notShown === true,
+      sentTo: new Set(), asked: new Set(), unheld: new Set(), offered: false, timer: null, takeDown: null, turnOver: null, over: false, resolve
     };
     remoteAsks.open.set(id, ask);
     queueModal(() => new Promise((turnOver) => {
@@ -7566,7 +7637,7 @@ function openAsk({ kind, c, tool, args, device = null, paint }) {
       ask.turnOver = turnOver;
       try {
         paint();
-        ask.takeDown = wireAskModal(kind, (value) => endAsk(ask, value, { name: 'home' }));
+        ask.takeDown = wireAskModal(kind, (value) => endAsk(ask, value, { home: true }));
       } catch (e) {
         console.warn('A pop-up could not be drawn', e);
         endAsk(ask, refusal);
@@ -7611,9 +7682,14 @@ function connectedLaptops() {
   return remoteDevices().filter((d) => d.role === 'laptop' && d.connected === true);
 }
 
-// A chat too large for the mirror isn't on any laptop, so there's nothing there to ask about.
 function askCanGoOut(ask) {
-  return !!sharedChatById(ask.chatId) && !mirror.tooLarge.has(ask.chatId);
+  return RemoteRules.askCanGoOut(sharedChatById(ask.chatId), mirror.tooLarge);
+}
+
+// Someone who could say yes, somewhere other than here. A laptop that's only been offered the refusal
+// can't, and nor can one that has said it couldn't hold this.
+function aLaptopCanApprove(ask) {
+  return !ask.notShown && askCanGoOut(ask) && connectedLaptops().some((d) => !ask.unheld.has(d.id));
 }
 
 function tellAskClosed(ask, value) {
@@ -7624,11 +7700,11 @@ function tellAskClosed(ask, value) {
 }
 
 // When a laptop started the run, there may be nobody at this machine at all, so it doesn't wait
-// forever. But that's only so while no laptop can answer either. The time starts again each time the
+// forever. But that's only so while no laptop can say yes either. The time starts again each time the
 // last one goes. Started here, someone may just be slow.
 function watchAskTimer(ask) {
   const run = state.runningChats.get(ask.chatId);
-  const nobody = !!run?.startedBy && !(askCanGoOut(ask) && connectedLaptops().length > 0);
+  const nobody = !!run?.startedBy && !aLaptopCanApprove(ask);
   if (!nobody) {
     clearTimeout(ask.timer);
     ask.timer = null;
@@ -7671,14 +7747,37 @@ function syncOpenAsks() {
 // A new snapshot means saying it again. A laptop that was told on this connection can still answer
 // while that's under way: `asked` only goes with the connection.
 function sayAsksAgainTo(deviceId) {
-  for (const ask of remoteAsks.open.values()) ask.sentTo.delete(deviceId);
+  for (const ask of remoteAsks.open.values()) {
+    ask.sentTo.delete(deviceId);
+    ask.unheld.delete(deviceId);
+  }
 }
 
 function forgetAsksSentTo(deviceId) {
   for (const ask of remoteAsks.open.values()) {
     ask.sentTo.delete(deviceId);
     ask.asked.delete(deviceId);
+    ask.unheld.delete(deviceId);
   }
+}
+
+// A laptop that can't hold a pop-up. Nothing changes for the pop-up itself. That laptop just stops
+// counting as someone who could answer it, so a run with nobody at home doesn't wait on it.
+function askUnheldFromDevice(deviceId, frame) {
+  const device = remoteDevices().find((d) => d.id === deviceId);
+  const ask = typeof frame.id === 'string' ? remoteAsks.open.get(frame.id) : undefined;
+  const problem = RemoteRules.checkAskUnheld(frame, {
+    role: device?.role,
+    connected: device?.connected,
+    open: !!ask,
+    asked: ask?.asked.has(deviceId) === true
+  });
+  if (problem) {
+    window.api.remote.audit({ event: 'refused', device: deviceId, deviceName: device?.name, tool: 'ask-unheld', reason: problem, ok: false }).catch(() => {});
+    return;
+  }
+  ask.unheld.add(deviceId);
+  watchAskTimer(ask);
 }
 
 // A paired device's frame, on its way to running a command. Everything but a good answer stops here
@@ -7689,7 +7788,7 @@ function answerFromDevice(deviceId, frame) {
   const problem = RemoteRules.checkAnswer(frame, {
     role: device?.role,
     connected: device?.connected,
-    open: ask ? { kind: ask.kind, tooLarge: ask.tooLarge } : null,
+    open: ask ? { kind: ask.kind, notShown: ask.notShown } : null,
     asked: ask?.asked.has(deviceId) === true,
     shared: !!ask && askCanGoOut(ask)
   });
@@ -7709,22 +7808,38 @@ function heldAsksOf(deviceId) {
 }
 
 // Only ever a device this one treats as its home PC, and only for a chat it has sent here. One that's
-// already held stays exactly as it is, so a pop-up can't change under someone reading it.
+// already held stays exactly as it is, so a pop-up can't change under someone reading it. Whatever
+// can't be held, home is told, unless it came with no id to say it about.
 function acceptAsk(deviceId, frame) {
+  if (!RemoteRules.isActionId(frame.id)) return;
+  const key = `${deviceId}:${frame.id}`;
+  if (remoteAsks.held.has(key)) return;
   const ask = RemoteRules.cleanAsk(frame);
-  if (!ask) return;
-  const key = `${deviceId}:${ask.id}`;
-  const chatKey = remoteChatKey(deviceId, ask.chatId);
-  if (remoteAsks.held.has(key) || !state.chats[chatKey]) return;
-  if (heldAsksOf(deviceId).length >= ASK_HELD_MAX) {
-    if (!remoteAsks.saidTooMany.has(deviceId)) {
-      remoteAsks.saidTooMany.add(deviceId);
-      remoteToast(`Too many questions from ${remoteHomeLabel(deviceId)} at once. The rest are waiting on that PC.`);
-    }
+  const chatKey = ask && remoteChatKey(deviceId, ask.chatId);
+  if (!ask || !state.chats[chatKey] || heldAsksOf(deviceId).length >= ASK_HELD_MAX) {
+    cantHoldAsk(deviceId, frame.id);
     return;
   }
+  remoteAsks.unheld.get(deviceId)?.delete(ask.id);
   remoteAsks.held.set(key, { ...ask, key, deviceId, chatKey, queued: false, answered: false, takeDown: null, turnOver: null });
   showHeldAsks();
+}
+
+function cantHoldAsk(deviceId, id) {
+  window.api.remote.send(deviceId, { type: 'ask-unheld', id }).catch(() => {});
+  const ids = remoteAsks.unheld.get(deviceId) || new Set();
+  remoteAsks.unheld.set(deviceId, ids);
+  const first = ids.size === 0;
+  if (ids.size < ASK_UNHELD_REMEMBERED_MAX) ids.add(id);
+  if (first) sayAskUnheld(deviceId);
+}
+
+// One at a time, for each home PC. While locked it waits, and it's only said then if there's still
+// something to say it about.
+function sayAskUnheld(deviceId) {
+  if (remoteChatsHidden()) return;
+  const home = remoteHomeLabel(deviceId);
+  showToast(`A question from ${home} can't be shown here. Answer it at ${home}, or press Stop.`);
 }
 
 // Everything held that isn't on its way to the screen goes in the queue, unless chats are hidden.
@@ -7746,13 +7861,14 @@ function showHeldAsk(held) {
     }
     held.turnOver = turnOver;
     const home = remoteHomeLabel(held.deviceId);
-    const from = `From the chat "${state.chats[held.chatKey]?.title || 'New chat'}" on ${home}. `;
-    const words = { tool: held.tool, args: held.args, machine: held.device, from, tooLarge: held.tooLarge };
+    const title = RemoteRules.revealHidden(state.chats[held.chatKey]?.title || 'New chat').text;
+    const from = `From the chat "${title}" on ${home}. `;
+    const words = { tool: held.tool, args: held.args, machine: held.device, from, notShown: held.notShown };
     try {
       if (held.kind === 'approval') paintApprovalAsk(words);
       else if (held.kind === 'plan') paintPlanAskFromHome(words);
       else paintPathAsk(words);
-      held.takeDown = wireAskModal(held.kind, (value) => answerHeldAsk(held, value), held.tooLarge);
+      held.takeDown = wireAskModal(held.kind, (value) => answerHeldAsk(held, value), held.notShown);
     } catch (e) {
       console.warn('A pop-up could not be drawn', e);
       letGoOfHeldAsk(held, null);
@@ -7790,7 +7906,6 @@ function letGoOfHeldAsk(held, words) {
   const onScreen = held.takeDown !== null;
   remoteAsks.held.delete(held.key);
   putAwayHeldAsk(held);
-  if (heldAsksOf(held.deviceId).length < ASK_HELD_MAX) remoteAsks.saidTooMany.delete(held.deviceId);
   // The status that brings a lock can also be the one that ends this, before the lock has hidden it.
   if (onScreen && words && !remoteChatsHidden()) showToast(words);
 }
@@ -7803,11 +7918,13 @@ function askClosedWords(held, value) {
 
 // Keyed by who sent it, so one home PC can't close another's.
 function closeHeldAsk(deviceId, frame) {
+  remoteAsks.unheld.get(deviceId)?.delete(frame.id);
   const held = typeof frame.id === 'string' ? remoteAsks.held.get(`${deviceId}:${frame.id}`) : undefined;
   if (held) letGoOfHeldAsk(held, askClosedWords(held, frame.value));
 }
 
 function letGoOfAsksOfHome(deviceId, words) {
+  remoteAsks.unheld.delete(deviceId);
   for (const held of heldAsksOf(deviceId)) letGoOfHeldAsk(held, words);
 }
 
@@ -7820,7 +7937,7 @@ function letGoOfAsksOfChat(chatKey, words) {
 // A wipe, or removing the home PCs instead of setting a PIN.
 function discardHeldAsks() {
   for (const held of [...remoteAsks.held.values()]) letGoOfHeldAsk(held, null);
-  remoteAsks.saidTooMany.clear();
+  remoteAsks.unheld.clear();
 }
 
 // The lock has come down. Nothing is let go of, but nothing stays on the page.
@@ -8865,6 +8982,7 @@ function mirrorOnFrame(deviceId, frame) {
     return;
   }
   if (frame.type === 'answer') { answerFromDevice(deviceId, frame); return; }
+  if (frame.type === 'ask-unheld') { askUnheldFromDevice(deviceId, frame); return; }
   // Matched against the call that was sent to this device, so it needs no more than that.
   if (frame.type === 'tool-result') { finishToolCall(deviceId, frame); return; }
   // On a page that has just loaded the role may not be known yet, and a home PC is the one thing
@@ -9630,6 +9748,7 @@ function reflectRemoteLock() {
     else renderChatList();
     if (mirror.awaited) openIfAwaited(mirror.awaited.key);
     for (const text of mirror.toastsForUnlock.splice(0)) showToast(text);
+    for (const [deviceId, ids] of remoteAsks.unheld) if (ids.size) sayAskUnheld(deviceId);
     showHeldAsks();
   }
   paintStrandedBar();

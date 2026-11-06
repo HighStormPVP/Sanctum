@@ -1209,29 +1209,29 @@ test('a pop-up goes whole, or not at all: past 64 KiB it says so and carries not
   const base = { id: 'ask_1', kind: 'approval', chatId: 'c_1', tool: 'write_file', device: 'MacBook' };
   const small = askFrame({ ...base, args: { path: 'a.txt', content: 'x'.repeat(1000) } });
   assert.deepEqual(small, { type: 'ask', ...base, args: { path: 'a.txt', content: 'x'.repeat(1000) } });
-  assert.equal('tooLarge' in small, false);
+  assert.equal('notShown' in small, false);
 
   const big = askFrame({ ...base, args: { path: 'a.txt', content: 'x'.repeat(MAX_ASK_BYTES) } });
-  assert.deepEqual(big, { type: 'ask', ...base, args: {}, tooLarge: true });
+  assert.deepEqual(big, { type: 'ask', ...base, args: {}, notShown: true });
 
   // Bytes, not characters. Each of these is three bytes on the wire, and short by a count of letters.
   const wide = askFrame({ ...base, args: { path: 'a.txt', content: '\u20ac'.repeat(30000) } });
-  assert.equal(wide.tooLarge, true);
+  assert.equal(wide.notShown, true);
 
   // Right up to the line, by what JSON really comes to.
-  const overhead = Buffer.byteLength(JSON.stringify(askFrame({ ...base, args: { content: '' } })), 'utf8');
-  const fits = askFrame({ ...base, args: { content: 'x'.repeat(MAX_ASK_BYTES - overhead) } });
-  assert.equal(fits.tooLarge, undefined, 'exactly at the limit still goes');
-  const over = askFrame({ ...base, args: { content: 'x'.repeat(MAX_ASK_BYTES - overhead + 1) } });
-  assert.equal(over.tooLarge, true, 'one byte more does not');
+  const overhead = Buffer.byteLength(JSON.stringify(askFrame({ ...base, args: { path: 'a', content: '' } })), 'utf8');
+  const fits = askFrame({ ...base, args: { path: 'a', content: 'x'.repeat(MAX_ASK_BYTES - overhead) } });
+  assert.equal(fits.notShown, undefined, 'exactly at the limit still goes');
+  const over = askFrame({ ...base, args: { path: 'a', content: 'x'.repeat(MAX_ASK_BYTES - overhead + 1) } });
+  assert.equal(over.notShown, true, 'one byte more does not');
 });
 
 test('a laptop takes a pop-up only in exactly the shape a home PC sends', () => {
   const { cleanAsk, MAX_ASK_BYTES } = RemoteRules;
-  assert.deepEqual(cleanAsk(askOf()), { id: 'ask_1', kind: 'approval', chatId: 'c_1', tool: 'run_command', args: { command: 'echo hi', cwd: 'C:/work' }, device: 'MacBook', tooLarge: false });
+  assert.deepEqual(cleanAsk(askOf()), { id: 'ask_1', kind: 'approval', chatId: 'c_1', tool: 'run_command', args: { command: 'echo hi', cwd: 'C:/work' }, device: 'MacBook', notShown: false });
   assert.deepEqual(cleanAsk(askOf({ kind: 'plan', tool: 'exit_plan_mode', args: { plan: 'Do it.' } })).args, { plan: 'Do it.' });
   assert.deepEqual(cleanAsk(askOf({ kind: 'path', tool: 'read_file', args: { path: 'C:/x', folder: '' } })).args, { path: 'C:/x', folder: '' });
-  assert.equal(cleanAsk(askOf({ args: {}, tooLarge: true })).tooLarge, true);
+  assert.equal(cleanAsk(askOf({ args: {}, notShown: true })).notShown, true);
   assert.deepEqual(cleanAsk(askOf({ tool: 'mcp__a__b', args: { anything: [1, { two: 2 }] } })).args, { anything: [1, { two: 2 }] });
 
   const refused = {
@@ -1268,9 +1268,9 @@ test('a laptop takes a pop-up only in exactly the shape a home PC sends', () => 
     'a plan with more than a plan': askOf({ kind: 'plan', tool: 'exit_plan_mode', args: { plan: 'x', y: 1 } }),
     'a path with no folder field': askOf({ kind: 'path', tool: 'read_file', args: { path: 'x' } }),
     'a path that is not text': askOf({ kind: 'path', tool: 'read_file', args: { path: 1, folder: '' } }),
-    'too large, but carrying something': askOf({ tooLarge: true }),
-    'tooLarge that is not exactly true': askOf({ args: {}, tooLarge: 1 }),
-    'tooLarge false': askOf({ tooLarge: false }),
+    'too large, but carrying something': askOf({ notShown: true }),
+    'notShown that is not exactly true': askOf({ args: {}, notShown: 1 }),
+    'notShown false': askOf({ notShown: false }),
     'over the size': askOf({ args: { command: 'x'.repeat(MAX_ASK_BYTES), cwd: '' } })
   };
   for (const [what, frame] of Object.entries(refused)) assert.equal(cleanAsk(frame), null, what);
@@ -1278,18 +1278,18 @@ test('a laptop takes a pop-up only in exactly the shape a home PC sends', () => 
 
 test('what a laptop keeps of a pop-up holds nothing but its named fields', () => {
   const { cleanAsk } = RemoteRules;
-  assert.deepEqual(Object.keys(cleanAsk(askOf())).sort(), ['args', 'chatId', 'device', 'id', 'kind', 'tooLarge', 'tool']);
+  assert.deepEqual(Object.keys(cleanAsk(askOf())).sort(), ['args', 'chatId', 'device', 'id', 'kind', 'notShown', 'tool']);
 });
 
 test('home takes an answer only from a connected laptop it asked, for a question still open on a shared chat', () => {
   const { checkAnswer } = RemoteRules;
   const frame = { type: 'answer', id: 'ask_1', value: true };
-  const fine = { role: 'laptop', connected: true, open: { kind: 'approval', tooLarge: false }, asked: true, shared: true };
+  const fine = { role: 'laptop', connected: true, open: { kind: 'approval', notShown: false }, asked: true, shared: true };
   assert.equal(checkAnswer(frame, fine), null);
   assert.equal(checkAnswer({ ...frame, value: false }, fine), null);
-  assert.equal(checkAnswer({ type: 'answer', id: 'ask_1', value: 'once' }, { ...fine, open: { kind: 'path', tooLarge: false } }), null);
-  assert.equal(checkAnswer({ type: 'answer', id: 'ask_1', value: 'folder' }, { ...fine, open: { kind: 'path', tooLarge: false } }), null);
-  assert.equal(checkAnswer({ type: 'answer', id: 'ask_1', value: true }, { ...fine, open: { kind: 'plan', tooLarge: false } }), null);
+  assert.equal(checkAnswer({ type: 'answer', id: 'ask_1', value: 'once' }, { ...fine, open: { kind: 'path', notShown: false } }), null);
+  assert.equal(checkAnswer({ type: 'answer', id: 'ask_1', value: 'folder' }, { ...fine, open: { kind: 'path', notShown: false } }), null);
+  assert.equal(checkAnswer({ type: 'answer', id: 'ask_1', value: true }, { ...fine, open: { kind: 'plan', notShown: false } }), null);
 
   const dropped = [
     ['a home PC of this one', frame, { ...fine, role: 'home' }],
@@ -1303,11 +1303,11 @@ test('home takes an answer only from a connected laptop it asked, for a question
     ['an id that is not text', { ...frame, id: 7 }, fine],
     ['a word for yes', { ...frame, value: 'yes' }, fine],
     ['a path answer to an approval', { ...frame, value: 'once' }, fine],
-    ['an approval answer to a path', frame, { ...fine, open: { kind: 'path', tooLarge: false } }],
+    ['an approval answer to a path', frame, { ...fine, open: { kind: 'path', notShown: false } }],
     ['no value', { type: 'answer', id: 'ask_1' }, fine],
-    ['yes to what could not be shown', frame, { ...fine, open: { kind: 'approval', tooLarge: true } }],
-    ['once to what could not be shown', { ...frame, value: 'once' }, { ...fine, open: { kind: 'path', tooLarge: true } }],
-    ['folder to what could not be shown', { ...frame, value: 'folder' }, { ...fine, open: { kind: 'path', tooLarge: true } }]
+    ['yes to what could not be shown', frame, { ...fine, open: { kind: 'approval', notShown: true } }],
+    ['once to what could not be shown', { ...frame, value: 'once' }, { ...fine, open: { kind: 'path', notShown: true } }],
+    ['folder to what could not be shown', { ...frame, value: 'folder' }, { ...fine, open: { kind: 'path', notShown: true } }]
   ];
   for (const [what, answer, facts] of dropped) {
     const reason = checkAnswer(answer, facts);
@@ -1315,6 +1315,202 @@ test('home takes an answer only from a connected laptop it asked, for a question
     assert.ok(reason.length > 0 && reason.length < 100, `${what}: a short reason of its own, nothing from the frame`);
     assert.ok(!reason.includes('ask_1'), what);
   }
-  assert.equal(checkAnswer({ ...frame, value: false }, { ...fine, open: { kind: 'approval', tooLarge: true } }), null, 'no is always something it can say');
-  assert.equal(checkAnswer({ ...frame, value: 'deny' }, { ...fine, open: { kind: 'path', tooLarge: true } }), null);
+  assert.equal(checkAnswer({ ...frame, value: false }, { ...fine, open: { kind: 'approval', notShown: true } }), null, 'no is always something it can say');
+  assert.equal(checkAnswer({ ...frame, value: 'deny' }, { ...fine, open: { kind: 'path', notShown: true } }), null);
+});
+
+// ---- Fix round 1: the pop-ups ----
+
+test('askFrame never sends what a laptop would drop: the shapes that fail go in the form with only a refusal', () => {
+  const { askFrame, cleanAsk } = RemoteRules;
+  const base = { id: 'ask_1', kind: 'approval', chatId: 'c_1', device: 'MacBook' };
+  let deep = { end: 1 };
+  for (let i = 0; i < 40; i += 1) deep = { deep };
+  const shapes = {
+    'a long name': { tool: `mcp__a__${'x'.repeat(200)}`, args: { a: 1 } },
+    'deep arguments': { tool: 'mcp__a__b', args: deep },
+    'a key named constructor': { tool: 'mcp__a__b', args: JSON.parse('{"constructor":"x","a":1}') },
+    'a key named __proto__': { tool: 'mcp__a__b', args: JSON.parse('{"__proto__":{"x":1}}') },
+    'a command field that is not text': { tool: 'run_command', args: { command: ['echo'], cwd: '' } },
+    'a name with a line break': { tool: 'mcp__a__b\nApproved', args: {} }
+  };
+  for (const [what, { tool, args }] of Object.entries(shapes)) {
+    const frame = askFrame({ ...base, tool, args });
+    assert.equal(frame.notShown, true, what);
+    assert.deepEqual(frame.args, {}, what);
+    assert.ok(frame.tool.length <= 128, what);
+    assert.ok(cleanAsk(JSON.parse(JSON.stringify(frame))), `${what}: and a laptop can hold it`);
+  }
+  assert.equal(askFrame({ ...base, tool: 'mcp__a__b', args: { a: 1 } }).notShown, undefined, 'an ordinary one goes as it is');
+  assert.ok(cleanAsk(askFrame({ ...base, tool: '\u202e', args: {} })), 'a name of nothing but hidden characters still names something');
+});
+
+test('ask-unheld is taken only from the device asked, about a question still open', () => {
+  const { checkAskUnheld } = RemoteRules;
+  const frame = { type: 'ask-unheld', id: 'ask_1' };
+  const fine = { role: 'laptop', connected: true, open: true, asked: true };
+  assert.equal(checkAskUnheld(frame, fine), null);
+  for (const [what, shape, facts] of [
+    ['a home PC of this one', frame, { ...fine, role: 'home' }],
+    ['a device not connected', frame, { ...fine, connected: false }],
+    ['a question not open', frame, { ...fine, open: false }],
+    ['a device not asked', frame, { ...fine, asked: false }],
+    ['an extra field', { ...frame, value: true }, fine],
+    ['an id that is not text', { ...frame, id: 7 }, fine]
+  ]) {
+    assert.equal(typeof checkAskUnheld(shape, facts), 'string', what);
+  }
+});
+
+test('a relative cwd lands where the machine\'s own path rules put it', () => {
+  const { resolveCwd } = RemoteRules;
+  const nodePath = require('node:path');
+  const cases = {
+    win32: { folder: 'C:\\work\\proj', others: ['D:\\x', 'C:/work/proj', '\\\\server\\share\\deep\\er'], rels: ['.', 'src', 'src\\a', 'src/a', '..', '..\\..', '..\\..\\..\\..', './x/../y', 'a\\.\\b\\..'] },
+    darwin: { folder: '/Users/a/proj', others: ['/', '/x//y/', '/a b/c'], rels: ['.', 'src', 'src/a', '..', '../..', '../../../..', './x/../y', 'a/./b/..', 'back\\slash'] },
+    linux: { folder: '/home/a/proj', others: [], rels: ['.', 'src', '..'] }
+  };
+  for (const [os, { folder, others, rels }] of Object.entries(cases)) {
+    const rules = os === 'win32' ? nodePath.win32 : nodePath.posix;
+    for (const base of [folder, ...others]) {
+      for (const rel of rels) {
+        assert.deepEqual(resolveCwd(rel, base, os), { cwd: rules.resolve(base, rel) }, `${os} ${base} + ${rel}`);
+      }
+    }
+  }
+});
+
+test('a cwd that is blank, absolute, or can\'t be placed', () => {
+  const { resolveCwd } = RemoteRules;
+  for (const blank of [undefined, null, '', ' ', '\t ']) {
+    assert.deepEqual(resolveCwd(blank, 'C:\\work', 'win32'), { cwd: 'C:\\work' }, `blank ${JSON.stringify(blank)} is the folder`);
+    assert.deepEqual(resolveCwd(blank, '', 'win32'), { cwd: '' }, 'and with no folder, the machine\'s default');
+    assert.deepEqual(resolveCwd(blank, '', 'unknown'), { cwd: '' });
+  }
+  assert.deepEqual(resolveCwd('D:\\other', 'C:\\work', 'win32'), { cwd: 'D:\\other' }, 'absolute stays as given');
+  assert.deepEqual(resolveCwd('C:/a/../b', 'C:\\work', 'win32'), { cwd: 'C:/a/../b' });
+  assert.deepEqual(resolveCwd('\\\\server\\share', 'C:\\work', 'win32'), { cwd: '\\\\server\\share' });
+  assert.deepEqual(resolveCwd('/usr/local', '/home/a', 'linux'), { cwd: '/usr/local' });
+  assert.deepEqual(resolveCwd('/usr/local', '', 'unknown'), { cwd: '/usr/local' }, 'absolute on anything');
+  assert.deepEqual(resolveCwd('  /usr/local ', '/home/a', 'linux'), { cwd: '/usr/local' }, 'as the handlers trim it');
+  for (const [what, cwd, folder, os] of [
+    ['relative with no folder', 'src', '', 'win32'],
+    ['relative with no folder', '.', '', 'darwin'],
+    ['relative on an unknown system', 'src', '/home/a', 'unknown'],
+    ['relative on no system at all', 'src', '/home/a', undefined],
+    ['a Windows path\'s drive with no root', 'C:src', 'C:\\work', 'win32'],
+    ['a home folder shorthand', '~', '/home/a', 'linux'],
+    ['a home folder shorthand', '~/x', 'C:\\work', 'win32'],
+    ['a folder that is not itself absolute', 'src', 'relative\\folder', 'win32'],
+    ['a POSIX folder on Windows rules', 'src', '/home/a', 'win32'],
+    ['a Windows folder on POSIX rules', 'src', 'C:\\work', 'linux']
+  ]) {
+    assert.match(resolveCwd(cwd, folder, os).error ?? '', /absolute path/, what);
+  }
+});
+
+test('whatWillRun reads a tool\'s arguments once, for what\'s shown and what runs', () => {
+  const { whatWillRun } = RemoteRules;
+  const at = { folder: 'C:\\work', root: 'C:\\work', os: 'win32' };
+  assert.deepEqual(whatWillRun('run_command', { command: 'echo', cwd: 'src', device: 'x' }, at), { fields: { command: 'echo', cwd: 'C:\\work\\src' } });
+  assert.deepEqual(whatWillRun('run_command', { command: 'echo' }, at), { fields: { command: 'echo', cwd: 'C:\\work' } });
+  assert.deepEqual(whatWillRun('run_command', { command: 'echo', cwd: null }, at), { fields: { command: 'echo', cwd: 'C:\\work' } }, 'null for optional is left out');
+  assert.deepEqual(whatWillRun('run_command_async', { command: 'echo', cwd: '..' }, at), { fields: { command: 'echo', cwd: 'C:\\' } });
+  assert.deepEqual(whatWillRun('run_command', { command: '' }, at), { fields: { command: '', cwd: 'C:\\work' } });
+  assert.deepEqual(whatWillRun('write_file', { path: 'a', content: '', device: 'x' }, at), { fields: { path: 'a', content: '' } });
+  assert.deepEqual(whatWillRun('apply_patch', { path: 'a', find: 'b', replace: '' }, at), { fields: { path: 'a', find: 'b', replace: '' } });
+  assert.deepEqual(whatWillRun('read_file', { path: 'a' }, at), { fields: { path: 'a' } });
+  assert.deepEqual(whatWillRun('list_dir', { path: 'a' }, at), { fields: { path: 'a' } });
+  assert.deepEqual(whatWillRun('web_search', { query: 5 }, at), { fields: { query: '5' } });
+  assert.deepEqual(whatWillRun('web_fetch', { url: 'http://x' }, at), { fields: { url: 'http://x' } });
+  assert.deepEqual(whatWillRun('glob', { pattern: '*.js' }, at), { fields: { pattern: '*.js', root: 'C:\\work' } });
+  assert.deepEqual(whatWillRun('grep', { pattern: 'x', case_insensitive: 1 }, at), { fields: { pattern: 'x', root: 'C:\\work', glob: '', case_insensitive: true } });
+  assert.deepEqual(whatWillRun('task_status', { task_id: 'a' }, at), { fields: { task_id: 'a' } });
+  assert.deepEqual(whatWillRun('task_list', {}, at), { fields: {} });
+  assert.deepEqual(whatWillRun('mcp__a__b', { any: [1] }, at), { fields: { any: [1] } }, 'anything else, as it was given');
+  assert.deepEqual(whatWillRun('mcp__a__b', null, at), { fields: {} });
+
+  const bad = [
+    ['run_command', { command: ['echo', 'x'] }], ['run_command', { command: { a: 1 } }], ['run_command', { command: 5 }],
+    ['run_command', { command: true }], ['run_command', { command: null }], ['run_command', {}],
+    ['run_command', { command: 'x', cwd: {} }], ['run_command', { command: 'x', cwd: 0 }], ['run_command', { command: 'x', cwd: false }], ['run_command', { command: 'x', cwd: ['a'] }],
+    ['run_command_async', { command: ['x'] }], ['run_command_async', { command: 'x', cwd: 1 }],
+    ['write_file', { path: 'a', content: 0 }], ['write_file', { path: 'a', content: false }], ['write_file', { path: 'a', content: { a: 1 } }],
+    ['write_file', { path: 'a', content: [1] }], ['write_file', { path: 'a', content: null }], ['write_file', { path: 'a' }], ['write_file', { path: 5, content: 'x' }],
+    ['apply_patch', { path: 'a', find: 'b', replace: 0 }], ['apply_patch', { path: 'a', find: 'b', replace: false }], ['apply_patch', { path: 'a', find: 'b', replace: null }],
+    ['apply_patch', { path: 'a', find: 'b', replace: { x: 1 } }], ['apply_patch', { path: 'a', find: 5, replace: 'b' }], ['apply_patch', { path: ['a'], find: 'b', replace: 'c' }],
+    ['read_file', { path: 5 }], ['read_file', {}], ['list_dir', { path: { a: 1 } }]
+  ];
+  for (const [tool, args] of bad) {
+    const out = whatWillRun(tool, args, at);
+    assert.match(out.error ?? '', /as text/, `${tool} ${JSON.stringify(args)}`);
+    assert.equal(out.fields, undefined);
+  }
+  assert.match(whatWillRun('run_command', { command: 'x', cwd: 'src' }, { folder: '', root: '', os: 'win32' }).error, /absolute path/);
+});
+
+test('a pop-up can go out only for a shared chat small enough to be on a laptop', () => {
+  const { askCanGoOut } = RemoteRules;
+  assert.equal(askCanGoOut({ id: 'c' }, new Set()), true);
+  assert.equal(askCanGoOut({ id: 'c' }, new Set(['d'])), true);
+  assert.equal(askCanGoOut({ id: 'c' }, new Set(['c'])), false);
+  assert.equal(askCanGoOut(null, new Set()), false);
+  assert.equal(askCanGoOut(undefined, new Set()), false);
+});
+
+test('what can\'t be seen shows as codes, and ordinary text is left alone', () => {
+  const { revealHidden } = RemoteRules;
+  assert.deepEqual(revealHidden('plain words\n\twith a tab\r\nand a Windows line'), { text: 'plain words\n\twith a tab\r\nand a Windows line', found: false });
+  assert.deepEqual(revealHidden(''), { text: '', found: false });
+  assert.deepEqual(revealHidden('caf\u00e9 \ud83d\ude00'), { text: 'caf\u00e9 \ud83d\ude00', found: false });
+  assert.deepEqual(revealHidden('notes\u202etxt.exe'), { text: 'notes\\u202Etxt.exe', found: true });
+  assert.deepEqual(revealHidden('github.com\u200b.evil.example'), { text: 'github.com\\u200B.evil.example', found: true });
+  assert.deepEqual(revealHidden('a\u0000b\u001bc\u007fd'), { text: 'a\\u0000b\\u001Bc\\u007Fd', found: true });
+  assert.deepEqual(revealHidden('a\u2028b\u2029c'), { text: 'a\\u2028b\\u2029c', found: true });
+  assert.deepEqual(revealHidden('lone\rreturn'), { text: 'lone\\u000Dreturn', found: true }, 'a return with no line after it can hide what came before');
+  assert.deepEqual(revealHidden('tag\u{e0041}'), { text: 'tag\\u{E0041}', found: true });
+});
+
+test('each hidden character is a piece of its own, so it can be shown as one', () => {
+  const { hiddenParts } = RemoteRules;
+  assert.deepEqual(hiddenParts('C:\\work\\notes\u202etxt.exe'), [{ text: 'C:\\work\\notes', code: false }, { text: '\\u202E', code: true }, { text: 'txt.exe', code: false }]);
+  assert.deepEqual(hiddenParts('\u200b\u200b'), [{ text: '\\u200B', code: true }, { text: '\\u200B', code: true }]);
+  assert.deepEqual(hiddenParts('plain\r\nlines'), [{ text: 'plain\r\nlines', code: false }]);
+  assert.deepEqual(hiddenParts(''), [{ text: '', code: false }]);
+});
+
+test('agent-audit.log keeps each long argument to its first 8 KB and its size, and each line to a limit', () => {
+  const { agentAuditLine, MAX_AGENT_AUDIT_LINE } = RemoteRules;
+  const KB8 = 8 * 1024;
+  const short = { ts: 't', tool: 'x', args: { command: 'echo', n: 5 }, ok: true };
+  assert.deepEqual(JSON.parse(agentAuditLine(short)), short, 'nothing short changes');
+
+  const plain = JSON.parse(agentAuditLine({ tool: 'write_file', args: { path: 'a', content: 'x'.repeat(2 * 1024 * 1024) } }));
+  assert.equal(plain.args.path, 'a');
+  assert.equal(plain.args.content, 'x'.repeat(KB8));
+  assert.equal(plain.args.contentBytes, 2 * 1024 * 1024);
+
+  const exact = JSON.parse(agentAuditLine({ args: { content: 'x'.repeat(KB8) } }));
+  assert.equal(exact.args.contentBytes, undefined, 'at the limit it goes whole');
+
+  const wide = JSON.parse(agentAuditLine({ args: { content: '\u20ac'.repeat(5000) } }));
+  assert.equal(wide.args.contentBytes, 15000, 'bytes, not characters');
+  assert.ok(Buffer.byteLength(wide.args.content) <= KB8);
+  assert.ok(!wide.args.content.includes('\ufffd'), 'and no character cut in half');
+
+  const nested = JSON.parse(agentAuditLine({ args: { a: { b: ['y'.repeat(KB8 + 1)] } } }));
+  assert.equal(nested.args.a.b[0].start, 'y'.repeat(KB8));
+  assert.equal(nested.args.a.b[0].bytes, KB8 + 1);
+
+  const many = {};
+  for (let i = 0; i < 100; i += 1) many[`k${i}`] = 'z'.repeat(KB8);
+  const huge = agentAuditLine({ ts: 't', chat: 'c', tool: 'mcp__a__b', status: 'x'.repeat(300000), args: many });
+  assert.ok(huge.length <= MAX_AGENT_AUDIT_LINE, `${huge.length}`);
+  const parsed = JSON.parse(huge);
+  assert.equal(parsed.tool, 'mcp__a__b');
+  assert.equal(parsed.chat, 'c');
+  assert.ok(!huge.includes('\n'));
+
+  assert.ok(!agentAuditLine({ tool: 'a\u2028b' }).includes('\u2028'), 'one line, whatever reads it');
+  assert.ok(agentAuditLine({ args: 'x'.repeat(MAX_AGENT_AUDIT_LINE * 2) }).length <= MAX_AGENT_AUDIT_LINE, 'args that are not an object too');
 });

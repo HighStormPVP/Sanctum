@@ -57,8 +57,11 @@ const readAudit = (device, file = 'remote-audit.log') => {
   }
 };
 
-const started = (device) =>
-  waitFor(`${device.name} to finish starting`, () => device.page.evaluate(() => state.order.length > 0 && Boolean(state.catalog)));
+// With the pop-up guard off, since e2e/approvals.e2e.js is where that's tested.
+const started = async (device) => {
+  await waitFor(`${device.name} to finish starting`, () => device.page.evaluate(() => state.order.length > 0 && Boolean(state.catalog)));
+  await device.page.evaluate(() => { remoteAsks.guardMs = 0; });
+};
 const isRunning = (device, id) => device.page.evaluate((chatId) => state.runningChats.has(chatId), id);
 const visible = (device, selector) => device.page.evaluate((sel) => {
   const el = document.querySelector(sel);

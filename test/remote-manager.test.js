@@ -4123,8 +4123,10 @@ test('pop-ups go out from a locked home PC, and an answer never leaves a locked 
   assert.equal(laptop.manager.send(home.id, { ...answer, type: new String('answer') }), false, 'a String object'); // eslint-disable-line no-new-wrappers
   assert.equal(laptop.manager.send(home.id, { ...answer, type: ['answer'] }), false, 'a list');
   assert.equal(laptop.manager.send(home.id, { type: 'ask', id: 'x' }), false, 'nor does a laptop ask anything of its home PC');
+  assert.equal(laptop.manager.send(home.id, { type: 'ask-unheld', id: 'ask_9' }), true, 'but it can say it couldn\'t hold one, since a locked laptop can be over its cap');
   world.relay.pump();
   assert.equal(home.frames.filter((f) => f.frame.type === 'answer').length, 1, 'nothing more reached home');
+  assert.ok(home.frames.some((f) => f.frame.type === 'ask-unheld'));
   assert.equal((await laptop.manager.unlock(PIN)).ok, true);
 
   home.manager.lock();

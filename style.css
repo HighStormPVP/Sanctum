@@ -2718,7 +2718,11 @@ button { font-family: inherit; }
 .approval-code.dim { color: var(--text-3); }
 .plan-approval-body .approval-section + .approval-section { margin-top: 12px; }
 .plan-approval-body .approval-code { max-height: none; }
-.ask-too-long { margin: 0; color: var(--text-1); font-size: 14px; line-height: 1.55; }
+.ask-not-shown { margin: 0; color: var(--text-1); font-size: 14px; line-height: 1.55; }
+.ask-hidden-note { margin: 0; color: var(--warn); font-size: 13px; line-height: 1.45; }
+.ask-code { color: var(--warn); outline: 1px solid currentColor; outline-offset: -1px; border-radius: 3px; padding: 0 2px; }
+.ask-more-lines { margin: 0; color: var(--text-3); font-size: 12px; line-height: 1.4; }
+.plan-approval-modal > .ask-hidden-note, .plan-approval-modal > .ask-more-lines { padding: 8px 24px 0; }
 
 .approval-diff {
   background: var(--bg-2);

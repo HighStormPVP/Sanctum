@@ -2866,7 +2866,7 @@ function auditLogPath() {
 
 ipcMain.handle('audit:log', (_e, entry) => {
   try {
-    fs.appendFileSync(auditLogPath(), JSON.stringify(entry) + '\n');
+    fs.appendFileSync(auditLogPath(), RemoteRules.agentAuditLine(entry) + '\n');
     return { ok: true };
   } catch (e) { return { error: e.message }; }
 });
