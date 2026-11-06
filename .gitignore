@@ -7,3 +7,6 @@ Thumbs.db
 .claude/
 .superpowers/
 .worktrees/
+relay/.wrangler
+.dev.vars
+relay/.dev.vars

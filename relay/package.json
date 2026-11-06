@@ -9,10 +9,11 @@
   },
   "scripts": {
     "test": "node --test test/",
-    "deploy": "npx wrangler@4 deploy"
+    "deploy": "wrangler deploy"
   },
   "devDependencies": {
     "miniflare": "4.20260730.0",
+    "wrangler": "4.158.0",
     "ws": "8.22.1"
   }
 }
