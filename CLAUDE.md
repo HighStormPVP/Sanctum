@@ -23,11 +23,11 @@ Three files carry almost everything:
 
 | File | Lines | Role |
 |---|---|---|
-| `renderer.js` | ~6.9K | All UI, chat loop, tool execution, state |
-| `main.js` | ~2.5K | IPC handlers, Ollama + cloud streaming, fs/shell/web |
-| `preload.js` | ~230 | contextBridge — the only renderer↔main surface |
+| `renderer.js` | ~11.2K | All UI, chat loop, tool execution, state, the Remote Control mirror |
+| `main.js` | ~3.2K | IPC handlers, Ollama + cloud streaming, fs/shell/web, Remote Control wiring |
+| `preload.js` | ~310 | contextBridge — the only renderer↔main surface |
 
-Plus `index.html` (markup), `style.css` (~3.5K lines), `models.json` (catalog), `lib/mcp-*.js` (MCP client/manager).
+Plus `index.html` (markup), `style.css` (~3.9K lines), `models.json` (catalog), `lib/mcp-*.js` (MCP client/manager), and `remote-transport.html` with its preload: the hidden, sandboxed window that holds Remote Control's WebRTC channels and only ever sees ciphertext.
 
 Rules that decide what's allowed live in `lib/`, free of Electron, so `npm test` can run them without launching the app:
 
@@ -40,8 +40,37 @@ Rules that decide what's allowed live in `lib/`, free of Electron, so `npm test`
 | `lib/cloud-params.js` | Per-model thinking, effort, fallback, and image rules |
 | `lib/text-rules.js` | Repetition guard, output line splitting, Windows argument quoting |
 | `lib/kill-tree.js` | Stops a process and everything it started |
+| `lib/window-rules.js` | What a window may offer by how the app runs: no DevTools and no debug switches in a packaged build |
+| `lib/remote-rules.js` | Remote Control's checks on hostile input: laptop actions, tool calls, devices, folders, PIN prompts, audit lines. Loaded by the renderer as `RemoteRules` |
+| `lib/chat-mirror.js` | Snapshots a shared chat and diffs it into ops for the laptop, and applies them there. Loaded by the renderer as `ChatMirror` |
 
-`npm test` runs them. The renderer's sandboxed preload can't read the disk, so anything it needs from the system comes through IPC.
+Remote Control's connection lives in `lib/remote/`, also free of Electron:
+
+| File | Job |
+|---|---|
+| `lib/remote/crypto.js` | Thin wrappers over the noble libraries: Ed25519, X25519, XChaCha20-Poly1305, HKDF, device ids |
+| `lib/remote/pake.js` | RFC 9382 SPAKE2 on P-256, the one piece of cryptography written here, checked against the RFC's vectors |
+| `lib/remote/pairing.js` | The 6-character code rules, and the exchange that turns a code into each device knowing the other's key |
+| `lib/remote/session.js` | Fresh keys per connection from the long-term keys, then encrypts and decrypts every frame |
+| `lib/remote/link.js` | Ordered, exactly-once delivery over the relay and the direct path, so a switch loses nothing |
+| `lib/remote/relay-client.js` | The WebSocket to the relay Worker, for a device's mailbox or the pairing slot |
+| `lib/remote/direct-path.js` | WebRTC data channels per device, run in the hidden window, beside the relay |
+| `lib/remote/keystore.js` | This device's identity, paired devices, PIN, and control switch, sealed with `safeStorage` |
+| `lib/remote/manager.js` | Ties those together into "these devices can talk", and decides which tool calls get past the main process |
+
+The relay Worker itself is in `relay/`, with its runbook in `relay/README.md`.
+
+### Tests
+
+```bash
+npm test                    # lib/ rules and test/*.test.js, plain Node, under a minute
+npm run test:relay          # the relay Worker in Miniflare; needs `npm ci --prefix relay` first
+node e2e/mirror.e2e.js      # one end-to-end suite
+```
+
+`npm test` doesn't run `e2e/`. Each file there is run on its own with `node`: `actions`, `approvals`, `direct`, `folders`, `mirror`, `preload-surface`, `tools`, and `ui`. They start real Electron instances on temp profiles against the relay in Miniflare and a fake Ollama, so they need `npm ci` and `npm ci --prefix relay`, and Node 22 or later. They never load a real model. `e2e/harness.js` has what they share, and `SANCTUM_REMOTE_TEST` holds test-only flags that a packaged build ignores. Never launch Electron on the default profile from a test: the single-instance lock would hand over to a Sanctum that's already running.
+
+The renderer's sandboxed preload can't read the disk, so anything it needs from the system comes through IPC.
 
 `contextIsolation: true`, `nodeIntegration: false`. Renderer touches the OS **only** through `window.api`.
 
@@ -132,17 +161,32 @@ Agentic chats are locked until a project folder is picked. `createAgenticChat()`
 
 ### Tool execution
 
-`executeToolImpl(name, args)` is the gate. Order matters:
-1. Plan Mode block (writes → error pointing at `exit_plan_mode`)
-2. `exit_plan_mode` handler (modal → flip modes on approve)
-3. Read-only enforcement
-4. No-fetch enforcement
-5. Approval modal (unless `skipAllApprovals` or command allowlist pre-approves)
-6. Actual dispatch
+`executeToolImpl(name, args, c, offeredTools)` is the gate. Order matters:
+1. Offered check (a tool this chat wasn't given is refused)
+2. Mode refusals in `modeRefusal()`: Plan Mode blocks writes with an error pointing at `exit_plan_mode`, then Read-only, then No-fetch
+3. `exit_plan_mode` handler (modal → flip modes on approve)
+4. Which machine: the `device` argument, or the chat's folder default
+5. Approval modal (unless `skipAllApprovals` or command allowlist pre-approves; the allowlist never pre-approves a call bound for a laptop). Mode refusals run again after the answer, since a mode can change on another device while a pop-up is open
+6. Actual dispatch, or `runToolOnDevice()` for a laptop
+
+**Tool execution uses `c`, never `currentChat()`.** `c` is the chat that asked for the tool, which may not be the one on screen: a chat running in the background, or one a laptop is driving. Its modes, folders, allowlists, and devices are the ones that apply. `currentChat()` anywhere in tool execution, or in anything it calls, applies another chat's rules. The same goes for actions a laptop sends home: they work on the chat the frame names.
 
 `alwaysGated` = `write_file`, `apply_patch`, `run_command`, `run_command_async`, `mcp_add_server`, `mcp_remove_server`.
 
-Everything writes to an audit log (`window.api.audit.log`).
+Everything writes to an audit log (`window.api.audit.log`). Each device also keeps `remote-audit.log` of what ran on it through Remote Control, and `remote-refusals.log` of the tool calls it refused.
+
+## Remote Control
+
+A laptop mirrors and drives chats running on a home PC, and the home model can use tools on the laptop. The design is `docs/superpowers/specs/2026-11-04-remote-control-design.md`.
+
+- **Roles.** In each pairing, one device is the home PC and the other the laptop. One install can be home to some devices and a laptop to others. The home PC holds the chats, keys, and models, and runs the chat loop. The laptop keeps no chat data on disk. A chat is shared while its `remoteControl` is on, from the message box menu. On the laptop it's `remote:<homeId>:<chatId>` with a `c.remote`, and every control on it sends an `action` home instead of changing anything locally.
+- **Off until set up.** Nothing shows and nothing connects until a service address is pasted in Settings > Devices. It holds the relay's secret, so it's never logged and never in the repo (`test/no-relay-address.test.js`).
+- **The switch.** "Let my home PC control this laptop" lives only on the laptop and is off by default. The laptop's main process enforces it (`lib/remote/manager.js`, then `admitToolCall()` in `main.js`) and never trusts home to. Turning it off ends commands in progress.
+- **The PIN.** A laptop sets a PIN of at least 6 digits when it first pairs, and it seals the Remote Control keys. It's asked at start and after 15 minutes idle. Ten wrong in a row delete the keys. A PIN-locked laptop still runs home's commands if its switch is on.
+- **Folders per device.** `c.projectFolders` and `c.pathAllowlists` are keyed by device id, beside the home PC's `projectFolder` and `pathAllowlist`. A device's folder is the default only while that device is available for tools. On a laptop, folders guide the model but aren't a security boundary: the switch and the chat's mode are.
+- **The device argument.** Tools that touch a machine gain `device`, whose enum always starts with `"home"`, once a laptop is available or the chat has a folder away from home. The system prompt names each device, its OS, and its shell. A laptop's MCP tools are renamed so they can't collide with home's. Web tools and the model stay at home. Tool cards name the device that ran each call.
+
+An installed build can't be debugged: `build/afterPack.js` turns off the RunAsNode, NODE_OPTIONS, and inspect fuses, and `main.js` exits at once if started with a remote-debugging, inspect, or js-flags switch. Debug with `npm start`.
 
 ## Shell
 

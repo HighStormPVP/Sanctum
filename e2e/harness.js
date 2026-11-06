@@ -166,7 +166,8 @@ async function launchDevice(name, { flags = 'log,no-stun', ollamaUrl, profile = 
 
 // Through the API, for tests about what comes after. e2e/ui.e2e.js does it through the
 // interface. The host's relay socket opens in the background, and "no
-// pairing waiting" doesn't count as a failed code, so asking again is fine.
+// pairing waiting" doesn't count as a failed code, so asking again is fine. The answer comes
+// back with the code that was used.
 async function pair(home, laptop, address) {
   assert.deepEqual(await home.remote('setAddress', address), { ok: true });
   assert.deepEqual(await laptop.remote('setAddress', address), { ok: true });
@@ -174,7 +175,7 @@ async function pair(home, laptop, address) {
   assert.ok(code, 'createCode gave a code');
   for (let i = 0; i < 100; i++) {
     const answer = await laptop.remote('pair', code, laptop.name, PIN);
-    if (answer.ok) return answer;
+    if (answer.ok) return { ...answer, code };
     if (!/cancelled/.test(answer.error)) assert.fail(`pairing failed: ${answer.error}`);
     await sleep(100);
   }

@@ -10,7 +10,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { pathToFileURL } = require('node:url');
 const {
-  startPair, startFakeOllama, startScriptedOllama, launchDevice, waitFor, sleep, PIN, MODEL, TITLE,
+  startPair, startRelay, startFakeOllama, startScriptedOllama, launchDevice, pair: pairDevices, waitFor, sleep, PIN, MODEL, TITLE,
   normalize, threadOf, threadsMatch, stopShowing, stopButtonsAre, secondsOn, timersAgree, newChat, openChat, submit, clickStop, remoteId, hasChat, watch, chatDataMatches, offlineMark, snapshotsSeen
 } = require('./harness.js');
 const { FIELDS } = require('../lib/chat-mirror.js');
@@ -1059,4 +1059,235 @@ test('a paired home can send anything: only the expected rendering comes of it',
   assert.equal(page.url(), appUrl, 'the window never left');
   assert.ok(!(await page.title()).includes('EVIL'));
   assert.equal(await page.evaluate(() => window.__fuzz), undefined);
+});
+
+// ---- What the relay sees ----
+
+// Stands between the devices and the relay, and keeps a copy of every message the Worker is sent
+// and every message it sends, pairing included. The path holds the secret, so only what follows
+// it is kept.
+async function startRecordingProxy(relayAddress) {
+  const WebSocket = require('ws');
+  const target = new URL(relayAddress);
+  const server = new WebSocket.WebSocketServer({ host: '127.0.0.1', port: 0, maxPayload: 16 * 1024 * 1024 });
+  await new Promise((resolve) => server.once('listening', resolve));
+  const frames = [];
+  const sockets = new Set();
+  server.on('connection', (down, req) => {
+    const route = req.url.split('/').slice(2).join('/');
+    const up = new WebSocket(`${target.protocol}//${target.host}${req.url}`, { perMessageDeflate: false });
+    const waiting = [];
+    sockets.add(up);
+    sockets.add(down);
+    const close = () => {
+      for (const ws of [up, down]) if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) ws.terminate();
+    };
+    up.on('open', () => {
+      for (const { data, isBinary } of waiting.splice(0)) up.send(data, { binary: isBinary });
+    });
+    up.on('message', (data, isBinary) => {
+      frames.push({ route, from: 'relay', bytes: Buffer.from(data) });
+      if (down.readyState === WebSocket.OPEN) down.send(data, { binary: isBinary });
+    });
+    down.on('message', (data, isBinary) => {
+      frames.push({ route, from: 'device', bytes: Buffer.from(data) });
+      if (up.readyState === WebSocket.OPEN) up.send(data, { binary: isBinary });
+      else waiting.push({ data, isBinary });
+    });
+    for (const ws of [up, down]) {
+      ws.on('close', close);
+      ws.on('error', close);
+    }
+  });
+  return {
+    address: `ws://127.0.0.1:${server.address().port}${target.pathname}`,
+    frames,
+    stop() {
+      for (const ws of sockets) ws.terminate();
+      return new Promise((resolve) => server.close(resolve));
+    }
+  };
+}
+
+// Every way a string could cross readably: as it is, escaped as JSON once or twice, in hex, and
+// in base64 or URL-safe base64 starting at any of the three byte positions. A base64 form too
+// short to tell from noise is left to the decoded search below.
+function readableForms(text) {
+  const once = JSON.stringify(text).slice(1, -1);
+  const spellings = [...new Set([text, once, JSON.stringify(once).slice(1, -1)])];
+  const forms = new Set(spellings);
+  for (const spelling of spellings) {
+    const bytes = Buffer.from(spelling, 'utf8');
+    forms.add(bytes.toString('hex'));
+    forms.add(bytes.toString('hex').toUpperCase());
+    for (let shift = 0; shift < 3; shift += 1) {
+      const encoded = Buffer.concat([Buffer.alloc(shift), bytes]).toString('base64');
+      const form = encoded.slice(shift ? 4 : 0, Math.floor((shift + bytes.length) / 3) * 4);
+      if (form.length >= 8) {
+        forms.add(form);
+        forms.add(form.replace(/\+/g, '-').replace(/\//g, '_'));
+      }
+    }
+  }
+  return [...forms];
+}
+
+// A frame as it is, and every run of base64 or hex in it decoded, wherever its bytes start.
+function viewsOf(bytes) {
+  const text = bytes.toString('latin1');
+  const views = [text];
+  for (const m of text.matchAll(/[A-Za-z0-9+/_-]{12,}={0,2}/g)) views.push(Buffer.from(m[0], 'base64').toString('latin1'));
+  for (const m of text.matchAll(/(?:[0-9a-fA-F]{2}){6,}/g)) views.push(Buffer.from(m[0], 'hex').toString('latin1'));
+  return views;
+}
+
+// Which of the needles appear in any frame, in any of those forms.
+function readableIn(frames, needles) {
+  const forms = needles.map((needle) => ({ needle, forms: readableForms(needle).map((f) => Buffer.from(f, 'utf8').toString('latin1')) }));
+  const hits = new Map();
+  for (const frame of frames) {
+    for (const view of viewsOf(frame.bytes)) {
+      for (const { needle, forms: list } of forms) {
+        if (hits.has(needle)) continue;
+        const form = list.find((f) => view.includes(f));
+        if (form) hits.set(needle, { form, route: frame.route, from: frame.from });
+      }
+    }
+  }
+  return hits;
+}
+
+const TRAFFIC_MARKER = 'TRAFFIC-MARKER-5d0c2f9e';
+const TRAFFIC_TITLE = 'TRAFFIC-TITLE-b7e4a1c2';
+
+test('the relay sees no chat, code, command, folder, or title, in any form', async (t) => {
+  const relay = await startRelay();
+  const proxy = await startRecordingProxy(relay.address);
+  const ollama = await startScriptedOllama();
+  const quiet = await startFakeOllama();
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'sanctum-e2e-traffic-'));
+  const homeDir = path.join(root, 'HOMEFOLDER-c3a9e1');
+  const laptopDir = path.join(root, 'LAPTOPFOLDER-81fd07');
+  for (const dir of [homeDir, laptopDir]) fs.mkdirSync(dir);
+  // Nothing can go direct, so everything the devices say crosses the relay.
+  const flags = 'log,no-stun,block-ice';
+  const home = await launchDevice('home', { flags, ollamaUrl: ollama.url });
+  const laptop = await launchDevice('laptop', { flags, ollamaUrl: quiet.url });
+  t.after(async () => {
+    await Promise.all([home.stop(), laptop.stop()]);
+    await proxy.stop();
+    await relay.stop();
+    await ollama.stop();
+    await quiet.stop();
+    fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+  });
+
+  // The search finds every form it claims to, before it's trusted to find none.
+  const sample = `C:\\samples\\${TRAFFIC_MARKER}`;
+  for (const needle of [TRAFFIC_MARKER, sample, 'K7M2QX']) {
+    const json = JSON.stringify({ text: needle });
+    const base64At = (shift, alphabet = 'base64') => Buffer.concat([Buffer.alloc(shift, 7), Buffer.from(json)]).toString(alphabet);
+    const encodings = [
+      json,
+      JSON.stringify({ data: json }),
+      ...[0, 1, 2].map((shift) => JSON.stringify({ t: 'link', b: base64At(shift) })),
+      ...[0, 1, 2].map((shift) => JSON.stringify({ b: base64At(shift, 'base64url') })),
+      JSON.stringify({ h: Buffer.from(json).toString('hex') }),
+      // Base64 that doesn't start where its run does, so decoding the run reads it wrongly.
+      ...(needle.length >= 9 ? [1, 2, 3].map((junk) => JSON.stringify({ b: 'Q'.repeat(junk) + base64At(0) })) : [])
+    ];
+    for (const encoded of encodings) {
+      const hits = readableIn([{ route: 'sample', from: 'device', bytes: Buffer.from(encoded) }], [needle]);
+      assert.ok(hits.has(needle), `the search misses ${needle} in ${encoded.slice(0, 80)}`);
+    }
+  }
+
+  const { code } = await pairDevices(home, laptop, proxy.address);
+  await waitFor('the session on both ends', async () => (await home.entry())?.connected && (await laptop.entry())?.connected);
+  const homeId = (await laptop.entry()).id;
+  const laptopId = (await home.entry()).id;
+  const both = { home, laptop, homeId };
+
+  const started = async (device) => {
+    await waitFor(`${device.name} to finish starting`, () => device.page.evaluate(() => state.order.length > 0 && Boolean(state.catalog)));
+    await device.page.evaluate(() => { remoteAsks.guardMs = 0; });
+  };
+  await started(home);
+  await started(laptop);
+  await waitFor('the model to show as installed', () => home.page.evaluate((m) => state.installed.has(m), MODEL));
+  await home.page.evaluate((m) => ensureModelInfo(m), MODEL);
+  assert.deepEqual(await laptop.remote('setControlAllowed', true), { ok: true });
+  await waitFor('home to hear the switch', () => home.page.evaluate((id) => remoteTools.control.get(id)?.allowed === true, laptopId), 10000);
+
+  // One session: a titled chat with a folder on each machine, a message typed on the laptop, a
+  // reply, and a command on the laptop that asks first and prints the marker.
+  const chatId = await newChat(home, {
+    modality: 'agent', title: TRAFFIC_TITLE, titleManual: true, remoteControl: true, webEnabled: false, thinkingEnabled: false,
+    planMode: false, approvalMode: true, noApproval: false, readOnly: false, noFetch: false,
+    projectFolder: homeDir, pathAllowlist: [homeDir],
+    projectFolders: { [laptopId]: laptopDir }, pathAllowlists: { [laptopId]: [laptopDir] }, maxSteps: 5
+  });
+  const rid = await watch(both, chatId);
+  await submit(laptop, `Please say ${TRAFFIC_MARKER}`);
+  const first = await ollama.next();
+  assert.ok(first.body.messages.some((m) => m.role === 'user' && m.content.includes(TRAFFIC_MARKER)), 'the laptop\'s message reached the model at home');
+  first.say(`Here it is: ${TRAFFIC_MARKER}. `);
+  first.call(['run_command', { command: `echo ${TRAFFIC_MARKER}`, device: 'laptop' }]);
+  first.finish();
+
+  await waitFor('the pop-up on the laptop', () => laptop.page.evaluate(() => {
+    const overlay = document.querySelector('#approval-overlay');
+    return !overlay.hidden && overlay.dataset.shown === 'yes';
+  }), 10000);
+  const asked = await laptop.page.evaluate(() => [...document.querySelectorAll('#approval-body .approval-code')].map((el) => el.textContent));
+  assert.deepEqual(asked, ['laptop', `echo ${TRAFFIC_MARKER}`, laptopDir], 'the pop-up shows the command and the folder');
+  await laptop.page.evaluate(() => document.querySelector('#approval-approve').click());
+
+  const second = await ollama.next();
+  const [result] = second.body.messages.filter((m) => m.role === 'tool').map((m) => JSON.parse(m.content));
+  assert.equal(result.device, 'laptop');
+  assert.equal(result.exitCode, 0, JSON.stringify(result));
+  assert.ok(JSON.stringify(result).includes(TRAFFIC_MARKER), 'the command ran on the laptop and printed the marker');
+  second.say(`Done with ${TRAFFIC_MARKER}.`);
+  second.finish();
+  await waitFor('the chat to stop', () => home.page.evaluate((id) => !state.runningChats.has(id), chatId), 15000);
+  await threadsMatch(both, 'the end of the session', `Done with ${TRAFFIC_MARKER}.`, 'te-shell');
+
+  // All of it reached the laptop, decrypted, and none of it went any way but the relay.
+  const delivered = JSON.stringify([...(await laptop.mirrorFrames()), ...(await laptop.frames())]);
+  for (const text of [TRAFFIC_MARKER, TRAFFIC_TITLE, JSON.stringify(homeDir).slice(1, -1), JSON.stringify(laptopDir).slice(1, -1)]) {
+    assert.ok(delivered.includes(text), `the laptop was sent ${text}`);
+  }
+  assert.ok((await laptop.frames()).some((f) => f.type === 'tool-call' && f.args?.command?.includes(TRAFFIC_MARKER)), 'the tool call crossed');
+  assert.ok((await laptop.frames()).some((f) => f.type === 'ask'), 'the pop-up crossed');
+  assert.equal(await laptop.page.evaluate((id) => state.chats[id].title, rid), TRAFFIC_TITLE);
+  assert.equal(await home.path(), 'relay');
+  assert.equal(await laptop.path(), 'relay');
+
+  // The recording holds the whole session, pairing too, and the search finds what the relay may
+  // see: which device is which.
+  const frames = proxy.frames.slice();
+  const bytes = frames.reduce((sum, f) => sum + f.bytes.length, 0);
+  const routes = new Set(frames.map((f) => f.route));
+  t.diagnostic(`the relay saw ${frames.length} messages, ${bytes} bytes, on ${[...routes].map((r) => r.replace(/[a-z2-7]{16}$/, '<id>')).sort().join(', ')}`);
+  for (const route of ['pair/host', 'pair/guest', `device/${homeId}`, `device/${laptopId}`]) assert.ok(routes.has(route), `the recording has ${route}`);
+  assert.ok(bytes > 10000, `the recording has ${bytes} bytes`);
+  const routing = readableIn(frames, [homeId, laptopId]);
+  assert.ok(routing.has(homeId) && routing.has(laptopId), 'the search finds the device ids the relay routes by');
+
+  const secrets = {
+    marker: TRAFFIC_MARKER,
+    'pairing code': code,
+    'pairing code in lower case': code.toLowerCase(),
+    PIN,
+    'home folder': homeDir,
+    'laptop folder': laptopDir,
+    'home folder name': path.basename(homeDir),
+    'laptop folder name': path.basename(laptopDir),
+    'chat title': TRAFFIC_TITLE,
+    command: `echo ${TRAFFIC_MARKER}`
+  };
+  const hits = readableIn(frames, Object.values(secrets));
+  const found = Object.entries(secrets).filter(([, value]) => hits.has(value)).map(([name, value]) => `${name} as ${JSON.stringify(hits.get(value).form)} in a message ${hits.get(value).from === 'relay' ? 'from' : 'to'} the relay on ${hits.get(value).route.replace(/[a-z2-7]{16}$/, '<id>')}`);
+  assert.deepEqual(found, [], `the relay could read these:\n  ${found.join('\n  ')}`);
 });
