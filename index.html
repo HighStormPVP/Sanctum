@@ -584,6 +584,19 @@
             <span class="tools-menu-switch" aria-hidden="true"><span class="tools-menu-switch-dot"></span></span>
           </button>
         </section>
+        <section class="setting-group" id="availability-wrap" hidden>
+          <h3>Keeping this PC available</h3>
+          <p class="setting-help">Your other devices can reach shared chats only while Sanctum is running here. While a chat is shared, closing the window keeps Sanctum running in the tray.</p>
+          <label class="wd-row">
+            <input type="checkbox" id="setting-start-at-login" />
+            <span class="wd-label">Start Sanctum when I log in</span>
+          </label>
+          <p class="setting-help availability-note" id="setting-start-at-login-note" hidden></p>
+          <label class="wd-row">
+            <input type="checkbox" id="setting-keep-awake" />
+            <span class="wd-label">Keep this PC awake while a chat is shared</span>
+          </label>
+        </section>
         </section>
       </div>
       </div>
@@ -638,6 +651,15 @@
         <p class="remote-dialog-text" id="remote-code-hint" hidden></p>
         <p class="remote-code-expiry" id="remote-code-expiry" hidden></p>
         <p class="remote-dialog-text" id="remote-code-message" role="status" hidden></p>
+        <div class="remote-suggest" id="remote-suggest" hidden>
+          <p class="remote-dialog-text">Your laptop can reach this PC only while Sanctum is running here. These help with that:</p>
+          <ul class="remote-suggest-list" id="remote-suggest-list"></ul>
+          <div class="remote-suggest-actions">
+            <button type="button" class="ghost-btn" id="remote-suggest-no">Not now</button>
+            <button type="button" class="approval-approve" id="remote-suggest-yes">Turn on</button>
+          </div>
+          <p class="setting-help">You can change these at any time in Settings &gt; Devices.</p>
+        </div>
       </div>
       <footer class="approval-footer">
         <button type="button" class="ghost-btn" id="remote-code-close">Cancel</button>
@@ -690,6 +712,68 @@
       <footer class="approval-footer">
         <button type="button" class="ghost-btn" id="remote-control-ask-off">Leave off</button>
         <button type="button" class="approval-approve" id="remote-control-ask-on">Turn on</button>
+      </footer>
+    </div>
+  </div>
+
+  <!-- REMOTE CONTROL: A FOLDER ON THE HOME PC, CHOSEN FROM A LAPTOP -->
+  <div class="modal-overlay" id="folder-browser-overlay" hidden>
+    <div class="modal remote-dialog folder-browser" role="dialog" aria-labelledby="fb-title">
+      <header class="modal-head">
+        <h2 id="fb-title">Choose a folder on <span id="fb-home"></span></h2>
+        <button class="modal-close" id="fb-x" type="button" aria-label="Close"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
+      </header>
+      <div class="modal-body">
+        <div class="fb-bar">
+          <button type="button" class="ghost-btn fb-up" id="fb-up">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
+            <span>Up</span>
+          </button>
+          <div class="fb-roots" id="fb-roots"></div>
+        </div>
+        <p class="fb-path" id="fb-path"></p>
+        <ul class="fb-list" id="fb-list" aria-label="Folders"></ul>
+        <p class="fb-more" id="fb-more" hidden></p>
+        <p class="remote-error" id="fb-error" role="alert"></p>
+      </div>
+      <footer class="approval-footer">
+        <button type="button" class="ghost-btn" id="fb-cancel">Cancel</button>
+        <button type="button" class="approval-approve" id="fb-choose">Use this folder</button>
+      </footer>
+    </div>
+  </div>
+
+  <!-- RUN ON A CODE BLOCK, ON A LAPTOP -->
+  <div class="modal-overlay" id="run-confirm-overlay" hidden>
+    <div class="modal approval-modal" role="dialog" aria-labelledby="run-confirm-title">
+      <header class="modal-head">
+        <div class="approval-head">
+          <div class="approval-warn">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M7 4v16l13-8z"/></svg>
+          </div>
+          <div class="approval-title-block">
+            <h2 id="run-confirm-title">Run this code on this laptop?</h2>
+            <p id="run-confirm-desc"></p>
+          </div>
+        </div>
+      </header>
+      <div class="modal-body">
+        <section class="approval-section">
+          <div class="approval-label">Machine</div>
+          <pre class="approval-code" id="run-confirm-machine"></pre>
+        </section>
+        <section class="approval-section">
+          <div class="approval-label">Folder</div>
+          <pre class="approval-code" id="run-confirm-folder"></pre>
+        </section>
+        <section class="approval-section">
+          <div class="approval-label">Code</div>
+          <pre class="approval-code" id="run-confirm-code"></pre>
+        </section>
+      </div>
+      <footer class="approval-footer">
+        <button class="ghost-btn" id="run-confirm-cancel">Cancel</button>
+        <button class="approval-approve" id="run-confirm-run">Run on this laptop</button>
       </footer>
     </div>
   </div>

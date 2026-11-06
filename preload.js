@@ -155,7 +155,8 @@ contextBridge.exposeInMainWorld('api', {
 
   fs: {
     readFile:   (p, allowlist)              => ipcRenderer.invoke('fs:read_file', p, allowlist),
-    listDir:    (p, allowlist)              => ipcRenderer.invoke('fs:list_dir', p, allowlist),
+    // options { foldersOnly, roots } is the folder browser's listing.
+    listDir:    (p, allowlist, options)     => ipcRenderer.invoke('fs:list_dir', p, allowlist, options),
     writeFile:  (p, content, allowlist)     => ipcRenderer.invoke('fs:write_file', { path: p, content, allowlist }),
     applyPatch: (p, find, replace, allowlist) => ipcRenderer.invoke('fs:apply_patch', { path: p, find, replace, allowlist }),
     glob:       (pattern, root, allowlist)  => ipcRenderer.invoke('fs:glob', { pattern, root, allowlist }),
@@ -180,6 +181,15 @@ contextBridge.exposeInMainWorld('api', {
       ipcRenderer.on('mcp:updated', wrapped);
       return () => ipcRenderer.removeListener('mcp:updated', wrapped);
     }
+  },
+
+  // Keeping this PC available while a chat is shared: the tray, keep-awake, and start at login.
+  app: {
+    setKeepAwake:     (on)      => ipcRenderer.invoke('app:setKeepAwake', on),
+    setStartAtLogin:  (on)      => ipcRenderer.invoke('app:setStartAtLogin', on),
+    getAvailabilitySettings: () => ipcRenderer.invoke('app:getAvailabilitySettings'),
+    setSharing:       (sharing) => ipcRenderer.invoke('app:setSharing', sharing),
+    answerSuggestion: ()        => ipcRenderer.invoke('app:answerSuggestion')
   },
 
   remote: {
@@ -221,8 +231,9 @@ contextBridge.exposeInMainWorld('api', {
     //   { kind: 'stdout' | 'stderr', text }
     //   { kind: 'exit', exitCode, status, done, runtimeMs }
     //   { kind: 'error', text, done }
-    runCode: async ({ lang, code }, onChunk) => {
-      const { channelId, taskId } = await ipcRenderer.invoke('shell:run_code_stream', { lang, code });
+    // cwd only from a laptop, running code from a shared chat in its folder there.
+    runCode: async ({ lang, code, cwd }, onChunk) => {
+      const { channelId, taskId } = await ipcRenderer.invoke('shell:run_code_stream', { lang, code, cwd });
       return new Promise((resolve) => {
         const handler = (_e, payload) => {
           onChunk(payload);

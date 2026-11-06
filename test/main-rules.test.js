@@ -714,3 +714,17 @@ test('stopping an MCP client that ignores its stdin closing has ended it by the 
   await new Promise((resolve) => setTimeout(resolve, 100));
   assert.equal(pidAlive(pid), false, 'it was still running when stop() settled');
 });
+
+test('a folder listing for the folder browser filters to folders before it caps, sorted, and counts the rest', () => {
+  const { folderListing } = lib('fs-rules.js');
+  const dirent = (name, dir) => ({ name, isDirectory: () => dir });
+  // 300 files first, the way a big folder can list them, then the folders.
+  const dirents = [...Array.from({ length: 300 }, (_, i) => dirent(`f${i}.txt`, false)), ...Array.from({ length: 250 }, (_, i) => dirent(`dir${String(i).padStart(3, '0')}`, true))];
+  const { names, more } = folderListing(dirents.reverse(), 200);
+  assert.equal(names.length, 200);
+  assert.equal(more, 50);
+  assert.ok(names.every((n) => n.startsWith('dir')));
+  assert.deepEqual(names, [...names].sort());
+  assert.equal(names[0], 'dir000');
+  assert.deepEqual(folderListing([dirent('b', true), dirent('a', true), dirent('z.txt', false)], 200), { names: ['a', 'b'], more: 0 });
+});

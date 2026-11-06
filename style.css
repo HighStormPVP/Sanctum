@@ -3868,3 +3868,74 @@ textarea:focus-visible, input:focus-visible { outline: none; }
 #remote-stranded-put:hover { border-color: var(--border-3); }
 #remote-stranded-discard { background: transparent; border: 0; color: var(--text-3); }
 #remote-stranded-discard:hover { color: var(--text-1); }
+
+/* Keeping this PC available. The existing checkboxes, and one quiet note under a switch that can't work here. */
+#availability-wrap .setting-help { margin-bottom: 12px; }
+#availability-wrap .availability-note { margin: -6px 0 12px 28px; font-size: 12.5px; }
+.wd-row.is-disabled { cursor: default; }
+.wd-row.is-disabled input[type="checkbox"] { cursor: default; opacity: 0.45; }
+.wd-row.is-disabled input[type="checkbox"]:hover { border-color: var(--border-3); }
+.wd-row.is-disabled .wd-label { color: var(--text-3); }
+
+/* The suggestion after pairing: part of the dialog, set off by a hairline rather than a box of its own. */
+.remote-suggest { margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--border-1); }
+.remote-suggest-list { margin: 10px 0 14px; padding-left: 18px; font-size: 14px; line-height: 1.6; color: var(--text-1); }
+.remote-suggest-actions { display: flex; justify-content: flex-end; gap: 8px; margin-bottom: 10px; }
+.remote-suggest .setting-help { font-size: 12.5px; }
+
+/* The home folder browser on a laptop. A plain list of names, the path above it, nothing clever. */
+.modal.folder-browser { width: min(560px, calc(100vw - 48px)); }
+.fb-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.fb-up { display: inline-flex; align-items: center; gap: 6px; }
+.fb-roots { display: flex; gap: 6px; flex-wrap: wrap; }
+.fb-root {
+  padding: 5px 10px;
+  background: transparent;
+  border: 1px solid var(--border-2);
+  border-radius: var(--r-sm);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-2);
+  cursor: pointer;
+}
+.fb-root:hover:not(:disabled) { border-color: var(--border-3); color: var(--text-1); }
+.fb-path {
+  margin: 14px 0 8px;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--text-1);
+  overflow-wrap: anywhere;
+}
+.fb-list {
+  list-style: none;
+  margin: 0;
+  padding: 4px;
+  max-height: 300px;
+  overflow-y: auto;
+  background: var(--bg-2);
+  border: 1px solid var(--border-1);
+  border-radius: var(--r-sm);
+}
+.fb-list[aria-busy="true"] { opacity: 0.6; }
+.fb-entry {
+  display: block;
+  width: 100%;
+  padding: 7px 10px;
+  background: transparent;
+  border: 0;
+  border-radius: var(--r-sm);
+  font-family: inherit;
+  font-size: 13.5px;
+  text-align: left;
+  color: var(--text-1);
+  overflow-wrap: anywhere;
+  cursor: pointer;
+}
+.fb-entry:hover:not(:disabled), .fb-entry:focus-visible { background: var(--surface-3); outline: none; }
+.fb-entry:disabled { color: var(--text-3); cursor: default; }
+.fb-empty { padding: 7px 10px; font-size: 13px; color: var(--text-3); }
+.fb-more { margin: 8px 0 0; font-size: 12.5px; color: var(--text-3); }
+
+/* Where a code block ran, in the output panel's footer. */
+.output-foot-machine { flex-shrink: 0; color: var(--text-2); }

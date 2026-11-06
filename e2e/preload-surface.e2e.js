@@ -20,6 +20,8 @@ const REMOTE_METHODS = [
   'send', 'setAddress', 'setControlAllowed', 'setPin', 'status', 'unlock'
 ];
 
+const APP_METHODS = ['answerSuggestion', 'getAvailabilitySettings', 'setKeepAwake', 'setSharing', 'setStartAtLogin'];
+
 test('the preload surface', async (t) => {
   const pair = await startPair();
   t.after(() => pair.stop());
@@ -28,6 +30,12 @@ test('the preload surface', async (t) => {
   await t.test('window.api.remote exposes the listed methods and nothing else', async () => {
     assert.deepEqual(await home.page.evaluate(() => Object.keys(window.api.remote).sort()), REMOTE_METHODS);
     assert.ok(await home.page.evaluate(() => Object.values(window.api.remote).every((v) => typeof v === 'function')));
+  });
+
+  // Added on purpose in Task 14: keeping this PC available while a chat is shared.
+  await t.test('window.api.app exposes the listed methods and nothing else', async () => {
+    assert.deepEqual(await home.page.evaluate(() => Object.keys(window.api.app).sort()), APP_METHODS);
+    assert.ok(await home.page.evaluate(() => Object.values(window.api.app).every((v) => typeof v === 'function')));
   });
 
   await t.test('nothing in status() holds a key, the address, or the secret', async () => {

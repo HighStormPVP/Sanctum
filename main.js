@@ -1,11 +1,11 @@
-const { app, BrowserWindow, Menu, ipcMain, dialog, protocol, net, session, shell: electronShell, safeStorage } = require('electron');
+const { app, BrowserWindow, Menu, Tray, Notification, nativeImage, powerSaveBlocker, ipcMain, dialog, protocol, net, session, shell: electronShell, safeStorage } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
 const os = require('os');
 const { exec, spawn } = require('child_process');
 const { McpManager } = require('./lib/mcp-manager');
-const { isWithinRoots, checkAgentPath, applyExactPatch } = require('./lib/fs-rules');
+const { isWithinRoots, checkAgentPath, applyExactPatch, folderListing } = require('./lib/fs-rules');
 const { safeFetchText, isAppPage } = require('./lib/url-rules');
 const { grepInWorker, globInWorker } = require('./lib/grep-runner');
 const { detectRepetitionLoop, splitOutputLines, quoteWindowsArg, encodePowerShell } = require('./lib/text-rules');
@@ -409,6 +409,7 @@ function createWindow() {
   mainWindow.setMenuBarVisibility(false);
   // Otherwise the hidden window would keep the app running with nothing to show for it.
   mainWindow.on('closed', closeRemoteTransport);
+  wireHideToTray(mainWindow);
 
   // Web links open in the user's browser, never in a window of this app. The app
   // itself only ever shows its own page.
@@ -444,11 +445,13 @@ function createWindow() {
     if (details.isMainFrame && !details.isSameDocument) {
       abortStreams();
       endRemoteRunsWithPage();
+      pageStoppedSharing();
     }
   });
   contents.once('destroyed', () => {
     abortStreams();
     endRemoteRunsWithPage();
+    pageStoppedSharing();
   });
 
   mainWindow.loadFile(path.join(__dirname, 'index.html'));
@@ -507,7 +510,9 @@ app.whenReady().then(() => {
     console.error('[remote] could not start:', e.message);
   }
 
+  loadAvailability();
   createWindow();
+  applyAvailability();
 
   mcpManager = new McpManager({
     configPath: path.join(app.getPath('userData'), 'mcp_config.json'),
@@ -540,9 +545,16 @@ async function unloadAllOllamaModels() {
 // quit, run cleanup, then quit for real. Capped so a hung Ollama or MCP
 // server can't strand the app in a permanently-unquittable state.
 let quitCleanupRan = false;
+let quitCleanupStarted = false;
 app.on('before-quit', (e) => {
+  // So closing the window can't hide it now, from the tray's Quit or anywhere else.
+  appQuitting = true;
   if (quitCleanupRan) return;        // second pass: let the quit through
   e.preventDefault();
+  // Quit asked for again, from the tray twice say, while the cleanup is under way. It quits when that's done.
+  if (quitCleanupStarted) return;
+  quitCleanupStarted = true;
+  applyAvailability();
   const debugLog = path.join(app.getPath('userData'), 'chat-debug.log');
   const dlog = (m) => { try { fs.appendFileSync(debugLog, `[${new Date().toISOString()}] ${m}\n`); } catch {} };
 
@@ -576,7 +588,8 @@ app.on('before-quit', (e) => {
 });
 
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
-app.on('activate', () => { if (!mainWindow || mainWindow.isDestroyed()) createWindow(); });
+// The Dock icon brings back a window that was hidden to the tray, as well as making one after a close.
+app.on('activate', () => { if (!mainWindow || mainWindow.isDestroyed() || !mainWindow.isVisible()) showMainWindow(); });
 
 ipcMain.handle('config:get', () => ({ ollamaUrl: OLLAMA_URL }));
 
@@ -593,6 +606,223 @@ const REMOTE_TRANSPORT_URL = 'aio-transport://app/remote-transport.html';
 //   block-ice  no candidates cross, so a data channel can never form
 //   hang-kill-at-quit  a kill that never settles while quitting
 const remoteTestFlags = new Set(app.isPackaged ? [] : String(process.env.SANCTUM_REMOTE_TEST || '').split(','));
+
+// =================== KEEPING THIS PC AVAILABLE ===================
+// A laptop can only reach shared chats while Sanctum is running here. So while a chat is shared,
+// closing the window hides it to the tray, the window keeps working at full speed while hidden, and
+// two settings can keep this PC awake and start Sanctum at login. The page says whether a chat is
+// shared, since chats live there. Page code could lie about that, and the most a lie does is keep
+// a tray icon up or let this PC sleep.
+//
+// The settings live in a file here rather than in the page, so keep-awake applies from the start.
+// Start-at-login is read back from the system each time, because that's what's in effect.
+let availability = RemoteRules.cleanAvailability(null);
+let availabilitySharing = false;
+let appQuitting = false;
+let keepAwakeBlocker = null;
+let tray = null;
+let trayComing = null;
+let trayMenu = null;
+let trayNoteDue = false;
+const STILL_RUNNING_TITLE = 'Sanctum is still running';
+const STILL_RUNNING_TEXT = 'A chat is shared, so Sanctum keeps running in the tray. Quit it from there.';
+const START_AT_LOGIN_UNPACKAGED = 'Starting when you log in works in the installed app.';
+
+// For the tests in e2e/ only. `peek` shows them what's going on here, and keeps the note off the
+// desktop. `fake-login-item` puts a stand-in where the system's login items would be, because a
+// test must never add a real one. A login item for a development run would start Electron as plain
+// Node here, since ELECTRON_RUN_AS_NODE is set for the whole machine, so outside a test an
+// unpackaged run doesn't offer the setting at all.
+const notesShown = [];
+const fakeLoginItem = { openAtLogin: false };
+const loginItems = remoteTestFlags.has('fake-login-item')
+  ? { works: true, read: () => fakeLoginItem.openAtLogin, write: (on) => { fakeLoginItem.openAtLogin = on; } }
+  : { works: app.isPackaged, read: () => app.getLoginItemSettings().openAtLogin === true, write: (on) => app.setLoginItemSettings({ openAtLogin: on }) };
+if (remoteTestFlags.has('peek')) {
+  globalThis.__sanctumAvailability = {
+    tray: () => tray !== null,
+    keepAwake: () => keepAwakeBlocker,
+    sharing: () => availabilitySharing,
+    notes: () => notesShown.slice(),
+    loginItem: () => fakeLoginItem.openAtLogin,
+    // What a person can do with the icon, which a test can't reach on the real taskbar.
+    clickTrayIcon: () => tray?.emit('click'),
+    clickTrayMenu: (label) => trayMenu?.items.find((item) => item.label === label)?.click()
+  };
+}
+
+function availabilityFile() {
+  return path.join(app.getPath('userData'), 'availability.json');
+}
+
+function loadAvailability() {
+  try {
+    availability = RemoteRules.cleanAvailability(JSON.parse(fs.readFileSync(availabilityFile(), 'utf8')));
+  } catch {
+    availability = RemoteRules.cleanAvailability(null);
+  }
+}
+
+function saveAvailability() {
+  try {
+    fs.writeFileSync(availabilityFile(), JSON.stringify(availability));
+  } catch (e) {
+    console.error('[availability] could not save:', e.message);
+  }
+}
+
+function startAtLoginNow() {
+  if (!loginItems.works) return false;
+  try { return loginItems.read(); } catch { return false; }
+}
+
+function availabilitySettings() {
+  return {
+    keepAwake: availability.keepAwake,
+    startAtLogin: startAtLoginNow(),
+    startAtLoginWorks: loginItems.works,
+    suggestionAnswered: availability.suggestionAnswered
+  };
+}
+
+function windowHidden() {
+  return !!mainWindow && !mainWindow.isDestroyed() && !mainWindow.isVisible();
+}
+
+// Brings everything here into line with the settings and with whether a chat is shared. Safe to
+// call as often as anything changes: it never starts a second blocker or a second icon.
+function applyAvailability() {
+  const awake = RemoteRules.keepAwakeWanted({ keepAwake: availability.keepAwake, sharing: availabilitySharing, quitting: appQuitting });
+  if (awake && keepAwakeBlocker === null) {
+    keepAwakeBlocker = powerSaveBlocker.start('prevent-app-suspension');
+  } else if (!awake && keepAwakeBlocker !== null) {
+    powerSaveBlocker.stop(keepAwakeBlocker);
+    keepAwakeBlocker = null;
+  }
+  if (trayWantedNow()) showTray();
+  else dropTray();
+  // A hidden or minimized window is otherwise slowed to a timer a second, and the chat loop, the
+  // mirror and laptop tools all run in it. The page can be gone before its window is, which is when
+  // it last says nothing's shared.
+  const contents = mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents : null;
+  if (contents && !contents.isDestroyed()) contents.setBackgroundThrottling(!availabilitySharing);
+}
+
+function trayWantedNow() {
+  return RemoteRules.trayWanted({ sharing: availabilitySharing, hidden: windowHidden(), quitting: appQuitting });
+}
+
+// Sanctum sets no icon of its own, so the tray shows whatever the system shows for the app.
+function showTray() {
+  if (tray || trayComing) return;
+  trayComing = app.getFileIcon(process.execPath, { size: 'small' }).catch(() => nativeImage.createEmpty()).then((icon) => {
+    trayComing = null;
+    if (tray || !trayWantedNow()) return;
+    tray = new Tray(icon);
+    tray.setToolTip('Sanctum');
+    trayMenu = Menu.buildFromTemplate([
+      { label: 'Open Sanctum', click: showMainWindow },
+      { label: 'Quit', click: () => app.quit() }
+    ]);
+    tray.setContextMenu(trayMenu);
+    tray.on('click', showMainWindow);
+    if (trayNoteDue) noteStillRunning();
+  });
+}
+
+function dropTray() {
+  if (!tray) return;
+  tray.destroy();
+  tray = null;
+  trayMenu = null;
+}
+
+function showMainWindow() {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    createWindow();
+  } else {
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.show();
+    mainWindow.focus();
+  }
+  applyAvailability();
+}
+
+// Once, the first time the window ever hides, so someone who meant to quit knows where it went.
+function noteStillRunning() {
+  if (availability.trayNoteShown === true) return;
+  if (!tray) {
+    trayNoteDue = true;
+    return;
+  }
+  trayNoteDue = false;
+  availability.trayNoteShown = true;
+  saveAvailability();
+  if (remoteTestFlags.has('peek')) {
+    notesShown.push(STILL_RUNNING_TEXT);
+  } else if (process.platform === 'win32') {
+    tray.displayBalloon({ title: STILL_RUNNING_TITLE, content: STILL_RUNNING_TEXT });
+  } else if (Notification.isSupported()) {
+    new Notification({ title: STILL_RUNNING_TITLE, body: STILL_RUNNING_TEXT }).show();
+  }
+}
+
+// Closing hides only while a chat is shared, and never while quitting. On a Mac that's the same,
+// apart from the Dock: Sanctum stays in it, as Mac apps do, and clicking it brings the window back.
+function wireHideToTray(win) {
+  win.on('close', (e) => {
+    if (!RemoteRules.closeHidesWindow({ sharing: availabilitySharing, quitting: appQuitting })) return;
+    e.preventDefault();
+    win.hide();
+    applyAvailability();
+    noteStillRunning();
+  });
+  win.on('show', applyAvailability);
+  win.on('hide', applyAvailability);
+  // Windows is shutting down or logging off, which a hidden window mustn't stand in the way of.
+  win.on('session-end', () => { appQuitting = true; });
+}
+
+ipcMain.handle('app:setSharing', (_e, sharing) => {
+  availabilitySharing = sharing === true;
+  applyAvailability();
+  return availabilitySharing;
+});
+
+// A page that's going can't say a chat is shared any more. The next one says so if it is.
+function pageStoppedSharing() {
+  if (!availabilitySharing) return;
+  availabilitySharing = false;
+  applyAvailability();
+}
+
+ipcMain.handle('app:setKeepAwake', (_e, on) => {
+  availability.keepAwake = on === true;
+  saveAvailability();
+  applyAvailability();
+  return { ok: true, settings: availabilitySettings() };
+});
+
+ipcMain.handle('app:setStartAtLogin', (_e, on) => {
+  if (!loginItems.works) return { ok: false, error: START_AT_LOGIN_UNPACKAGED, settings: availabilitySettings() };
+  try {
+    loginItems.write(on === true);
+  } catch {
+    return { ok: false, error: "Couldn't change that. Try again.", settings: availabilitySettings() };
+  }
+  availability.startAtLogin = on === true;
+  saveAvailability();
+  return { ok: true, settings: availabilitySettings() };
+});
+
+ipcMain.handle('app:getAvailabilitySettings', () => availabilitySettings());
+
+// Answered once, either way, and never asked again.
+ipcMain.handle('app:answerSuggestion', () => {
+  availability.suggestionAnswered = true;
+  saveAvailability();
+  return availabilitySettings();
+});
 
 // A renderer that has loaded a file: page can read other file: URLs, which an exploit there
 // could use on the main window's storage files whatever the CSP says. So this page comes from
@@ -2185,9 +2415,22 @@ const LANG_RUNNERS = {
   cmd:  { ext: 'bat', cmd: 'cmd', args: ['/c'] }
 };
 
-ipcMain.handle('shell:run_code_stream', async (e, { lang, code }) => {
+// cwd is where it runs, given only by a laptop running code from a shared chat, in that chat's folder
+// on the laptop. Without one it runs in the temp folder, as it always has.
+ipcMain.handle('shell:run_code_stream', async (e, { lang, code, cwd }) => {
   const channelId = `runcode_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
   const safeSend = deferredSender(e.sender, channelId);
+  const runIn = cwd === undefined || cwd === null ? os.tmpdir() : cwd;
+  let folderProblem = null;
+  try {
+    if (typeof runIn !== 'string' || !path.isAbsolute(runIn) || !fs.statSync(runIn).isDirectory()) folderProblem = 'not a folder';
+  } catch {
+    folderProblem = 'gone';
+  }
+  if (folderProblem) {
+    setImmediate(() => safeSend({ kind: 'error', text: `That folder isn't available here: ${String(runIn)}`, done: true }));
+    return { channelId };
+  }
 
   const runner = LANG_RUNNERS[(lang || '').toLowerCase()];
   if (!runner) {
@@ -2214,7 +2457,7 @@ ipcMain.handle('shell:run_code_stream', async (e, { lang, code }) => {
     const viaShell = process.platform === 'win32' && runner.cmd === 'npx';
     const cmd = runner.cmd === 'bash' && /bash/i.test(SHELL.path || '') ? SHELL.path : runner.cmd;
     proc = spawn(cmd, viaShell ? spawnArgs.map(quoteWindowsArg) : spawnArgs, {
-      cwd: os.tmpdir(),
+      cwd: runIn,
       windowsHide: true,
       shell: viaShell,
       env: { ...process.env, PYTHONUNBUFFERED: '1', PYTHONIOENCODING: 'utf-8' }
@@ -2226,7 +2469,7 @@ ipcMain.handle('shell:run_code_stream', async (e, { lang, code }) => {
   }
 
   const task = {
-    id: taskId, command: `${runner.cmd} ${spawnArgs.join(' ')}`, cwd: os.tmpdir(),
+    id: taskId, command: `${runner.cmd} ${spawnArgs.join(' ')}`, cwd: runIn,
     proc, stdout: '', stderr: '',
     status: 'running', exitCode: null,
     startedAt: Date.now(), finishedAt: null,
@@ -2809,7 +3052,20 @@ ipcMain.handle('fs:read_file', async (_e, requestedPath, allowlist) => {
   } catch (e) { return { error: e.message }; }
 });
 
-ipcMain.handle('fs:list_dir', async (_e, requestedPath, allowlist) => {
+// The places a folder browser can start from: each drive on Windows, or the root. A drive that doesn't
+// answer soon, like a mapped one that's gone, is left out rather than holding the list up.
+async function folderRoots() {
+  if (process.platform !== 'win32') return ['/'];
+  const probe = (letter) => Promise.race([
+    fs.promises.stat(`${letter}:\\`).then((st) => (st.isDirectory() ? `${letter}:\\` : null), () => null),
+    new Promise((resolve) => setTimeout(() => resolve(null), 1500))
+  ]);
+  return (await Promise.all('ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('').map(probe))).filter(Boolean);
+}
+
+// { foldersOnly } is the folder browser's listing: folders before the cap, and how many more there were.
+// { roots } adds where it can start from.
+ipcMain.handle('fs:list_dir', async (_e, requestedPath, allowlist, options) => {
   try {
     const fp = resolveSafe(requestedPath);
     if (!fp) return { error: 'path required' };
@@ -2818,6 +3074,12 @@ ipcMain.handle('fs:list_dir', async (_e, requestedPath, allowlist) => {
     if (!fs.existsSync(fp)) return { error: 'directory not found' };
     const stat = fs.statSync(fp);
     if (!stat.isDirectory()) return { error: 'not a directory' };
+    if (options?.foldersOnly === true) {
+      const { names, more } = folderListing(fs.readdirSync(fp, { withFileTypes: true }), 200);
+      const listed = { path: fp, entries: names.map(name => ({ name, kind: 'dir' })), more };
+      if (options.roots === true) listed.roots = await folderRoots();
+      return listed;
+    }
     const dirents = fs.readdirSync(fp, { withFileTypes: true }).slice(0, 200);
     const entries = dirents.map(d => {
       const full = path.join(fp, d.name);

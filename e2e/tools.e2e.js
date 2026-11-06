@@ -235,7 +235,7 @@ test('tools on a laptop', async (t) => {
     assert.ok(prompt.includes(`"${homeName}"`));
     assert.ok(prompt.includes(`"${LAPTOP}"`));
     assert.match(prompt, /Bash|Cmd/);
-    assert.ok(prompt.includes(posix(laptopDir)) || prompt.includes(laptopDir), 'each device\'s folder is listed');
+    assert.ok(prompt.includes(JSON.stringify(laptopDir)), 'each device\'s folder is listed, as a quoted path');
     assert.ok(!/nothing has run/.test(prompt), 'an offline error mid-call can follow something that did run');
     assert.match(prompt, /may have partly run/);
     first.say('Hello.');
@@ -824,7 +824,7 @@ test('tools on a laptop', async (t) => {
     assert.ok(fs.existsSync(path.join(laptopDir, 'by-default.txt')));
     assert.ok(!fs.existsSync(path.join(homeDir, 'by-default.txt')));
     const prompt = first.first.body.messages.find((m) => m.role === 'system' && m.content.includes('PROJECT FOLDER')).content;
-    assert.ok(prompt.includes(laptopDir), prompt);
+    assert.ok(prompt.includes(JSON.stringify(laptopDir)), prompt);
     assert.ok(prompt.includes(`"${LAPTOP}"`), 'it says which machine that folder is on');
 
     const outside = path.join(outsideDir, 'secret.txt');
