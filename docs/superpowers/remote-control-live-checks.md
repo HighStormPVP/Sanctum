@@ -23,9 +23,9 @@ These use a throwaway pair of device keys made for the check, not a real device'
 - [ ] **Pair a Mac on the same Wi-Fi with only the code.** Paste the address on the Windows home PC only, leaving the Mac with none, and put both on the same Wi-Fi. On the Mac, Settings > Devices shows only Connect to a home PC. Choose Add a device at home, then Connect to a home PC on the Mac and type the code and a PIN. Pass, each separately:
   - The Mac asks for Local Network permission for Sanctum. Allow it. If it never asks and nothing is found, check System Settings > Privacy & Security > Local Network.
   - Windows may ask whether to allow Sanctum through its firewall. Allow it on private networks only. Note whether it asked.
-- [ ] **A Wi-Fi that Windows marks as Public.** In Windows Settings > Network & internet, set the home PC's Wi-Fi to Public, and repeat the check above with a new code. Note what happens: the Mac should say it couldn't find a home PC on this network, and the home PC's code dialog says pairing here won't find it on a public network. Pass: it fails with that message rather than hanging, and either fix works: set the network back to Private and pair again, or paste the address on the Mac and pair through the relay.
   - Pairing works: the Mac says Looking for your home PC on this network…, then both list each other with matching fingerprints.
   - The Mac then connects from a different network: move it to a phone hotspot. It shows the home PC connected, and a shared chat works.
+- [ ] **A Wi-Fi that Windows marks as Public.** In Windows Settings > Network & internet, set the home PC's Wi-Fi to Public, and repeat the check above with a new code. Note what happens: the Mac should say it couldn't find a home PC on this network, and the home PC's code dialog says pairing here won't find it on a public network. Pass: it fails with that message rather than hanging, and either fix works: set the network back to Private and pair again, or paste the address on the Mac and pair through the relay.
 
 ## Networks
 

@@ -830,6 +830,25 @@ test('home answers at most two probes a second from one address, and ten in all'
   assert.equal(answers.get('127.0.0.7'), before + 1);
 });
 
+test('the reply limiter keeps at most ten senders however many forged addresses flood it', () => {
+  const { createReplyLimiter } = require('../lib/remote/local-pairing.js');
+  const limiter = createReplyLimiter();
+  let answered = 0;
+  const started = process.hrtime.bigint();
+  for (let i = 0; i < 50000; i++) {
+    if (limiter.mayReply(`10.${(i >> 16) & 255}.${(i >> 8) & 255}.${i & 255}`, 5000)) answered += 1;
+    assert.ok(limiter.sourcesKept <= 10, `kept ${limiter.sourcesKept} senders`);
+  }
+  const perProbeMicros = Number(process.hrtime.bigint() - started) / 1000 / 50000;
+  assert.equal(answered, 10);
+  assert.ok(perProbeMicros < 20, `${perProbeMicros.toFixed(1)} µs a probe`);
+  // One sender gets two a second, and a new second starts afresh.
+  const one = createReplyLimiter();
+  assert.deepEqual([1, 2, 3].map(() => one.mayReply('10.0.0.1', 0)), [true, true, false]);
+  assert.equal(one.mayReply('10.0.0.1', 1000), true);
+  assert.equal(one.sourcesKept, 1);
+});
+
 // ---- A second guard, from the environment ----
 
 // Run in a process of its own without the test runner's variable, so only SANCTUM_LOOPBACK_ONLY

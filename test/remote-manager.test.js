@@ -5379,6 +5379,30 @@ test('same network: if the home PC can\'t be kept, the address isn\'t saved eith
   assert.equal(world.relay.deviceConnects.length, 0);
 });
 
+test('same network: when saving the address and removing the home PC both fail, the home PC stays out and goes at the next unlock', async (t) => {
+  const world = newWorld(t);
+  const laptop = await world.device('Laptop', { address: null, local: true, failSave: true });
+  const realRemove = laptop.keystore.removePeer.bind(laptop.keystore);
+  let removeFails = true;
+  laptop.keystore.removePeer = (id) => {
+    if (removeFails) throw new Error('Could not save the device.');
+    return realRemove(id);
+  };
+  laptop.start();
+  rawLocalHost(world.local, { code: 'ABCDEF', name: 'Home', address: ADDRESS });
+  const answer = await settleWith(world, laptop.manager.pair('ABCDEF', 'Laptop'));
+  assert.deepEqual(answer, { ok: false, error: "Couldn't save the address." });
+  assert.deepEqual(laptop.manager.status().devices, []);
+  // The keystore still holds it, since removing failed, but a lock and unlock mustn't bring it back.
+  removeFails = false;
+  laptop.manager.lock();
+  assert.equal((await laptop.manager.unlock(PIN)).ok, true);
+  assert.deepEqual(laptop.manager.status().devices, [], 'the home PC stays out after unlock');
+  assert.deepEqual(laptop.keystore.listPeers(), [], 'and is removed once removing works');
+  world.run(1000);
+  assert.equal(world.relay.deviceConnects.length, 0);
+});
+
 test('same network: a sealed address has to be wss, unless a test run says it may be ws on this machine', async (t) => {
   for (const [address, accept, ok] of [
     ['ws://127.0.0.1:8787/abc', false, false],
