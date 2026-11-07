@@ -271,6 +271,13 @@ test('outside loopback is refused under the test runner, so no test can ask the 
   assert.throws(() => createLocalPairing({}), /loopback/);
 });
 
+test('right before any socket binds, a non-loopback host is refused under the test runner', () => {
+  // Every bind in the module goes through this, so a mistake in choosing the host can't reach
+  // the network either.
+  for (const host of ['0.0.0.0', '192.168.1.5', '::', '', undefined]) assert.throws(() => local.checkBindHost(host), /loopback/, String(host));
+  for (const host of ['127.0.0.1', '::1']) assert.doesNotThrow(() => local.checkBindHost(host));
+});
+
 test('a loopback listener binds both its sockets to 127.0.0.1 and nothing wider', async (t) => {
   const { listener, ports, discoveryPort } = await startListener(t);
   assert.equal(ports.udpPort, discoveryPort);
