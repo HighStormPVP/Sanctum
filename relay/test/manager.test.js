@@ -312,7 +312,13 @@ async function nearby() {
 async function listenerGone(net_, listener) {
   const ports = await listener.ready;
   assert.ok(ports, 'it had bound');
-  await waitFor('both ports to be free', async () => (await udpPortFree(ports.udpPort)) && (await tcpPortFree(ports.tcpPort)), 5000);
+  // waitFor above doesn't wait on a promise, so this has its own loop.
+  const deadline = Date.now() + 5000;
+  for (;;) {
+    if ((await udpPortFree(ports.udpPort)) && (await tcpPortFree(ports.tcpPort))) return;
+    if (Date.now() > deadline) assert.fail('the listener still holds its ports');
+    await sleep(50);
+  }
 }
 
 // Real timers, except the code's ten minutes, which a test can bring forward.
