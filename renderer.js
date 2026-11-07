@@ -3878,6 +3878,8 @@ function sameOllamaModel(a, b) {
   return norm(a) === norm(b);
 }
 
+const SLOW_START_MS = 2 * 60 * 1000;
+
 // Ollama sends nothing until the first token, and a large model can take minutes
 // to get there. This says what is happening during that silence, with a running
 // time, so a slow start doesn't look like a hang. Returns the function that ends it.
@@ -3903,8 +3905,11 @@ function trackModelStartup(c, msg, model) {
     try { loaded = await window.api.ollama.ps(); } catch {}
     checking = false;
     if (!msg.startup || !Array.isArray(loaded)) return;
+    // Reading a prompt can run very slowly at times. Past 2 minutes it says so, so a long
+    // wait reads as a slow model rather than a stuck app.
+    const slow = Date.now() - msg.startup.startedAt > SLOW_START_MS;
     msg.startup.text = loaded.some(n => sameOllamaModel(n, model))
-      ? 'Reading your message'
+      ? `Reading your message${slow ? ' — this model is slow to start right now' : ''}`
       : `Loading ${name}`;
     paint();
   };
@@ -5454,25 +5459,14 @@ ollama pull qwen2.5vl:7b
         return;
       }
       if (chunk.error) {
-        // Surface the actual provider error verbatim so the user can see WHY
-        // it failed. Ollama-specific friendlyOllamaError rewrites only apply
-        // when the failing call WAS to Ollama — running them on a cloud error
-        // produces nonsense like 'Anthropic API error. Couldn't reach
-        // Ollama.' when an Anthropic request's `fetch failed` is rewritten by
-        // the Ollama-flavoured matcher.
-        const cloudPick = findPick(effectiveModel);
-        const cloudProv = pickProvider(cloudPick);
-        const isCloudErr = cloudProv !== 'ollama';
-        const provLabel = cloudProv === 'anthropic' ? 'Anthropic' : cloudProv === 'google' ? 'Google' : cloudProv;
-        const rawErr = String(chunk.error || '');
-        if (isCloudErr) {
-          const hint = /fetch failed|ECONNREFUSED|ENETUNREACH|EAI_AGAIN/i.test(rawErr)
-            ? `\n\n_Network error — check your internet connection. If your machine is online, ${provLabel}'s API may be having a brief outage; try again in a minute._`
-            : `\n\n_Double-check your API key in **Settings → API Keys**, and confirm the model id is current._`;
-          acc = `**${provLabel} API error.** ${rawErr}${hint}`;
-        } else {
-          acc = friendlyOllamaError(chunk.error, c);
-        }
+        // Surface the actual provider error so the user can see WHY it failed. Only a call that
+        // WAS to Ollama gets Ollama's words: see lib/chat-errors.js.
+        acc = ChatErrors.chatErrorText({
+          provider: pickProvider(findPick(effectiveModel)),
+          error: chunk.error,
+          errorKind: chunk.errorKind,
+          modality: c.modality
+        });
         assistantMsg.content = acc;
         assistantMsg.thinking = false;
         aborted = true;
@@ -10993,31 +10987,6 @@ function openOutputModal({ code, lang, filename, cwd, machine = thisDeviceName()
 // ============== UTIL ==============
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
-}
-
-// Convert Ollama's terse runtime errors into actionable explanations the user
-// can act on. Falls back to the raw message for anything we don't recognise.
-function friendlyOllamaError(err, currentChat) {
-  if (!err) return '';
-  const s = String(err);
-
-  const memMatch = s.match(/requires more system memory \(([\d.]+ GiB)\) than is available \(([\d.]+ GiB)\)/i);
-  if (memMatch) {
-    const isAgent = currentChat?.modality === 'agent';
-    const smaller = isAgent ? 'Hermes 3 8B (~5 GB)' : 'Llama 3.2 3B (~2 GB)';
-    return `**Out of memory.** This model needs **${memMatch[1]}** but only **${memMatch[2]}** is available on your machine right now.\n\nTry switching to a smaller model:\n- For ${isAgent ? 'agentic' : 'general'} chats: **${smaller}**\n- Or free up memory by closing other apps / models (Ollama keeps the most recent model loaded — running \`ollama stop <other-model>\` in a terminal can help).\n\nUse the model picker in the top right of this chat.`;
-  }
-
-  const noModelMatch = s.match(/model '([^']+)' not found/i);
-  if (noModelMatch) {
-    return `Model **${noModelMatch[1]}** isn't installed. Click its row in the model picker (top right) and use the download icon to pull it.`;
-  }
-
-  if (/connect\s*ECONNREFUSED|fetch failed|ollama returned 5\d\d/i.test(s)) {
-    return `Couldn't reach Ollama. Make sure the Ollama tray app is running — the status pill in the sidebar should be green.\n\n_Underlying error: ${s}_`;
-  }
-
-  return s;
 }
 
 // Minimal markdown → safe HTML for assistant messages.

@@ -91,6 +91,10 @@ contextBridge.exposeInMainWorld('api', {
     delete: (tag) => ipcRenderer.invoke('ollama:delete', tag),
     chat: async ({ model, messages, images, tools, options }, onChunk) => {
       const { channelId } = await ipcRenderer.invoke('ollama:chat', { model, messages, images, tools, options });
+      // The channel at once, with nothing else, so Stop can end a request that hasn't sent its
+      // first chunk yet: a local model can be silent for many minutes before it does.
+      try { onChunk({ _channelId: channelId }); }
+      catch (err) { console.error('chat chunk handler failed:', err); }
       return new Promise((resolve) => {
         const handler = (_e, payload) => {
           // Surface the channelId on each chunk so the renderer can wire stop.

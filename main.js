@@ -1678,6 +1678,12 @@ const activeChatStreams = new Map();
 // caller only runs it every ~200 chars. Thresholds are deliberately high so
 // real content (a repeated code line, a divider) never trips it — 1.2K straight
 // chars of one exact repeating unit does not occur in legitimate output.
+const { ollamaFailureKind, failureLine } = require(path.join(__dirname, 'lib', 'chat-errors.js'));
+
+// A local model can take many minutes to read a long prompt before it sends anything, and can
+// go quiet for minutes mid-reply. Node's global fetch gives up after 300 s of either, which
+// ended slow replies at exactly five minutes. Electron's net.fetch has no such limit, streams
+// the body, and still ends at once on abort.
 ipcMain.handle('ollama:chat', async (evt, { model, messages, images, tools, options }) => {
   const channelId = `ollama:chat:stream:${Date.now()}:${Math.random().toString(36).slice(2)}`;
   const controller = new AbortController();
@@ -1703,18 +1709,21 @@ ipcMain.handle('ollama:chat', async (evt, { model, messages, images, tools, opti
 
   (async () => {
     dlog(`=== chat start · model=${model} msgs=${messages?.length} tools=${tools ? tools.length : 0} images=${images?.length || 0} ctx=${options?.num_ctx || '(default)'} ===`);
+    // Once Ollama has answered, a failure is a reply cut short, not Ollama missing.
+    let accepted = false;
     try {
-      const res = await fetch(`${OLLAMA_URL}/api/chat`, {
+      const res = await net.fetch(`${OLLAMA_URL}/api/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
         signal: controller.signal
       });
+      accepted = true;
       dlog(`http status=${res.status}`);
       if (!res.ok || !res.body) {
         const errText = res.body ? await res.text() : '(no body)';
         dlog(`bad response: ${errText.slice(0, 500)}`);
-        evt.sender.send(channelId, { error: `Ollama returned ${res.status}: ${errText.slice(0, 300)}`, done: true });
+        evt.sender.send(channelId, { error: `Ollama returned ${res.status}: ${errText.slice(0, 300)}`, errorKind: 'answered', done: true });
         return;
       }
       const reader = res.body.getReader();
@@ -1780,8 +1789,10 @@ ipcMain.handle('ollama:chat', async (evt, { model, messages, images, tools, opti
         dlog('exception due to abort');
         evt.sender.send(channelId, { aborted: true, done: true });
       } else {
-        dlog(`exception: ${e.message}`);
-        evt.sender.send(channelId, { error: e.message, done: true });
+        const line = failureLine(e);
+        const errorKind = ollamaFailureKind(e, { accepted });
+        dlog(`exception (${errorKind}): ${line}`);
+        evt.sender.send(channelId, { error: line, errorKind, done: true });
       }
     } finally {
       activeChatStreams.delete(channelId);

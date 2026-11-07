@@ -259,4 +259,162 @@ test('one home PC and a fake Ollama', async (t) => {
       await home.page.evaluate((list) => { for (const id of list) deleteChat(id); }, Object.values(ids));
     });
   });
+
+  // ---- Waiting on a local model ----
+
+  const plainChat = (model = MODEL) => home.page.evaluate((m) => {
+    createChat(m, 'chat', { webEnabled: false, titleManual: true });
+    return state.activeId;
+  }, model);
+  const lastReply = (id) => home.page.evaluate((chatId) => latestAssistant(state.chats[chatId])?.content ?? null, id);
+
+  await t.test('Sanctum waits for a local model however long it takes to start', async (s) => {
+    await s.test('a reply that starts after the global fetch limit, and pauses past it, still arrives', async () => {
+      // Electron's global fetch gives up after 300 s with nothing back. That's too long to wait
+      // here, so it's lowered to 1 s in this app's main process, and the fake waits 3 s.
+      const limit = await home.app.evaluate(async (_electron, url) => {
+        const key = Symbol.for('undici.globalDispatcher.1');
+        if (!globalThis[key]) await fetch(`${url}/api/tags`).then((r) => r.text());
+        const Agent = globalThis[key].constructor;
+        globalThis[key] = new Agent({ headersTimeout: 1000, bodyTimeout: 1000 });
+        // The lowered limit bites: the same kind of silent request, through the global fetch.
+        try {
+          await fetch(`${url}/api/chat`, { method: 'POST', body: JSON.stringify({ model: 'probe', messages: [] }) });
+          return 'no limit';
+        } catch (e) {
+          return e.cause?.code || e.message;
+        }
+      }, ollama.url);
+      const probe = await ollama.next();
+      assert.equal(limit, 'UND_ERR_HEADERS_TIMEOUT', 'the global fetch now gives up after 1 s');
+      probe.cut();
+
+      const id = await plainChat();
+      await send(id, 'Take your time');
+      const reply = await ollama.next();
+      await sleep(3000);
+      reply.say('Slow ');
+      await sleep(3000);
+      reply.say('but here.');
+      reply.finish();
+      await stopped(id);
+      assert.equal(await lastReply(id), 'Slow but here.');
+    });
+
+    await s.test('Stop during the silent wait ends it at once, and Ollama sees the request go', async () => {
+      const id = await plainChat();
+      await send(id, 'Never mind');
+      const reply = await ollama.next();
+      await sleep(500);
+      const pressed = Date.now();
+      await home.page.evaluate((chatId) => stopChat(chatId), id);
+      await waitFor('the fake Ollama to see the connection close', () => reply.closed, 2000);
+      await stopped(id, 2000);
+      assert.ok(Date.now() - pressed < 2000);
+      assert.equal(await lastReply(id), '_Stopped._');
+    });
+
+    await s.test('past 2 minutes the waiting line says the model is slow to start, with the seconds still counting', async () => {
+      const id = await plainChat();
+      await send(id, 'Hello?');
+      const reply = await ollama.next();
+      const status = () => textOf(home, '#thread .msg-thinking .msg-status-text');
+      await waitFor('Reading your message', async () => (await status()) === 'Reading your message', 5000);
+      await home.page.evaluate((chatId) => { latestAssistant(state.chats[chatId]).startup.startedAt -= 121000; }, id);
+      await waitFor('the slow-start words', async () => (await status()) === 'Reading your message — this model is slow to start right now', 5000);
+      assert.match(await textOf(home, '#thread .msg-thinking .msg-status-time'), /^12\ds$/);
+      reply.say('Here.');
+      reply.finish();
+      await stopped(id);
+    });
+
+    await s.test('5 and a half minutes of silence, for real', { skip: !SLOW && 'set SANCTUM_SLOW_TESTS=1 to run it' }, async () => {
+      // With Electron's own limits as they ship: nothing lowered and nothing raised.
+      await home.app.evaluate(async () => {
+        const key = Symbol.for('undici.globalDispatcher.1');
+        globalThis[key] = new (globalThis[key].constructor)();
+      });
+      const id = await plainChat();
+      const started = Date.now();
+      await send(id, 'Take five and a half minutes');
+      const reply = await ollama.next();
+      await sleep(330000);
+      assert.equal(reply.closed, false, 'still waiting');
+      reply.say('Worth the wait.');
+      reply.finish();
+      await stopped(id);
+      const waited = Math.round((Date.now() - started) / 1000);
+      console.log(`# waited ${waited} s, then the reply was: ${JSON.stringify(await lastReply(id))}`);
+      assert.equal(await lastReply(id), 'Worth the wait.');
+    });
+  });
+
+  await t.test('a failed reply says what really happened', async (s) => {
+    await s.test("nothing listening: Couldn't reach Ollama", async () => {
+      const id = await plainChat();
+      await ollama.goAway();
+      try {
+        await send(id, 'Anyone there?');
+        await stopped(id);
+      } finally {
+        await ollama.comeBack();
+      }
+      const text = await lastReply(id);
+      assert.match(text, /Couldn't reach Ollama/);
+      assert.match(text, /ERR_CONNECTION_REFUSED|ECONNREFUSED/, 'with the error underneath');
+    });
+
+    await s.test('cut off partway: says so, and not that Ollama is missing', async () => {
+      const id = await plainChat();
+      await send(id, 'Tell me a story');
+      const reply = await ollama.next();
+      reply.say('Once upon');
+      await sleep(300);
+      reply.cut();
+      await stopped(id);
+      const text = await lastReply(id);
+      assert.ok(text.includes('Ollama stopped partway through this reply.'), text);
+      assert.doesNotMatch(text, /Couldn't reach Ollama/);
+      assert.match(text, /Underlying error: .+/);
+    });
+
+    await s.test('an error status from Ollama: Ollama answered, with an error', async () => {
+      const id = await plainChat();
+      await send(id, 'Break');
+      const reply = await ollama.next();
+      reply.fail(500, 'llama runner process has terminated');
+      await stopped(id);
+      const text = await lastReply(id);
+      assert.match(text, /Ollama returned an error/);
+      assert.match(text, /llama runner process has terminated/);
+      assert.doesNotMatch(text, /Couldn't reach Ollama/);
+    });
+
+    await s.test("a cloud model that can't be reached is named, and Ollama isn't", async () => {
+      // The main process's fetch to the provider fails as an unplugged cable would, before
+      // anything leaves this machine.
+      const stubbed = await home.app.evaluate(() => {
+        const real = globalThis.fetch;
+        globalThis.fetch = (url, options) => {
+          if (/^https:\/\/(api\.anthropic\.com|generativelanguage\.googleapis\.com)\//.test(String(url))) {
+            globalThis.__cloudCalls = (globalThis.__cloudCalls || 0) + 1;
+            const cause = Object.assign(new Error('connect ECONNREFUSED 203.0.113.1:443'), { code: 'ECONNREFUSED' });
+            return Promise.reject(new TypeError('fetch failed', { cause }));
+          }
+          return real(url, options);
+        };
+        return true;
+      });
+      assert.equal(stubbed, true);
+      await home.page.evaluate(() => { state.settings.apiKeys = { ...state.settings.apiKeys, anthropic: 'not-a-real-key' }; });
+      const id = await plainChat('claude-haiku-5-5');
+      await send(id, 'Hello');
+      await stopped(id);
+      assert.equal(await home.app.evaluate(() => globalThis.__cloudCalls), 1, 'the stub took the call');
+      const text = await lastReply(id);
+      assert.match(text, /Anthropic API error/);
+      assert.doesNotMatch(text, /Ollama/);
+      await home.page.evaluate(() => { delete state.settings.apiKeys.anthropic; });
+    });
+  });
 });
