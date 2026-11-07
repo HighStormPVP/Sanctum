@@ -3592,6 +3592,9 @@ textarea:focus-visible, input:focus-visible { outline: none; }
 #thread[data-remote-offline] *::before,
 #thread[data-remote-offline] *::after { animation: none !important; }
 
+/* A home PC's chat on a laptop: nothing here can edit what home holds. */
+#thread[data-remote-chat] .code-block-action[data-cb-action="edit"] { display: none; }
+
 /* Remote Control. Amber is what's live: a shared chat, a code that still works, and the one
    moment the home model is at work on this machine. Everything else stays quiet. */
 .chat-shared-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent-1); flex-shrink: 0; }

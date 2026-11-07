@@ -377,6 +377,7 @@ function deleteChat(id) {
   if (state.chats[id]?.remote) { askHome(state.chats[id], 'delete'); return; } // it's the home PC's to delete
   if (state.runningChats.has(id)) stopChat(id);
   endAsksOfChat(id);
+  remoteSendIds.delete(id);
   delete state.chats[id];
   state.order = state.order.filter(x => x !== id);
   if (state.activeId === id) {
@@ -8560,9 +8561,10 @@ function takeDownRunConfirm() {
   if (takeDown) takeDown();
 }
 
-// A lock takes down every Run that came from a home chat, and what it printed. A chat that has gone
-// takes its own. Closing a panel stops what it was running.
+// A lock takes down every Run that came from a home chat, and what it printed, and any editor showing
+// one. A chat that has gone takes its own. Closing a panel stops what it was running.
 function takeDownRemoteRuns(which = () => true) {
+  takeDownRemoteEditors(which);
   if (remoteUi.runConfirm && which(remoteUi.runConfirmKey)) takeDownRunConfirm();
   for (const [overlay, panel] of [...remoteUi.outputs]) {
     if (!which(panel.key)) continue;
@@ -8603,6 +8605,8 @@ const REMOTE_NO_ROOM = 'An unsent message was dropped because there was no room 
 const REMOTE_FILES_STAYED = 'Its files need attaching again.';
 const REMOTE_GONE_TITLES_MAX = 200;
 const REMOTE_AWAITED_MS = 30000;
+const REMOTE_SEND_IDS_MAX = 200;
+const remoteSendIds = new Map(); // chatId -> Map of a laptop's clientId -> the answer its send got
 
 // ---- At home ----
 
@@ -8684,7 +8688,31 @@ function runRemoteAction(deviceId, frame) {
   }
 }
 
+// A laptop that heard nothing in time gives the words back, and sending the same words again carries the
+// same client id, because the first may have landed after all. So a send that took effect is remembered
+// by that id, per chat, and a repeat gets the first one's answer instead of a second run. Only in memory:
+// a repeat after this page reloads or Sanctum restarts isn't caught. A send that was refused isn't
+// remembered, so trying the same words again once the problem is fixed still works.
 function remoteSend(deviceId, c, args) {
+  const clientId = typeof args.clientId === 'string' ? args.clientId : null;
+  const earlier = clientId && remoteSendIds.get(c.id)?.get(clientId);
+  if (earlier) return earlier;
+  const answer = startRemoteSend(deviceId, c, args);
+  if (clientId && answer.ok) rememberRemoteSend(c.id, clientId, answer);
+  return answer;
+}
+
+function rememberRemoteSend(chatId, clientId, answer) {
+  let ids = remoteSendIds.get(chatId);
+  if (!ids) {
+    ids = new Map();
+    remoteSendIds.set(chatId, ids);
+  }
+  ids.set(clientId, answer);
+  while (ids.size > REMOTE_SEND_IDS_MAX) ids.delete(ids.keys().next().value);
+}
+
+function startRemoteSend(deviceId, c, args) {
   const text = args.text.trim();
   const attachments = (args.attachments || []).map(RemoteRules.cleanAttachment);
   // Sending during a reply queues it, as it does at home.
@@ -9003,17 +9031,41 @@ async function sendComposerToHome(c) {
 
   const args = { text };
   if (attachments.length) args.attachments = attachments.map(RemoteRules.cleanAttachment);
+  const clientId = sendIdFor(key, text, attachments);
+  args.clientId = clientId;
   // Attachments take time to cross a slow connection before anything can answer. A second per
   // MiB, so a message that's on its way isn't given back and sent twice.
   const mib = attachments.reduce((sum, a) => sum + (a.base64?.length || a.text?.length || 0), 0) / (1024 * 1024);
   const answer = await actionToHome(c.remote.deviceId, c.remote.chatId, 'send', args, {
     extraWaitMs: Math.ceil(mib) * 1000,
-    onLateOk: () => takeBackReturned(key, text, attachments)
+    onLateOk: () => {
+      forgetSendId(key, clientId);
+      takeBackReturned(key, text, attachments);
+    }
   });
-  if (answer.ok) return;
+  if (answer.ok) {
+    forgetSendId(key, clientId);
+    return;
+  }
+  // It may yet land. The same words sent again keep this id, so home runs them once either way.
+  if (answer.timedOut) mirror.sendIds.set(key, { id: clientId, text, attachments });
+  else forgetSendId(key, clientId);
   returnToBox(key, text, attachments);
-  // It may yet land, and pressing Send again would start a second run, so this can't say it didn't.
   remoteToast(answer.timedOut ? `${answer.error} Your message may still arrive.` : `Your message wasn't sent. ${answer.error}`);
+}
+
+// A new id when the words leave the box, unless they're exactly what came back after no answer, with the
+// same files: then they're the same message, sent again. Anything edited is a new one.
+function sendIdFor(key, text, attachments) {
+  const kept = mirror.sendIds.get(key);
+  mirror.sendIds.delete(key);
+  const same = kept && kept.text === text && kept.attachments.length === attachments.length
+    && kept.attachments.every((a, i) => a === attachments[i]);
+  return same ? kept.id : crypto.randomUUID();
+}
+
+function forgetSendId(key, clientId) {
+  if (mirror.sendIds.get(key)?.id === clientId) mirror.sendIds.delete(key);
 }
 
 // The answer came after all, and the text had already been given back. It's removed only while
@@ -9321,6 +9373,7 @@ const mirror = {
   // Acting.
   actions: new Map(),        // id -> { deviceId, resolve, timer }, waiting for an answer
   lateActions: new Map(),    // id -> { deviceId, onLateOk, timer }, timed out but may still be answered
+  sendIds: new Map(),        // chat key -> { id, text, attachments }, words given back after no answer. Never saved.
   returnedSeen: new Set(),   // ids of queued-returned frames already put back in the box
   awaited: null,             // { key, clickedOn, until }, a chat made here, to open when it gets here
   folderTurns: new Map()     // chatId -> the latest set-folder to arrive, so a slow check can't undo a later one
@@ -9374,10 +9427,10 @@ function mirrorOnStatus(status) {
 
 // A device that has gone from the list for good keeps no folder in any chat, so a removed laptop's old
 // folder doesn't turn every call into a "no longer paired" error. Only a list that can be trusted to be
-// whole counts: Remote Control on, unlocked, with its storage, and the same for the list before it. A
-// locked or switched-off status lists nobody, and that isn't everybody being removed.
+// whole counts: Remote Control on, unlocked, with its storage, not shut down, and the same for the list
+// before it. A locked, switched-off or stopped status lists nobody, and that isn't everybody being removed.
 function dropRemovedDevicesFolders(status) {
-  const whole = status?.enabled === true && status.locked !== true && status.storageAvailable !== false && Array.isArray(status.devices);
+  const whole = status?.enabled === true && status.stopped !== true && status.locked !== true && status.storageAvailable !== false && Array.isArray(status.devices);
   const known = whole ? new Set(status.devices.map((d) => d.id)) : null;
   const before = remoteUi.wholeDevices;
   remoteUi.wholeDevices = known;
@@ -10209,6 +10262,7 @@ function discardHeldByLock() {
   discardHeldAsks();
   mirror.heldForGone.clear();
   mirror.goneTitles.clear();
+  mirror.sendIds.clear();
   mirror.toastsForUnlock.length = 0;
   mirror.noRoomSaid = false;
   mirror.awaited = null;
@@ -10241,6 +10295,8 @@ function paintRemoteOffline() {
   const c = currentChat();
   if (c?.remote && !mirror.homes.get(c.remote.deviceId)?.connected) list.setAttribute('data-remote-offline', '1');
   else list.removeAttribute('data-remote-offline');
+  // A home chat's code blocks have no Edit here, since there's no action that edits one.
+  list.toggleAttribute('data-remote-chat', !!c?.remote);
   paintRemoteComposer();
 }
 
@@ -10431,12 +10487,16 @@ function wireCodeBlockActions() {
       document.body.appendChild(a); a.click(); a.remove();
       setTimeout(() => URL.revokeObjectURL(url), 1000);
     } else if (action === 'edit') {
+      // The chat this block is in, which Save writes to whatever is on screen by then. A home chat
+      // on a laptop can't be edited from here: there's no action for it, so the button is hidden.
+      const c = currentChat();
+      if (!c || c.remote) return;
       openEditModal({
         code: content,
         lang: btn.dataset.cbLang || '',
         filename: btn.dataset.cbFilename || 'snippet.txt',
         originalCode: content,
-        sourceButton: btn
+        chatId: c.id
       });
     } else if (action === 'output') {
       const run = { code: content, lang: btn.dataset.cbLang || '', filename: btn.dataset.cbFilename || 'snippet.txt' };
@@ -10454,7 +10514,21 @@ function wireCodeBlockActions() {
 // chat message's content so future renders + downloads reflect the edit.
 // On close with unsaved changes, shows an inline Save / Discard / Cancel
 // confirm dialog.
-function openEditModal({ code, lang, filename, originalCode }) {
+//
+// Each editor saves into the chat it was opened from, by id. One showing a home PC's chat on a laptop
+// can't save, and goes with a lock or with its chat, because what it shows is that home's.
+const openEditors = new Set(); // { chatId, remote, takeDown }
+
+function takeDownRemoteEditors(which = () => true) {
+  for (const editor of [...openEditors]) {
+    if (editor.remote && which(editor.chatId)) editor.takeDown();
+  }
+}
+
+function openEditModal({ code, lang, filename, originalCode, chatId }) {
+  const chat = state.chats[chatId];
+  if (!chat) return;
+  if (chat.remote && remoteChatsHidden()) return;
   // Build modal DOM
   const overlay = document.createElement('div');
   overlay.className = 'modal-overlay editor-overlay';
@@ -10548,17 +10622,32 @@ function openEditModal({ code, lang, filename, originalCode }) {
     gutter.scrollTop = textarea.scrollTop;
   });
 
+  let closed = false;
   const close = () => {
+    closed = true;
+    openEditors.delete(editor);
     overlay.classList.add('is-closing');
     setTimeout(() => overlay.remove(), 160);
     document.removeEventListener('keydown', onEsc);
   };
+  // At once, with no question about unsaved changes, and taking the words with it.
+  const editor = {
+    chatId,
+    remote: !!chat.remote,
+    takeDown: () => {
+      close();
+      overlay.remove();
+      textarea.value = '';
+      gutter.textContent = '';
+    }
+  };
+  openEditors.add(editor);
 
   const doSave = () => {
-    if (saving) return;
+    if (saving || closed) return;
     saving = true;
     const newCode = textarea.value;
-    const ok = replaceCodeBlockInChat(originalCode, newCode);
+    const ok = replaceCodeBlockInChat(chatId, originalCode, newCode);
     saving = false;
     if (!ok) {
       footInfo.textContent = 'Save failed — couldn\'t find original block in message';
@@ -10630,9 +10719,10 @@ function openEditModal({ code, lang, filename, originalCode }) {
 
 // Finds the chat-message that contains `originalCode` as a fenced code block
 // and rewrites just that block. Returns true on success. Searches every
-// message of the current chat so position-independent.
-function replaceCodeBlockInChat(originalCode, newCode) {
-  const c = currentChat();
+// message of the chat the editor came from, which may not be the one on screen
+// by now, so position-independent.
+function replaceCodeBlockInChat(chatId, originalCode, newCode) {
+  const c = Object.hasOwn(state.chats, chatId) ? state.chats[chatId] : null;
   if (!c || c.remote) return false;
   const orig = originalCode.replace(/\n$/, '');
   const replacement = newCode.replace(/\n$/, '');
@@ -10660,7 +10750,7 @@ function replaceCodeBlockInChat(originalCode, newCode) {
     if (found) {
       m.content = newContent;
       saveToStorage();
-      renderActiveChat();
+      if (currentChat() === c) renderActiveChat();
       return true;
     }
   }
@@ -11008,7 +11098,9 @@ function renderMarkdown(text) {
   src = src.replace(/(^|[^\w])__([^_\n]+?)__(?=[^\w]|$)/g, '$1<strong>$2</strong>');
   src = src.replace(/(^|[^*])\*([^*\n]+?)\*(?!\*)/g, '$1<em>$2</em>');
   src = src.replace(/(^|[^\w])_([^_\n]+?)_(?=[^\w]|$)/g, '$1<em>$2</em>');
-  src = src.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (m, txt, url) => {
+  // Bounded, so a long run of brackets can't make this try every pair: the text and address are
+  // measured after escaping.
+  src = src.replace(/\[([^\]\n]{1,400})\]\(([^)\s]{1,2000})\)/g, (m, txt, url) => {
     if (!/^https?:\/\//.test(url)) return m;
     return `<a href="${url.replace(/"/g, '&quot;')}" target="_blank" rel="noopener noreferrer">${txt}</a>`;
   });

@@ -48,6 +48,20 @@ test('every listed kind, with the right arguments, is allowed', () => {
   assert.deepEqual([...kinds].sort(), ['delete', 'list-dir', 'new-chat', 'rename', 'send', 'set-folder', 'set-mode', 'set-model', 'set-toggle', 'stop']);
 });
 
+// The id a laptop gives the words when they leave its box, and keeps for sending the same words again.
+test('a send may carry a client message id, and only a UUID is one', () => {
+  const id = '3f2b8c1e-9a4d-4e6f-8b2a-1c3d5e7f9a0b';
+  assert.equal(isAllowedAction(action('send', { text: 'hello', clientId: id })), true);
+  assert.equal(isAllowedAction(action('send', { text: 'hello', clientId: require('node:crypto').randomUUID() })), true);
+  for (const forged of ['', 'a1', 'not-a-uuid', id.toUpperCase(), `${id} `, ` ${id}`, `${id}0`, id.slice(1), id.replace(/-/g, ''), '3f2b8c1e-9a4d-4e6f-8b2a-1c3d5e7f9a0g',
+    '3f2b8c1e_9a4d_4e6f_8b2a_1c3d5e7f9a0b', `${id}\n`, 7, null, true, {}, [id], { id }]) {
+    assert.equal(isAllowedAction(action('send', { text: 'hello', clientId: forged })), false, JSON.stringify(forged));
+  }
+  assert.equal(isAllowedAction(action('stop', { clientId: id })), false, 'only on a send');
+  assert.equal(isAllowedAction(action('rename', { title: 't', clientId: id })), false);
+  assert.equal(isAllowedAction({ ...action('send', { text: 'hello' }), clientId: id }), false, 'in the arguments, not beside them');
+});
+
 test('kinds that are not listed are refused', () => {
   for (const kind of ['read-api-keys', 'set-pin', 'pair', 'removeDevice', 'set-control', 'setControlAllowed', 'settings', 'read-file', 'run', 'constructor', '__proto__', 'toString', 'SEND', '', 7, null, undefined, {}, ['send']]) {
     assert.equal(isAllowedAction({ type: 'action', id: 'a1', chatId: 'c_1', kind }), false, String(kind));
@@ -404,7 +418,7 @@ test('what a PIN attempt came to is said plainly', () => {
 // ---- Tools on a laptop ----
 
 const {
-  HOME_DEVICE, LOCAL_ONLY_TOOLS, MAX_TOOL_FRAME_BYTES, availableDevices, namedDevices, resolveDevice, addDeviceArgument, mcpToolName,
+  HOME_DEVICE, LOCAL_ONLY_TOOLS, MAX_TOOL_FRAME_BYTES, availableDevices, namedDevices, resolveDevice, addDeviceArgument, deviceArgumentNames, mcpToolName,
   routesToDevice, checkToolCall, cleanToolResult, cleanControlState, outgoingMcpTools, laptopToolDefs, auditArgs, auditLine, overToolLimit
 } = RemoteRules;
 
@@ -518,6 +532,14 @@ test('resolveDevice: an unknown name is an error, and never falls back to home',
   }
   assert.deepEqual(resolveDevice('Desk ', {}, DEVICES), { deviceId: HOME_DEVICE }, 'space around a name means nothing');
   for (const value of [7, true, {}, [], ['Desk']]) assert.ok(resolveDevice(value, {}, DEVICES).error, JSON.stringify(value));
+});
+
+test('resolveDevice: an unknown name lists "home" first, then the laptops, as the schema offers them', () => {
+  assert.equal(resolveDevice('Nope', {}, DEVICES).error, 'There\'s no device called "Nope". The devices are: "home", "MacBook", "Air".');
+  const offered = addDeviceArgument({ type: 'function', function: { name: 'run_command', parameters: { type: 'object', properties: {} } } }, deviceArgumentNames(DEVICES, {}));
+  const listed = [...resolveDevice('Nope', {}, DEVICES).error.matchAll(/"([^"]+)"/g)].slice(1).map((m) => m[1]);
+  assert.deepEqual(listed, offered.function.parameters.properties.device.enum, 'only what the schema offers, in its order');
+  assert.equal(resolveDevice('Nope', {}, DEVICES.slice(0, 1)).error, 'There\'s no device called "Nope". The devices are: "home".');
 });
 
 test("resolveDevice: a chat whose only folders are on devices that aren't available is an error naming one, never home", () => {
@@ -1585,6 +1607,35 @@ test('closing hides only while a chat is shared and Sanctum is not quitting, and
   // A laptop can unshare the last chat while the window is hidden, and the home PC has to stay reachable.
   assert.equal(RemoteRules.trayWanted({ sharing: false, hidden: true, quitting: false }), true);
   assert.equal(RemoteRules.trayWanted({ sharing: true, hidden: true, quitting: true }), false);
+});
+
+test('closing hides while this PC is home to a paired laptop, shared chat or not, and never while quitting', () => {
+  assert.equal(RemoteRules.closeHidesWindow({ sharing: false, servingLaptop: true, quitting: false }), true);
+  assert.equal(RemoteRules.closeHidesWindow({ sharing: false, servingLaptop: false, quitting: false }), false);
+  assert.equal(RemoteRules.closeHidesWindow({ sharing: false, servingLaptop: true, quitting: true }), false);
+  assert.equal(RemoteRules.closeHidesWindow({ sharing: false, servingLaptop: 'yes' }), false, 'only real true counts');
+});
+
+test('a PC serves a laptop while Remote Control is on and a laptop is paired with it as home', () => {
+  const on = { enabled: true, stopped: false, devices: [{ id: 'L', role: 'laptop', connected: false }] };
+  assert.equal(RemoteRules.servesLaptop(on), true, 'connected or not');
+  assert.equal(RemoteRules.servesLaptop({ ...on, devices: [{ id: 'H', role: 'home', connected: true }] }), false, 'a home of its own is not a laptop it serves');
+  assert.equal(RemoteRules.servesLaptop({ ...on, devices: [] }), false);
+  assert.equal(RemoteRules.servesLaptop({ ...on, enabled: false }), false, 'Remote Control off');
+  assert.equal(RemoteRules.servesLaptop({ ...on, stopped: true }), false, 'shut down');
+  for (const status of [null, undefined, {}, { enabled: true }, { enabled: true, devices: 'laptop' }]) assert.equal(RemoteRules.servesLaptop(status), false, JSON.stringify(status));
+});
+
+test("an action that reaches a home with no window is refused at once, naming that PC, in the shape the laptop reads", () => {
+  assert.deepEqual(RemoteRules.windowClosedRefusal({ type: 'action', id: 'a_1', kind: 'new-chat' }, 'DESK'), {
+    type: 'action-result', id: 'a_1', ok: false, error: "Sanctum's window is closed on DESK. Open it there, or wait for it to start."
+  });
+  assert.equal(RemoteRules.windowClosedRefusal({ type: 'action', id: 'a_1', kind: 'send' }, '').error, "Sanctum's window is closed on the home PC. Open it there, or wait for it to start.");
+  assert.equal(RemoteRules.windowClosedRefusal({ type: 'action', id: 'a_1', kind: 'send' }, 'A‮evil\nname').error.includes('\n'), false, 'a name is one clean line');
+  // Nothing to answer: not an action, or no id an answer could carry.
+  for (const frame of [null, {}, { type: 'mirror-ops', id: 'a_1' }, { type: 'action' }, { type: 'action', id: 'bad id!' }, { type: 'action-result', id: 'a_1' }]) {
+    assert.equal(RemoteRules.windowClosedRefusal(frame, 'DESK'), null, JSON.stringify(frame));
+  }
 });
 
 test('pairing offers only what is off and can be turned on, and nothing once answered', () => {

@@ -138,3 +138,32 @@ test('after flipping, afterPack reads the fuses back and stops the build if any 
   const lineStart = source.lastIndexOf('\n', read);
   assert.match(source.slice(lineStart, read + 300), /fusesLeftOn\(await getCurrentFuseWire\(binary\)\);\s*if \(stillOn\.length\) throw new Error/, 'a fuse left on stops the build');
 });
+
+test("Sanctum's own page is granted writing to the clipboard, and nothing else is granted to anything", () => {
+  const { permissionAllowed, APP_PAGE_PERMISSIONS } = require(path.join(__dirname, '..', 'lib', 'window-rules.js'));
+  assert.deepEqual([...APP_PAGE_PERMISSIONS], ['clipboard-sanitized-write'], 'Copy on a code block, and that is all');
+  assert.equal(permissionAllowed('clipboard-sanitized-write', true), true);
+  // Not to a preview, or to any page but the app's own.
+  assert.equal(permissionAllowed('clipboard-sanitized-write', false), false);
+  for (const permission of ['media', 'clipboard-read', 'notifications', 'geolocation', 'fullscreen', 'openExternal', 'pointerLock', 'keyboardLock',
+    'midi', 'midiSysex', 'display-capture', 'mediaKeySystem', 'idle-detection', 'window-management', 'fileSystem', 'hid', 'serial', 'usb', 'unknown', '', undefined, null, {}]) {
+    assert.equal(permissionAllowed(permission, true), false, String(permission));
+    assert.equal(permissionAllowed(permission, false), false, String(permission));
+  }
+  assert.equal(permissionAllowed('clipboard-sanitized-write', 'yes'), false, 'only a real true counts');
+});
+
+test('main.js puts a refusing handler on the hidden window\'s session, and the rule on the main one, before any window', () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
+  const guard = source.indexOf('function guardPermissions()');
+  assert.ok(guard > 0);
+  const body = source.slice(guard, source.indexOf('\n}\n', guard));
+  assert.match(body, /fromPartition\(REMOTE_TRANSPORT_PARTITION\)/);
+  assert.match(body, /setPermissionRequestHandler\(\(_w, _p, cb\) => cb\(false\)\)/);
+  assert.match(body, /setPermissionCheckHandler\(\(\) => false\)/);
+  assert.match(body, /session\.defaultSession\.setPermissionRequestHandler\(/);
+  assert.match(body, /session\.defaultSession\.setPermissionCheckHandler\(/);
+  const ready = source.indexOf('app.whenReady().then(');
+  const called = source.indexOf('guardPermissions();', ready);
+  assert.ok(called > ready && called < source.indexOf('createWindow();', ready), 'called once ready, before the window');
+});

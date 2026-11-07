@@ -14,7 +14,8 @@ const path = require('node:path');
 const { _electron: electron } = require('playwright-core');
 
 const ROOT = path.join(__dirname, '..');
-const ELECTRON = path.join(ROOT, 'node_modules', 'electron', 'dist', process.platform === 'win32' ? 'electron.exe' : 'electron');
+// Under plain Node the electron package is the path to its binary, which on a Mac is inside Electron.app.
+const ELECTRON = require('electron');
 const SECRET = 'test-secret-not-a-real-one-0123456789';
 const PIN = '123456';
 const TRANSPORT_PAGE = 'remote-transport.html';
@@ -451,6 +452,6 @@ const offlineMark = (device) => device.page.evaluate(() => document.querySelecto
 const snapshotsSeen = async (device) => (await device.mirrorFrames()).filter((f) => f.type === 'mirror-snapshot').length;
 
 module.exports = {
-  startPair, startRelay, startFakeOllama, startScriptedOllama, startThrottledProxy, launchDevice, pair, waitFor, sleep, PIN, SECRET, TRANSPORT_PAGE, MODEL, TITLE,
+  ELECTRON, startPair, startRelay, startFakeOllama, startScriptedOllama, startThrottledProxy, launchDevice, pair, waitFor, sleep, PIN, SECRET, TRANSPORT_PAGE, MODEL, TITLE,
   normalize, threadOf, threadsMatch, stopShowing, stopButtonsAre, secondsOn, timersAgree, newChat, openChat, submit, clickStop, remoteId, hasChat, watch, sorted, chatDataMatches, offlineMark, snapshotsSeen
 };

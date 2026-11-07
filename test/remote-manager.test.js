@@ -2296,6 +2296,20 @@ test('shutdown closes everything and leaves no timers behind', async (t) => {
   assert.ok(world.relay.pairConnects.every((client) => client.closed));
 });
 
+// The page asks for status while quitting, and an empty list that reads as whole would mean every
+// laptop had been removed.
+test('status after shutdown says it has stopped, not that nobody is paired', async (t) => {
+  const { home, laptop } = await connected(t);
+  assert.equal(home.manager.status().devices.length, 1);
+  home.manager.shutdown();
+  const after = home.manager.status();
+  assert.equal(after.stopped, true);
+  assert.equal(after.enabled, false, 'nothing reads it as Remote Control on');
+  assert.deepEqual(after.devices, []);
+  assert.equal(laptop.manager.status().stopped, false, 'one still running says so');
+  assert.equal(laptop.manager.status().enabled, true);
+});
+
 // ---- A device with nobody there to type a PIN ----
 
 test('the first code on a device with no PIN makes a sealed secret, and it shows nowhere', async (t) => {

@@ -1459,3 +1459,34 @@ test('tools on a laptop', async (t) => {
     await endsSoon(pid, 'the task to end, now that nothing can ask about it');
   });
 });
+
+// Nothing to do with a laptop: a command the home PC's own model or a code block started here. Quitting
+// ends it the way it ends what a home PC started on a laptop.
+test("a command running here when Sanctum quits is ended with it", async (t) => {
+  const ollama = await startScriptedOllama();
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'sanctum-e2e-quit-'));
+  const pids = new Set();
+  const device = await launchDevice('quitter', { ollamaUrl: ollama.url });
+  t.after(async () => {
+    await device.stop();
+    await ollama.stop();
+    for (const pid of pids) if (isAlive(pid)) process.kill(pid);
+    fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+  });
+  await started(device);
+  const pidFile = path.join(root, 'local.pid');
+  const answer = device.page.evaluate(([command, cwd]) => window.api.shell.run(command, cwd), [spinner(pidFile), root]).catch(() => null);
+  const pid = await waitFor('the command to start', () => {
+    try {
+      return Number(fs.readFileSync(pidFile, 'utf8')) || null;
+    } catch {
+      return null;
+    }
+  }, 15000);
+  pids.add(pid);
+  assert.ok(isAlive(pid));
+  device.app.evaluate(({ app }) => app.quit()).catch(() => {});
+  await waitFor('it to quit', () => device.exited, 15000);
+  await answer;
+  assert.equal(isAlive(pid), false, 'the command outlived the app');
+});

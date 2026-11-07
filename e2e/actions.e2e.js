@@ -845,6 +845,62 @@ test('acting from a laptop', async (t) => {
     assert.equal(kept, false);
   });
 
+  await t.test('words sent again after no answer keep their id and run once, and edited words get a new id and run too', async (s) => {
+    const id = await shared({ title: 'Twice' });
+    await openChat(home, id);
+    await openOn(laptop, id);
+    const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+    const sends = async () => (await home.frames()).filter((f) => f.type === 'action' && f.kind === 'send' && f.chatId === id);
+    const answered = (actionId) => home.page.evaluate((aid) => window.__answered.has(aid), actionId);
+    // Each frame is looked at only after the laptop has given up waiting, as on a link that stalls.
+    await home.page.evaluate(() => {
+      window.__answered = new Set();
+      window.__realHandle = window.handleRemoteAction;
+      window.handleRemoteAction = (d, frame) => setTimeout(() => { window.__realHandle(d, frame); window.__answered.add(frame.id); }, 16500);
+    });
+    // Put back however this ends, so the tests after it get answers on time.
+    s.after(() => home.page.evaluate(() => { if (window.__realHandle) window.handleRemoteAction = window.__realHandle; }).catch(() => {}));
+    const userTurns = () => home.page.evaluate((chatId) => state.chats[chatId].messages.filter((m) => m.role === 'user').map((m) => m.content), id);
+
+    // The same words, sent again as they came back: one id, and one run.
+    await submit(laptop, 'Only once');
+    await waitFor('the text back in the box', async () => (await box(laptop)) === 'Only once', 16000);
+    await submit(laptop, 'Only once');
+    await waitFor('both sends at home', async () => (await sends()).length === 2, 5000);
+    const [a, b] = await sends();
+    assert.match(a.args.clientId, UUID);
+    assert.equal(b.args.clientId, a.args.clientId, 'sent again, so the same id');
+    assert.notEqual(b.id, a.id, 'as another action');
+    const first = await ollama.next();
+    assert.equal(first.body.messages.at(-1).content, 'Only once');
+    await waitFor('the repeat to be answered', () => answered(b.id), 20000);
+    await sleep(500);
+    assert.equal(ollama.poll(), null, 'no second run');
+    assert.deepEqual(await userTurns(), ['Only once']);
+    assert.equal(await box(laptop), '', 'and nothing comes back to the box');
+    first.finish();
+    await waitFor('the run to end', async () => !(await isRunning(home, id)), 5000);
+
+    // Edited before going again: a new id, so both run.
+    await submit(laptop, 'Edit me');
+    await waitFor('the text back in the box', async () => (await box(laptop)) === 'Edit me', 16000);
+    await submit(laptop, 'Edit me, edited');
+    await waitFor('both sends at home', async () => (await sends()).length === 4, 5000);
+    const [, , c, d] = await sends();
+    assert.match(d.args.clientId, UUID);
+    assert.notEqual(d.args.clientId, c.args.clientId, 'edited, so a new id');
+    const second = await ollama.next();
+    assert.equal(second.body.messages.at(-1).content, 'Edit me');
+    await waitFor('the edited words to be answered', () => answered(d.id), 20000);
+    second.finish();
+    const third = await ollama.next();
+    assert.equal(third.body.messages.at(-1).content, 'Edit me, edited');
+    third.finish();
+    await waitFor('the run to end', async () => !(await isRunning(home, id)), 5000);
+    assert.deepEqual(await userTurns(), ['Only once', 'Edit me', 'Edit me, edited']);
+    await home.page.evaluate(() => { window.handleRemoteAction = window.__realHandle; });
+  });
+
   await t.test('the home PC keeps a record of what a laptop did, and never what it said', async () => {
     const auditFile = await home.page.evaluate(() => window.api.audit.path());
     const entries = () => fs.readFileSync(auditFile, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line));

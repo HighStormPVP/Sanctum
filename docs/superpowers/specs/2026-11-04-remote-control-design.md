@@ -125,7 +125,7 @@ How it works:
 
 **Keeping the home PC available (Call)**
 
-- Sanctum has to be running at home. While a chat is shared, closing the window keeps Sanctum running in the system tray instead of quitting.
+- Sanctum has to be running at home. While a chat is shared, or a laptop is paired with this PC as its home, closing the window keeps Sanctum running in the system tray instead of quitting.
 - Settings offers "Start Sanctum when I log in" and "Keep this PC awake while a chat is shared". Both are off until chosen, and pairing suggests them.
 
 ## How the mirror works
@@ -242,7 +242,7 @@ By hand, before release: two real machines on different networks, including one 
 4. The laptop stores no chat data on disk.
 5. The laptop can create and delete shared chats at home.
 6. Commands choose a machine with a `device` argument, defaulting to wherever the chat's folder is.
-7. While a chat is shared, closing the window at home keeps Sanctum running in the tray.
+7. While a chat is shared, or a laptop is paired with it, closing the window at home keeps Sanctum running in the tray.
 8. Very large attachments, such as videos, are refused from the laptop in the first version.
 9. Each chat can have one folder per device, and folders aren't a security boundary on the laptop.
 10. The Run button on a code block acts on the machine where you click it.

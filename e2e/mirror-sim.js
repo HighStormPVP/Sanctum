@@ -63,7 +63,8 @@ function createInstance(world) {
     set: () => true,
     has: () => true
   });
-  const instance = { toasts: [], audit: [], dead: false, link: null };
+  // runs: what started a reply or went in a chat's queue, as the chat loop would have been asked to.
+  const instance = { toasts: [], audit: [], runs: [], dead: false, link: null };
   const timers = new Map();
   let timerId = 1;
   const RealDate = Date;
@@ -127,7 +128,17 @@ function createInstance(world) {
       return id;
     },
     clearInterval: cancel,
+    // Kept outside the section. Only what's written to it is real here, and the rest is the stub.
+    remoteUi: new Proxy({}, {
+      get: (target, key) => (Object.hasOwn(target, key) ? target[key] : stub),
+      set(target, key, value) {
+        target[key] = value;
+        return true;
+      }
+    }),
     showToast: (text) => instance.toasts.push({ t: world.now, text }),
+    submitToChat: async (c, text) => { instance.runs.push({ kind: 'run', chatId: c.id, text }); },
+    queueOnChat: (c, text) => { instance.runs.push({ kind: 'queue', chatId: c.id, text }); },
     currentChat: () => null,
     chatsInCurrentSpace: () => [],
     console: { warn() {}, log() {}, error() {} }
@@ -143,6 +154,8 @@ function createInstance(world) {
   });
   const body = `with (scope) { return (function () {\n${SECTION}\n; return { ${SECTION_EXPORTS.join(', ')} }; })(); }`;
   Object.assign(instance, new Function('scope', body)(scope));
+  // For a test to stand in for one more thing from outside the section.
+  instance.overrides = overrides;
   instance.wireChatMirror();
   return instance;
 }

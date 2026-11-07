@@ -10,7 +10,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { pathToFileURL } = require('node:url');
-const { startPair, waitFor, sleep, SECRET, PIN, TRANSPORT_PAGE } = require('./harness.js');
+const { startPair, waitFor, sleep, SECRET, PIN, TRANSPORT_PAGE, MODEL } = require('./harness.js');
 
 const PARTITION = 'remote-transport';
 const REFUSED = /can only be used from this app's own window/;
@@ -82,6 +82,52 @@ test('the preload surface', async (t) => {
     assert.equal(await laptop.remote('send', homeId, { type: 'after' }), true);
     await waitFor('the frame after', async () => (await home.frameCount()) === 1);
     assert.deepEqual(await home.frames(), [{ type: 'after' }]);
+  });
+
+  // Asking only: nothing here opens a microphone or a camera, even where it would be allowed.
+  await t.test('the hidden window is granted no web permission, and the main page only writing to the clipboard', async () => {
+    const hidden = await home.transport();
+    const ask = (page) => page.evaluate(async () => {
+      const query = async (name) => {
+        try {
+          return (await navigator.permissions.query({ name })).state;
+        } catch (e) {
+          return `error: ${e.message}`;
+        }
+      };
+      const answers = {};
+      for (const name of ['notifications', 'geolocation', 'microphone', 'camera', 'clipboard-read', 'clipboard-write', 'midi']) answers[name] = await query(name);
+      answers.requested = await Notification.requestPermission();
+      return answers;
+    });
+    const none = { notifications: 'denied', geolocation: 'denied', microphone: 'denied', camera: 'denied', 'clipboard-read': 'denied', 'clipboard-write': 'denied', midi: 'denied', requested: 'denied' };
+    assert.deepEqual(await ask(hidden), none);
+    assert.deepEqual(await ask(home.page), { ...none, 'clipboard-write': 'granted' });
+
+    // And Copy on a code block still works. Whatever was on the clipboard goes back afterwards.
+    const saved = await home.app.evaluate(({ clipboard }) => ({ text: clipboard.readText(), html: clipboard.readHTML(), rtf: clipboard.readRTF(), image: clipboard.readImage().toDataURL() }));
+    try {
+      await home.page.evaluate((model) => {
+        createChat(model, 'chat', { title: 'Copy', titleManual: true });
+        currentChat().messages.push({ role: 'assistant', content: '```js\nconsole.log("copied by a test")\n```' });
+        renderActiveChat();
+      }, MODEL);
+      await home.page.evaluate(() => document.querySelector('#thread button[data-cb-action="copy"]').click());
+      await waitFor('Copy to answer', () => home.page.evaluate(() => /Copied|Copy failed/.test(document.querySelector('#thread button[data-cb-action="copy"]').textContent)), 5000);
+      assert.equal(await home.page.evaluate(() => document.querySelector('#thread button[data-cb-action="copy"]').textContent), 'Copied');
+      assert.equal(await home.app.evaluate(({ clipboard }) => clipboard.readText()), 'console.log("copied by a test")');
+    } finally {
+      await home.app.evaluate(({ clipboard, nativeImage }, was) => {
+        const restore = {};
+        if (was.text) restore.text = was.text;
+        if (was.html) restore.html = was.html;
+        if (was.rtf) restore.rtf = was.rtf;
+        const image = nativeImage.createFromDataURL(was.image);
+        if (!image.isEmpty()) restore.image = image;
+        clipboard.clear();
+        if (Object.keys(restore).length) clipboard.write(restore);
+      }, saved);
+    }
   });
 
   await t.test('the hidden window is cut off from everything else', async (s) => {

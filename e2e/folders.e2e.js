@@ -15,13 +15,13 @@ const http = require('node:http');
 const os = require('node:os');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
-const { startRelay, launchDevice, pair, waitFor, sleep, PIN, MODEL, newChat, openChat, watch } = require('./harness.js');
+const { ELECTRON, startRelay, launchDevice, pair, waitFor, sleep, PIN, MODEL, newChat, openChat, watch } = require('./harness.js');
 
 const ROOT = path.join(__dirname, '..');
-const ELECTRON = path.join(ROOT, 'node_modules', 'electron', 'dist', process.platform === 'win32' ? 'electron.exe' : 'electron');
 
 const FLAGS = 'log,no-stun,peek';
 const KEEP_AWAKE = 'Keep this PC awake while a chat is shared';
+const STILL_RUNNING = 'Sanctum keeps running in the tray, so a paired laptop can still reach this PC. Quit it from there.';
 const START_AT_LOGIN = 'Start Sanctum when I log in';
 const PROFILE_REFUSED = "That is Sanctum's own data folder. A project can't use it.";
 const LISTING_REFUSED = "The home PC's answer wasn't a folder listing, so it isn't shown.";
@@ -223,7 +223,7 @@ test('keeping the home PC available', async (t) => {
     assert.equal(JSON.parse(fs.readFileSync(path.join(home.profile, 'availability.json'), 'utf8')).keepAwake, true);
   });
 
-  await t.test('closing with no chat shared quits as it always has, and the cleanup runs once', async () => {
+  await t.test('closing with no laptop paired and no chat shared quits as it always has, and the cleanup runs once', async () => {
     const home = await solo('plain');
     const before = ollama.unloads();
     assert.equal(await peek(home, 'tray'), false, 'no icon while nothing is shared');
@@ -245,7 +245,7 @@ test('keeping the home PC available', async (t) => {
     assert.equal(home.exited, false, 'still running');
     assert.deepEqual(await mainWindowFacts(home), { visible: false, destroyed: false });
     assert.equal(await peek(home, 'tray'), true);
-    assert.deepEqual(await peek(home, 'notes'), ['A chat is shared, so Sanctum keeps running in the tray. Quit it from there.']);
+    assert.deepEqual(await peek(home, 'notes'), [STILL_RUNNING]);
 
     await peek(home, 'clickTrayIcon');
     await waitFor('the icon to bring it back', async () => (await mainWindowFacts(home))?.visible === true, 5000);
@@ -264,6 +264,67 @@ test('keeping the home PC available', async (t) => {
     await sleep(300);
     assert.equal(ollama.unloads() - before, 1, 'the cleanup ran, once');
     assert.equal(JSON.parse(fs.readFileSync(path.join(home.profile, 'availability.json'), 'utf8')).trayNoteShown, true, 'and the note stays said');
+  });
+
+  // A laptop that pairs with this PC can start a chat here, so it has to stay reachable with nothing shared.
+  const servedBy = async (name) => {
+    const home = await solo(name);
+    const laptop = await launch(`${name}-laptop`, ollama);
+    made.push(laptop);
+    await pair(home, laptop, relay.address);
+    await waitFor('the session on both ends', async () => (await home.entry())?.connected && (await laptop.entry())?.connected, 15000);
+    return { home, laptop, homeId: (await laptop.entry()).id, laptopId: (await home.entry()).id, homeName: (await home.remote('status')).name };
+  };
+
+  await t.test('paired with a laptop and nothing shared, closing hides to the tray and a new chat from the laptop is made; once unpaired, closing quits', async () => {
+    const { home, laptop, homeId, laptopId } = await servedBy('serving');
+    assert.equal(await peek(home, 'sharing'), false, 'nothing is shared');
+    await closeMainWindow(home);
+    await waitFor('the window to hide', async () => (await mainWindowFacts(home))?.visible === false, 5000);
+    await sleep(500);
+    assert.equal(home.exited, false, 'still running');
+    assert.deepEqual(await mainWindowFacts(home), { visible: false, destroyed: false }, 'hidden, not gone, so its page can answer');
+    assert.equal(await peek(home, 'tray'), true);
+    assert.deepEqual(await peek(home, 'notes'), [STILL_RUNNING]);
+
+    // The laptop asks for a new chat, the hidden page makes it, and it arrives.
+    const answer = await laptop.page.evaluate((id) => actionToHome(id, undefined, 'new-chat', { modality: 'chat' }), homeId);
+    assert.equal(answer.ok, true, JSON.stringify(answer));
+    await waitFor('the new chat on the laptop', () => laptop.page.evaluate((key) => Boolean(state.chats[key]), `remote:${homeId}:${answer.chatId}`), 10000);
+    assert.equal(await home.page.evaluate((chatId) => state.chats[chatId]?.remoteControl, answer.chatId), true);
+
+    // With nothing shared and no laptop paired, closing goes back to quitting.
+    await peek(home, 'clickTrayIcon');
+    await waitFor('shown', async () => (await mainWindowFacts(home))?.visible === true, 5000);
+    await setShared(home, answer.chatId, false);
+    await sharingIs(home, false);
+    assert.deepEqual(await home.remote('removeDevice', laptopId), { ok: true });
+    await waitFor('no laptop paired', async () => (await home.remote('status')).devices.length === 0, 5000);
+    await closeMainWindow(home);
+    await exits(home);
+  });
+
+  await t.test("with no window at home, a laptop's action is refused at once, naming the PC, and the laptop says so", async () => {
+    const { home, laptop, homeId, homeName } = await servedBy('windowless');
+    // Something else keeps Sanctum running once the window has gone, as the Dock does on a Mac.
+    await home.app.evaluate(({ BrowserWindow }) => {
+      globalThis.__keepRunning = new BrowserWindow({ show: false });
+      BrowserWindow.getAllWindows().find((w) => w.webContents.getURL().includes('index.html')).destroy();
+    });
+    await waitFor('the window to be gone', async () => (await mainWindowFacts(home)) === null, 5000);
+    assert.equal(home.exited, false);
+    await waitFor('the laptop still connected', async () => (await laptop.entry())?.connected, 15000);
+    const refusal = `Sanctum's window is closed on ${homeName}. Open it there, or wait for it to start.`;
+
+    const startedAt = Date.now();
+    const answer = await laptop.page.evaluate((id) => actionToHome(id, undefined, 'new-chat', { modality: 'chat' }), homeId);
+    const took = Date.now() - startedAt;
+    assert.deepEqual(answer, { ok: false, error: refusal });
+    assert.ok(took < 3000, `answered in ${took} ms, well before the laptop would give up at 15 s`);
+
+    // Through the button's own path, the toast says it.
+    await laptop.page.evaluate((id) => newRemoteChat(id), homeId);
+    await waitFor('the toast', async () => (await textsOf(laptop, '#toast-host .toast')).some((text) => text.includes(refusal)), 3000);
   });
 
   await t.test('a second launch on the same profile hands over to the first and exits, and other profiles run alongside', async () => {
@@ -1157,6 +1218,92 @@ test('from a laptop', async (t) => {
     await laptop.page.evaluate(() => window.__panel.querySelector('[data-out-action="reload"]').click());
     await sleep(500);
     assert.equal(await laptop.page.evaluate(() => window.__previews), 2, 'and nothing once its chat has gone');
+  });
+
+  await t.test('Edit is hidden on a home chat, an editor showing one goes with a lock or its chat, and Save writes only into the chat it came from', async () => {
+    const block = 'console.log("the same block")';
+    const editors = () => laptop.page.evaluate(() => document.querySelectorAll('.editor-overlay').length);
+    const withBlock = async (title) => {
+      const id = await newChat(laptop, { modality: 'chat', title, titleManual: true });
+      await laptop.page.evaluate(([chatId, body]) => {
+        state.chats[chatId].messages.push({ role: 'user', content: 'Code please' }, { role: 'assistant', content: '```js\n' + body + '\n```' });
+        saveToStorage();
+        renderActiveChat();
+      }, [id, block]);
+      return id;
+    };
+    const contentOf = (id) => laptop.page.evaluate((chatId) => state.chats[chatId].messages.at(-1).content, id);
+    const editInThread = async (text) => {
+      await laptop.page.evaluate(() => document.querySelector('#thread button[data-cb-action="edit"]').click());
+      await waitFor('the editor', async () => (await editors()) === 1, 5000);
+      await laptop.page.evaluate((value) => {
+        window.__editor = document.querySelector('.editor-overlay');
+        const area = window.__editor.querySelector('.editor-textarea');
+        area.value = value;
+        area.dispatchEvent(new Event('input'));
+      }, text);
+    };
+    const save = () => laptop.page.evaluate(() => window.__editor.querySelector('[data-edit-action="save"]').click());
+
+    // On a home chat the button isn't there to press, and pressing it anyway opens nothing.
+    const { id: homeChat, rid } = await withCode(block);
+    assert.equal(await laptop.page.evaluate(() => Boolean(document.querySelector('#thread button[data-cb-action="edit"]'))), true);
+    assert.equal(await visible(laptop, '#thread button[data-cb-action="edit"]'), false);
+    await laptop.page.evaluate(() => document.querySelector('#thread button[data-cb-action="edit"]').click());
+    await sleep(300);
+    assert.equal(await editors(), 0);
+
+    // Two chats of the laptop's own hold the same block. Save goes to the one the editor came from,
+    // whichever is on screen by then.
+    const first = await withBlock('Mine one');
+    const second = await withBlock('Mine two');
+    await openChat(laptop, first);
+    assert.equal(await visible(laptop, '#thread button[data-cb-action="edit"]'), true, 'a chat of its own can be edited');
+    await editInThread('console.log("edited in one")');
+    await openChat(laptop, second);
+    await save();
+    assert.match(await contentOf(first), /edited in one/);
+    assert.equal(await contentOf(second), '```js\n' + block + '\n```', 'the chat on screen is untouched');
+    await laptop.page.evaluate(() => window.__editor.querySelector('[data-edit-action="cancel"]').click());
+    await waitFor('it to close', async () => (await editors()) === 0, 5000);
+
+    // An editor showing the home chat, as page code could open one, goes with a lock, with its words,
+    // and Save after that writes nowhere, not even into the laptop's chat holding the same block.
+    const openOnHomeChat = () => laptop.page.evaluate(([key, body]) => {
+      openEditModal({ code: body, lang: 'js', filename: 'x.js', originalCode: body, chatId: key });
+      window.__editor = document.querySelector('.editor-overlay');
+      const area = window.__editor.querySelector('.editor-textarea');
+      area.value = 'console.log("EDITED")';
+      area.dispatchEvent(new Event('input'));
+    }, [rid, block]);
+    await openChat(laptop, rid);
+    await openOnHomeChat();
+    assert.equal(await editors(), 1);
+    await openChat(laptop, second);
+    await laptop.remote('lock');
+    await waitFor('the editor to go', async () => (await editors()) === 0, 5000);
+    assert.equal(await laptop.page.evaluate(() => window.__editor.querySelector('.editor-textarea').value), '', 'and the words with it');
+    await save();
+    await sleep(300);
+    assert.equal(await contentOf(second), '```js\n' + block + '\n```', 'the local chat with the same block is unchanged');
+    // Nor does one open while locked.
+    await laptop.page.evaluate(([key, body]) => openEditModal({ code: body, lang: 'js', filename: 'x.js', originalCode: body, chatId: key }), [rid, block]);
+    await sleep(300);
+    assert.equal(await editors(), 0, 'none opens while locked');
+    assert.equal((await laptop.remote('unlock', PIN)).ok, true);
+
+    // And with its chat, when home stops sharing it. One on a chat of the laptop's own stays.
+    await watch(trio, homeChat);
+    await openOnHomeChat();
+    await openChat(laptop, second);
+    await laptop.page.evaluate(() => document.querySelector('#thread button[data-cb-action="edit"]').click());
+    await waitFor('both editors', async () => (await editors()) === 2, 5000);
+    await setShared(home, homeChat, false);
+    await waitFor('the home chat\'s editor to go', async () => (await editors()) === 1, 5000);
+    await sleep(300);
+    assert.equal(await editors(), 1, 'the local one stays');
+    await laptop.page.evaluate(() => document.querySelector('.editor-overlay [data-edit-action="cancel"]').click());
+    await waitFor('it to close', async () => (await editors()) === 0, 5000);
   });
 
   await t.test("removing a laptop drops its folders from every chat, so calls route as if they'd never been there", async () => {

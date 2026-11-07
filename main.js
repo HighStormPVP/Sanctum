@@ -10,7 +10,7 @@ const { safeFetchText, isAppPage } = require('./lib/url-rules');
 const { grepInWorker, globInWorker } = require('./lib/grep-runner');
 const { detectRepetitionLoop, splitOutputLines, quoteWindowsArg, encodePowerShell } = require('./lib/text-rules');
 const { killTree, startInOwnGroup, runShellCommand } = require('./lib/kill-tree');
-const { devToolsAllowed, applicationMenuTemplate, refusedDebugSwitch } = require('./lib/window-rules');
+const { devToolsAllowed, applicationMenuTemplate, refusedDebugSwitch, permissionAllowed } = require('./lib/window-rules');
 
 // An installed Sanctum never runs under a debugger, which would reach the keys, the chats, and past
 // the PIN lock. Checked before anything else happens: no lock, no window, no keystore. app.exit
@@ -409,6 +409,19 @@ ipcMain.handle('preview:create', (_e, html) => {
   return `aio-preview://${id}/`;
 });
 
+// What a page may ask Chromium for: see permissionAllowed. The app's own page, in its main frame, gets
+// the clipboard for Copy. The hidden transport window, which handles what peers and the network send,
+// gets nothing.
+function guardPermissions() {
+  const appPage = path.join(__dirname, 'index.html');
+  const fromAppPage = (details) => details?.isMainFrame !== false && isAppPage(details?.requestingUrl, appPage);
+  session.defaultSession.setPermissionRequestHandler((_w, permission, cb, details) => cb(permissionAllowed(permission, fromAppPage(details))));
+  session.defaultSession.setPermissionCheckHandler((_w, permission, _origin, details) => permissionAllowed(permission, fromAppPage(details)));
+  const transport = session.fromPartition(REMOTE_TRANSPORT_PARTITION);
+  transport.setPermissionRequestHandler((_w, _p, cb) => cb(false));
+  transport.setPermissionCheckHandler(() => false);
+}
+
 function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1280,
@@ -532,6 +545,7 @@ app.whenReady().then(() => {
     console.error('[remote] could not start:', e.message);
   }
 
+  guardPermissions();
   loadAvailability();
   createWindow();
   applyAvailability();
@@ -586,6 +600,7 @@ app.on('before-quit', (e) => {
     remoteRefusals.flush();
     if (remoteManager) { try { remoteManager.shutdown(); } catch {} }
     for (const [, entry] of activeChatStreams) { try { entry.controller.abort(); } catch {} }
+    for (const child of localRuns) killing(child);
     for (const task of backgroundTasks.values()) { if (task.proc) killing(task.proc); }
     for (const entry of videoProcesses.values()) { entry.aborted = true; if (entry.proc) killing(entry.proc); }
     // A test's way to have a kill that never finishes.
@@ -630,12 +645,12 @@ const REMOTE_TRANSPORT_URL = 'aio-transport://app/remote-transport.html';
 const remoteTestFlags = new Set(app.isPackaged ? [] : String(process.env.SANCTUM_REMOTE_TEST || '').split(','));
 
 // =================== KEEPING THIS PC AVAILABLE ===================
-// A laptop can only reach shared chats while Sanctum is running here. So while a chat is shared,
-// closing the window hides it to the tray, where it keeps working at full speed (it's never
-// throttled, see createWindow), and two settings can keep this PC awake and start Sanctum at
-// login. The page says whether a chat is
-// shared, since chats live there. Page code could lie about that, and the most a lie does is keep
-// a tray icon up or let this PC sleep.
+// A laptop can only reach this PC while Sanctum is running here. So while a chat is shared, or a
+// laptop is paired with this PC as its home, closing the window hides it to the tray, where it keeps
+// working at full speed (it's never throttled, see createWindow). Two settings can keep this PC awake
+// while a chat is shared and start Sanctum at login. The page says whether a chat is shared, since
+// chats live there. Page code could lie about that, and the most a lie does is keep a tray icon up or
+// let this PC sleep.
 //
 // The settings live in a file here rather than in the page, so keep-awake applies from the start.
 // Start-at-login is read back from the system each time, because that's what's in effect.
@@ -649,7 +664,7 @@ let trayMenu = null;
 let trayNoteDue = false;
 let trayFailed = false;
 const STILL_RUNNING_TITLE = 'Sanctum is still running';
-const STILL_RUNNING_TEXT = 'A chat is shared, so Sanctum keeps running in the tray. Quit it from there.';
+const STILL_RUNNING_TEXT = 'Sanctum keeps running in the tray, so a paired laptop can still reach this PC. Quit it from there.';
 const START_AT_LOGIN_UNPACKAGED = 'Starting when you log in works in the installed app.';
 
 // For the tests in e2e/ only. `peek` shows them what's going on here, and keeps the note off the
@@ -804,11 +819,13 @@ function noteStillRunning() {
   }
 }
 
-// Closing hides only while a chat is shared, and never while quitting. On a Mac that's the same,
-// apart from the Dock: Sanctum stays in it, as Mac apps do, and clicking it brings the window back.
+// Closing hides while a chat is shared or a laptop is paired with this PC as its home, on every platform,
+// and never while quitting. A laptop can start a chat here with nothing shared, and that needs the page.
+// With no laptop paired it closes as it always has. On a Mac the Dock icon also brings the window back.
 function wireHideToTray(win) {
   win.on('close', (e) => {
-    if (trayFailed || !RemoteRules.closeHidesWindow({ sharing: availabilitySharing, quitting: appQuitting })) return;
+    const servingLaptop = RemoteRules.servesLaptop(lastRemoteStatus);
+    if (trayFailed || !RemoteRules.closeHidesWindow({ sharing: availabilitySharing, servingLaptop, quitting: appQuitting })) return;
     e.preventDefault();
     win.hide();
     applyAvailability();
@@ -1005,7 +1022,8 @@ function startRemoteControl() {
   });
   remoteManager.onFrame((deviceId, frame) => {
     if (frame?.type === 'tool-call' && !admitToolCall(deviceId, frame)) return;
-    sendToLocalUi('remote:frame', { deviceId, frame });
+    if (sendToLocalUi('remote:frame', { deviceId, frame })) return;
+    refuseActionWithoutWindow(deviceId, frame);
   });
   // The work ends first, so a switch turned off has taken effect by the time anything says so.
   remoteManager.onStatus((status) => {
@@ -1013,6 +1031,16 @@ function startRemoteControl() {
     reconcileRemoteWork(status);
     sendToLocalUi('remote:status', withHomeTasks(status));
   });
+  // So closing the window knows from the start whether a laptop is paired with this PC.
+  remoteManager.refreshStatus();
+}
+
+// No page here to do what a laptop asked, as when the window has gone on a Mac. The laptop would
+// otherwise wait out its 15 seconds, so it's told at once, the way admitToolCall answers a tool call.
+function refuseActionWithoutWindow(deviceId, frame) {
+  if (lastRemoteStatus?.devices?.find((d) => d.id === deviceId)?.role !== 'laptop') return;
+  const refusal = RemoteRules.windowClosedRefusal(frame, lastRemoteStatus?.name);
+  if (refusal) remoteManager.send(deviceId, refusal);
 }
 
 function sendToLocalUi(channel, payload) {
@@ -1069,6 +1097,8 @@ const REMOTE_LOG_MAX_BYTES = 16 * 1024 * 1024;
 const REMOTE_AUDIT_FILE = 'remote-audit.log';
 const REMOTE_REFUSALS_FILE = 'remote-refusals.log';
 const remoteRuns = new Map(); // `${deviceId}:${id}` -> { child, deviceId, id, command, ended }
+// What this device's own page started with shell:run, so quitting ends those too.
+const localRuns = new Set(); // child processes
 const killsUnderWay = new Set();
 let lastRemoteStatus = null;
 
@@ -3202,6 +3232,7 @@ ipcMain.handle('shell:run', async (_e, { command, cwd, remoteCall }) => {
   const refused = remoteCallRefused(remoteCall);
   if (refused) return { error: refused };
   const wd = cwd ? resolveSafe(cwd) : os.homedir();
+  let started = null;
   const result = await runShellCommand({
     command,
     cwd: wd,
@@ -3210,10 +3241,13 @@ ipcMain.handle('shell:run', async (_e, { command, cwd, remoteCall }) => {
     shell: SHELL.path,
     timeoutMs: 60_000,
     onStart: (child) => {
+      started = child;
       if (remoteCall) remoteRuns.set(remoteRunKey(remoteCall), { child, deviceId: remoteCall.deviceId, id: remoteCall.id, command, ended: false });
+      else localRuns.add(child);
     }
   });
   if (remoteCall) remoteRuns.delete(remoteRunKey(remoteCall));
+  else localRuns.delete(started);
   return { command, cwd: wd, ...result };
 });
 
