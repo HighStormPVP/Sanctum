@@ -20,3 +20,8 @@ test('no e2e file builds its own path into dist/', () => {
     assert.doesNotMatch(text, /['"]dist['"]/, file);
   }
 });
+
+test('every instance the harness starts is told to bind nothing but loopback', () => {
+  const source = require('node:fs').readFileSync(require('node:path').join(__dirname, '..', 'e2e', 'harness.js'), 'utf8');
+  assert.match(source, /SANCTUM_LOOPBACK_ONLY: '1'/);
+});

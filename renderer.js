@@ -7187,8 +7187,9 @@ async function submitConnect() {
     .catch(() => ({ ok: false, error: "Couldn't connect. Try again." }));
   remoteUi.pairing = false;
   $('#remote-connect-looking').hidden = true;
-  // Nothing found here, so the other way in is opened, ready below Connect to a home PC.
-  if (searching && !answer.ok) $('#remote-address-fold').open = true;
+  // No home PC found here, so the other way in is opened, ready below Connect to a home PC.
+  // Only for that: a wrong code or a PIN to set is said in the dialog, and nothing else moves.
+  if (searching && answer.notFound === true) $('#remote-address-fold').open = true;
   remoteStatusRefresh();
   // Still happened if the dialog has been closed since, and worth saying so.
   if (answer.ok) showToast(`Connected to ${answer.device?.name || 'your home PC'}`, 'ok');

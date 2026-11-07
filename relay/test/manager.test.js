@@ -86,6 +86,8 @@ async function startWorld(t) {
           }
         },
         local,
+        // The Worker here is plain ws on this machine, which only a test run may be sealed.
+        acceptPlainLoopbackAddress: true,
         ...(clock ? { clock } : {}),
         deviceName: name
       });
@@ -424,7 +426,8 @@ test('on the same network, a wrong code uses one of the five attempts, and five 
   // The fifth, back on this network, and the code is over.
   const fifth = await world.device('Laptop 5', null, { local });
   assert.deepEqual(await fifth.manager.pair(wrongs[4], 'Laptop 5'), { ok: false, error: "That code didn't work. Check it and try again." });
-  await waitFor('the code to be cancelled', () => home.manager.status().codePending === false, 5000);
+  // The relay's last wrong guess may still be live, so this can take the 15 seconds' grace.
+  await waitFor('the code to be cancelled', () => home.manager.status().codePending === false, 20000);
   await listenerGone(net, listeners[0]);
 
   // The right code finds nothing now, either way.
@@ -456,4 +459,54 @@ test('on the same network, the listener is gone after cancelling, expiry and shu
   assert.ok(await listeners[2].ready);
   home.manager.shutdown();
   await listenerGone(net, listeners[2]);
+});
+
+// ---- Others on the same network, without the code ----
+
+function silentSocket(port) {
+  const socket = net.connect({ host: '127.0.0.1', port });
+  socket.on('error', () => {});
+  return socket;
+}
+
+test('on the same network, two silent connections can\'t hold home\'s places: the right code still pairs', async (t) => {
+  const world = await startWorld(t);
+  const { local, listeners } = await nearby();
+  const home = await world.device('Home', world.address, { local });
+  const { code } = await home.manager.createCode();
+  const { tcpPort } = await listeners[0].ready;
+  const held = [silentSocket(tcpPort)];
+  await sleep(1100);
+  held.push(silentSocket(tcpPort));
+  await sleep(1100);
+  t.after(() => held.forEach((socket) => socket.destroy()));
+
+  const laptop = await world.device('Laptop', null, { local });
+  const answer = await laptop.manager.pair(code, 'Laptop');
+  assert.equal(answer.ok, true, answer.error);
+  assert.equal(home.manager.status().devices[0]?.role, 'laptop');
+});
+
+// Accepted, and in the spec: a try is charged before its guess is checked, so nobody guesses for
+// free, and anyone on the network can use up a showing code's five. The owner makes a new one.
+test('on the same network, anyone can use up a code\'s five tries, one connection each, and the code ends', async (t) => {
+  const world = await startWorld(t);
+  const { local, listeners } = await nearby();
+  const home = await world.device('Home', world.address, { local });
+  await home.manager.createCode();
+  const { tcpPort } = await listeners[0].ready;
+  // One junk pake per connection, since a connection gets one attempt.
+  const first = silentSocket(tcpPort);
+  await new Promise((resolve) => first.once('connect', resolve));
+  for (let i = 0; i < 5; i++) first.write('{"t":"pake","pake":"AA=="}\n');
+  await sleep(300);
+  assert.equal(home.manager.status().codePending, true, 'one connection spends one try');
+  for (let i = 1; i < 5; i++) {
+    await sleep(1100);
+    const socket = silentSocket(tcpPort);
+    await new Promise((resolve) => socket.once('connect', resolve));
+    socket.write('{"t":"pake","pake":"AA=="}\n');
+  }
+  await waitFor('the code to end', () => home.manager.status().codePending === false, 5000);
+  await listenerGone(net, listeners[0]);
 });

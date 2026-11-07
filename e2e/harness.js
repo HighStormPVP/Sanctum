@@ -83,7 +83,9 @@ async function startFakeOllama() {
 // real STUN server for its address, as the shipped app does. Passing the `profile` of an
 // instance that has quit restarts that instance.
 async function launchDevice(name, { flags = 'log,no-stun', ollamaUrl, profile = fs.mkdtempSync(path.join(os.tmpdir(), `sanctum-e2e-${name}-`)) }) {
-  const env = { ...process.env, OLLAMA_URL: ollamaUrl, SANCTUM_REMOTE_TEST: flags };
+  // SANCTUM_LOOPBACK_ONLY is a second guard: whatever main.js chooses, nothing binds wider than
+  // loopback, because that would make Windows ask whoever is at this machine about its firewall.
+  const env = { ...process.env, OLLAMA_URL: ollamaUrl, SANCTUM_REMOTE_TEST: flags, SANCTUM_LOOPBACK_ONLY: '1' };
   delete env.ELECTRON_RUN_AS_NODE;
   const app = await electron.launch({
     executablePath: ELECTRON,

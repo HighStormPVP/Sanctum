@@ -17,8 +17,11 @@ const { startRelay, startFakeOllama, launchDevice, waitFor, sleep, SECRET } = re
 
 const NEARBY_LINE = 'For this first pairing, both devices need to be on the same Wi-Fi.';
 const LOOKING = 'Looking for your home PC on this network…';
-const NOT_FOUND = "Couldn't find a home PC showing a code on this network. Check both are on the same Wi-Fi, or paste the service address below.";
-const FIREWALL = 'If Windows asks, allow Sanctum on private networks so your laptop can find this PC.';
+const NOT_FOUND = "Couldn't find a home PC showing a code on this network. Check both are on the same Wi-Fi, or close this and paste the service address under Connect to a home PC.";
+const FIREWALL = "If Windows asks, allow Sanctum so your laptop can find this PC. If Windows treats this Wi-Fi as a public network, pairing here won't find it.";
+const WRONG_CODE = "That code didn't work. Check it and try again.";
+const NEEDS_PIN = 'Set a PIN for this device before connecting it to a home PC.';
+const foldOpen = (device) => device.page.evaluate(() => document.querySelector('#remote-address-fold').open);
 const PIN = '904172358613';
 const FLAGS = 'log,no-stun,block-ice,peek';
 const THEMES = ['sanctum', 'dark', 'light'];
@@ -119,6 +122,15 @@ test('a laptop with no address pairs with only the code, and then reaches its ho
   await appeared(laptop, '#remote-connect-code');
   assert.equal(await textOf(laptop, '#remote-connect-nearby'), NEARBY_LINE);
   assert.equal(await isVisible(laptop, '#remote-connect-nearby'), true);
+  // A wrong code is said, and isn't a reason to offer the address field.
+  const wrong = code === '222222' ? '333333' : '222222';
+  await fill(laptop, '#remote-connect-code', wrong);
+  await fill(laptop, '#remote-connect-pin', PIN);
+  await fill(laptop, '#remote-connect-pin2', PIN);
+  await click(laptop, '#remote-connect-submit');
+  await waitFor('the wrong code to be said', async () => (await textOf(laptop, '#remote-connect-error')) === WRONG_CODE, 20000);
+  assert.equal(await foldOpen(laptop), false, 'a wrong code leaves the address folded');
+
   await fill(laptop, '#remote-connect-code', code.toLowerCase());
   await fill(laptop, '#remote-connect-pin', PIN);
   await fill(laptop, '#remote-connect-pin2', PIN);
@@ -176,7 +188,12 @@ test('with no home PC showing a code, the laptop says it could not find one', as
   await openDevices(laptop);
   assert.equal(await laptop.page.evaluate(() => document.querySelector('#remote-address-fold').open), false);
   await click(laptop, '#remote-connect-home');
+  // No PIN typed: said, with the address left folded.
   await fill(laptop, '#remote-connect-code', 'K7M2QX');
+  await click(laptop, '#remote-connect-submit');
+  await waitFor('the PIN to be asked for', async () => (await textOf(laptop, '#remote-connect-error')) === NEEDS_PIN, 10000);
+  assert.equal(await foldOpen(laptop), false, 'asking for a PIN leaves the address folded');
+
   await fill(laptop, '#remote-connect-pin', PIN);
   await fill(laptop, '#remote-connect-pin2', PIN);
   await click(laptop, '#remote-connect-submit');

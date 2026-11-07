@@ -891,7 +891,7 @@ test('a guest that has paired refuses everything afterwards', () => {
 test('the sides expose no key material', () => {
   const host = makeHost();
   const guest = makeGuest();
-  assert.deepStrictEqual(Object.keys(host.side).sort(), ['attemptsLeft', 'handle']);
+  assert.deepStrictEqual(Object.keys(host.side).sort(), ['attemptsInFlight', 'attemptsLeft', 'end', 'handle']);
   assert.deepStrictEqual(Object.keys(guest.side).sort(), ['first', 'handle']);
 });
 
@@ -999,4 +999,60 @@ test('a host ignores an address in the laptop identity', () => {
   }));
   assert.deepStrictEqual(Object.keys(result.peer).sort(), ['deviceId', 'name', 'publicKey']);
   assert.ok(!('address' in result));
+});
+
+// ---------------------------------------------------------------------------
+// One attempt in flight per channel, so a line on one connection can never end
+// another's. The budget is still one for the code.
+// ---------------------------------------------------------------------------
+test('junk on another channel does not end an attempt in flight', () => {
+  const host = makeHost();
+  const guest = makeGuest();
+  const { reply } = host.side.handle(wire(guest.side.first), { channel: 'laptop' });
+  assert.ok(reply);
+  assertFailed(host.side.handle({ t: 'junk' }, { channel: 'stranger' }));
+  assertFailed(host.side.handle({ t: 'pake', pake: 'AAAA' }, { channel: 'stranger' }));
+  const confirm = guest.side.handle(wire(reply)).reply;
+  const done = host.side.handle(wire(confirm), { channel: 'laptop' });
+  assertPeer(done.peer, guest);
+});
+
+test('an attempt can only be finished on the channel that started it, and a stray confirm costs nothing', () => {
+  const host = makeHost();
+  const guest = makeGuest();
+  const { reply } = host.side.handle(wire(guest.side.first), { channel: 'a' });
+  const confirm = wire(guest.side.handle(wire(reply)).reply);
+  assertFailed(host.side.handle(confirm, { channel: 'b' }));
+  assert.strictEqual(host.side.attemptsLeft, 4);
+  assertPeer(host.side.handle(confirm, { channel: 'a' }).peer, guest);
+});
+
+test('anything else on the same channel still ends its attempt', () => {
+  const host = makeHost();
+  const guest = makeGuest();
+  const { reply } = host.side.handle(wire(guest.side.first), { channel: 'a' });
+  const confirm = wire(guest.side.handle(wire(reply)).reply);
+  assertFailed(host.side.handle({ t: 'junk' }, { channel: 'a' }));
+  assertFailed(host.side.handle(confirm, { channel: 'a' }));
+});
+
+test('attempts in flight are counted per channel, and end() lets one go without a cost back', () => {
+  const host = makeHost();
+  host.side.handle(wire(makeGuest().side.first), { channel: 'a' });
+  host.side.handle(wire(makeGuest().side.first), { channel: 'b' });
+  host.side.handle(wire(makeGuest().side.first));
+  assert.strictEqual(host.side.attemptsInFlight, 3);
+  assert.strictEqual(host.side.attemptsLeft, 2);
+  host.side.end('a');
+  assert.strictEqual(host.side.attemptsInFlight, 2);
+  assert.strictEqual(host.side.attemptsLeft, 2, 'a try is charged when it starts, and stays charged');
+});
+
+test('the address still needs both messages on one local channel', () => {
+  const host = makeHost();
+  const guest = makeGuest();
+  const { reply } = host.side.handle(wire(guest.side.first), { channel: 'a', address: SERVICE_ADDRESS });
+  const confirm = wire(guest.side.handle(wire(reply)).reply);
+  const done = host.side.handle(confirm, { channel: 'a', address: SERVICE_ADDRESS });
+  assert.strictEqual(guest.side.handle(wire(done.reply)).address, SERVICE_ADDRESS);
 });

@@ -16,6 +16,7 @@ const {
 } = local;
 
 const LOOPBACK = '127.0.0.1';
+const PAKE_LINE = JSON.stringify({ t: 'pake', pake: 'AAAA' });
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function waitFor(what, check, ms = 5000) {
@@ -125,7 +126,6 @@ async function startListener(t, options = {}) {
   const pairing = createLocalPairing({ loopback: true, discoveryPort, ...options.config });
   const seen = { messages: [], closed: [], channels: new Set() };
   const listener = pairing.listen({
-    name: options.name ?? 'Home Desk',
     clock: options.clock,
     host: options.host,
     onMessage(channel, msg) {
@@ -183,9 +183,8 @@ test('isPrivateAddress refuses everything else, the near misses most of all', ()
 test('the probe and the reply are exactly the agreed shapes', () => {
   assert.equal(DISCOVERY_PORT, 47613);
   assert.equal(probeBytes().toString('utf8'), '{"sanctum":"pair-probe","v":1}');
-  assert.deepEqual(JSON.parse(replyBytes({ port: 50123, name: 'Home Desk' }).toString('utf8')), {
-    sanctum: 'pair-here', v: 1, port: 50123, name: 'Home Desk'
-  });
+  // No name: nothing reads it, and anyone on the network could.
+  assert.equal(replyBytes({ port: 50123 }).toString('utf8'), '{"sanctum":"pair-here","v":1,"port":50123}');
   assert.equal(isProbe(probeBytes()), true);
 });
 
@@ -199,9 +198,9 @@ test('a probe that is anything but exactly that shape is ignored', () => {
 });
 
 test('a reply is taken only in its exact shape, from this network, with a port it could listen on', () => {
-  const good = { sanctum: 'pair-here', v: 1, port: 50123, name: 'Home Desk' };
+  const good = { sanctum: 'pair-here', v: 1, port: 50123 };
   const bytes = (value) => Buffer.from(typeof value === 'string' ? value : JSON.stringify(value));
-  assert.deepEqual(parseReply(bytes(good), '192.168.1.20'), { address: '192.168.1.20', port: 50123, name: 'Home Desk' });
+  assert.deepEqual(parseReply(bytes(good), '192.168.1.20'), { address: '192.168.1.20', port: 50123 });
   assert.deepEqual(parseReply(bytes({ ...good, port: 1024 }), '10.0.0.2')?.port, 1024);
   assert.deepEqual(parseReply(bytes({ ...good, port: 65535 }), '10.0.0.2')?.port, 65535);
   // The address it came from, not one it claims, and in IPv4 spelling when it came mapped.
@@ -218,13 +217,12 @@ test('a reply is taken only in its exact shape, from this network, with a port i
     'a fractional port': [{ ...good, port: 50123.5 }],
     'a port as text': [{ ...good, port: '50123' }],
     'a negative port': [{ ...good, port: -50123 }],
-    'no port': [{ sanctum: 'pair-here', v: 1, name: 'Home Desk' }],
-    'a name that is not text': [{ ...good, name: 7 }],
-    'no name': [{ sanctum: 'pair-here', v: 1, port: 50123 }],
+    'no port': [{ sanctum: 'pair-here', v: 1 }],
+    'a name, which the shape no longer has': [{ ...good, name: 'Home Desk' }],
     'another version': [{ ...good, v: 2 }],
     'a probe': [{ sanctum: 'pair-probe', v: 1 }],
     'an extra field': [{ ...good, address: '8.8.8.8' }],
-    'over 1 KiB': [{ ...good, name: 'x'.repeat(1100) }],
+    'over 1 KiB': [`{"sanctum":"pair-here","v":1,"port":50123${' '.repeat(1100)}}`],
     'not JSON': ['pair-here 50123'],
     'a JSON array': ['[1,2]'],
     'JSON null': ['null'],
@@ -235,13 +233,15 @@ test('a reply is taken only in its exact shape, from this network, with a port i
   }
 });
 
-test('the list of homes keeps at most four, and one per address', () => {
+test('the list of homes keeps sixteen, one per address, in the order they answered', () => {
   const homes = createHomeList();
-  homes.add({ address: '192.168.1.2', port: 50000, name: 'A' });
-  homes.add({ address: '192.168.1.2', port: 50001, name: 'A again' });
-  for (let i = 3; i <= 9; i++) homes.add({ address: `192.168.1.${i}`, port: 50000 + i, name: `H${i}` });
-  assert.deepEqual(homes.list().map((h) => h.address), ['192.168.1.2', '192.168.1.3', '192.168.1.4', '192.168.1.5']);
-  assert.equal(homes.list()[0].port, 50000, 'the first answer from an address stands');
+  homes.add({ address: '192.168.1.2', port: 50000 });
+  homes.add({ address: '192.168.1.2', port: 50001 });
+  for (let i = 3; i <= 30; i++) homes.add({ address: `192.168.1.${i}`, port: 50000 + i });
+  const list = homes.list();
+  assert.equal(list.length, 16);
+  assert.deepEqual(list.map((h) => h.address), Array.from({ length: 16 }, (_, i) => `192.168.1.${i + 2}`));
+  assert.equal(list[0].port, 50000, 'the first answer from an address stands');
 });
 
 test('broadcastAddresses is the limited broadcast and each private interface\'s directed one', () => {
@@ -287,10 +287,41 @@ test('a loopback listener binds both its sockets to 127.0.0.1 and nothing wider'
 
 // ---- Finding a home ----
 
-test('a listener answers a probe with its port and name, and discover finds it on loopback', async (t) => {
-  const { pairing, ports } = await startListener(t, { name: 'Home Desk' });
+test('a listener answers a probe with its port, and discover finds it on loopback', async (t) => {
+  const { pairing, ports } = await startListener(t);
   const homes = await pairing.discover().result;
-  assert.deepEqual(homes, [{ address: LOOPBACK, port: ports.tcpPort, name: 'Home Desk' }]);
+  assert.deepEqual(homes, [{ address: LOOPBACK, port: ports.tcpPort }]);
+});
+
+// 127.0.0.2 and up are loopback too, so they can stand in for other machines on the network.
+test('four forged replies from other addresses don\'t crowd out the real home, which is tried in its turn', async (t) => {
+  const discoveryPort = await freeUdpPort();
+  const forgers = [];
+  for (let i = 2; i <= 5; i++) {
+    const forger = dgram.createSocket('udp4');
+    await new Promise((resolve) => forger.bind({ address: `127.0.0.${i}`, port: 0 }, resolve));
+    forgers.push(forger);
+  }
+  const home = dgram.createSocket('udp4');
+  home.on('message', (msg, rinfo) => {
+    // The forgers answer first, then the real home.
+    forgers.forEach((forger, i) => forger.send(replyBytes({ port: 41000 + i }), rinfo.port, rinfo.address));
+    setTimeout(() => home.send(replyBytes({ port: 42000 }), rinfo.port, rinfo.address), 30);
+  });
+  await new Promise((resolve) => home.bind({ address: LOOPBACK, port: discoveryPort }, resolve));
+  t.after(() => {
+    home.close();
+    for (const forger of forgers) forger.close();
+  });
+  const clock = fakeClock();
+  const search = createLocalPairing({ loopback: true, discoveryPort }).discover({ clock });
+  await sleep(300);
+  clock.advance(4000);
+  assert.deepEqual(await search.result, [
+    { address: '127.0.0.2', port: 41000 }, { address: '127.0.0.3', port: 41001 },
+    { address: '127.0.0.4', port: 41002 }, { address: '127.0.0.5', port: 41003 },
+    { address: LOOPBACK, port: 42000 }
+  ]);
 });
 
 test('discover probes three times a second apart and stops listening at four seconds', async (t) => {
@@ -321,14 +352,14 @@ test('discover probes three times a second apart and stops listening at four sec
   assert.ok(probes.every((p) => p.text === '{"sanctum":"pair-probe","v":1}' && p.from === LOOPBACK));
 
   // A late answer still counts until four seconds are up.
-  const reply = replyBytes({ port: 40000, name: 'Late' });
+  const reply = replyBytes({ port: 40000 });
   clock.advance(1999);
   fakeHome.send(reply, probes[0].port, LOOPBACK);
   await sleep(100);
   assert.equal(done, null);
   clock.advance(1);
   await waitFor('the result', () => done !== null);
-  assert.deepEqual(done, [{ address: LOOPBACK, port: 40000, name: 'Late' }]);
+  assert.deepEqual(done, [{ address: LOOPBACK, port: 40000 }]);
   clock.advance(5000);
   await sleep(100);
   assert.equal(probes.length, 3, 'no probe after the end');
@@ -341,11 +372,11 @@ test('discover keeps only good replies, and one per address', async (t) => {
   fakeHome.on('message', (msg, rinfo) => {
     const send = (value) => fakeHome.send(Buffer.from(typeof value === 'string' ? value : JSON.stringify(value)), rinfo.port, rinfo.address);
     send('not json');
-    send({ sanctum: 'pair-here', v: 1, port: 80, name: 'Low port' });
-    send({ sanctum: 'pair-here', v: 1, port: 41000, name: 'x'.repeat(1100) });
-    send({ sanctum: 'pair-here', v: 1, port: 41001, name: 'Extra', extra: true });
-    send({ sanctum: 'pair-here', v: 1, port: 41002, name: 'Good' });
-    send({ sanctum: 'pair-here', v: 1, port: 41003, name: 'Second from the same address' });
+    send({ sanctum: 'pair-here', v: 1, port: 80 });
+    send(`{"sanctum":"pair-here","v":1,"port":41000${' '.repeat(1100)}}`);
+    send({ sanctum: 'pair-here', v: 1, port: 41001, name: 'A name' });
+    send({ sanctum: 'pair-here', v: 1, port: 41002 });
+    send({ sanctum: 'pair-here', v: 1, port: 41003 });
   });
   await new Promise((resolve) => fakeHome.bind({ address: LOOPBACK, port: discoveryPort }, resolve));
   t.after(() => fakeHome.close());
@@ -354,7 +385,7 @@ test('discover keeps only good replies, and one per address', async (t) => {
   const search = createLocalPairing({ loopback: true, discoveryPort }).discover({ clock });
   await sleep(300);
   clock.advance(4000);
-  assert.deepEqual(await search.result, [{ address: LOOPBACK, port: 41002, name: 'Good' }]);
+  assert.deepEqual(await search.result, [{ address: LOOPBACK, port: 41002 }]);
 });
 
 test('cancelling a search ends it at once with nothing', async () => {
@@ -442,7 +473,7 @@ test('a channel the other end closes reports onClose once', async (t) => {
   const client = connectLocalPairing({
     address: LOOPBACK,
     port: ports.tcpPort,
-    onOpen: () => client.send({ t: 'pake' }),
+    onOpen: () => client.send({ t: 'pake', pake: 'AAAA' }),
     onMessage: () => {},
     onClose: () => {
       closed += 1;
@@ -472,7 +503,7 @@ test('a line over 64 KiB closes the connection', async (t) => {
   const { ports, seen } = await startListener(t);
   const fits = rawClient(ports.tcpPort);
   await fits.opened;
-  const fitting = JSON.stringify({ t: 'pake', pad: 'x'.repeat(64 * 1024 - 40) });
+  const fitting = JSON.stringify({ t: 'pake', pake: 'A'.repeat(64 * 1024 - 40) });
   assert.ok(fitting.length + 1 <= 64 * 1024);
   fits.socket.write(`${fitting}\n`);
   await waitFor('the fitting line', () => seen.messages.length === 1);
@@ -486,16 +517,58 @@ test('a line over 64 KiB closes the connection', async (t) => {
   assert.equal(seen.messages.length, 1);
 });
 
-test('the ninth line closes the connection, and the eight before it arrive', async (t) => {
-  const { ports, seen } = await startListener(t);
-  const raw = rawClient(ports.tcpPort);
-  await raw.opened;
-  for (let i = 0; i < 8; i++) raw.socket.write(`${JSON.stringify({ t: 'pake', i })}\n`);
-  await waitFor('eight lines', () => seen.messages.length === 8);
-  assert.equal(raw.closed, false);
-  raw.socket.write(`${JSON.stringify({ t: 'pake', i: 8 })}\n`);
-  await waitFor('the connection to close', () => raw.closed);
-  assert.equal(seen.messages.length, 8);
+// One attempt per connection: a pake, then a confirm, and nothing more.
+test('home takes a pake first, then a confirm, and closes a connection for anything else', async (t) => {
+  const clock = fakeClock();
+  const { ports, seen } = await startListener(t, { clock });
+  const cases = {
+    'a first line that is not a pake': [JSON.stringify({ t: 'confirm', confirm: 'AAAA' })],
+    'a pake with no pake in it': [JSON.stringify({ t: 'pake' })],
+    'a pake whose pake is not text': [JSON.stringify({ t: 'pake', pake: 7 })],
+    'a pake with more in it': [JSON.stringify({ t: 'pake', pake: 'AAAA', more: 1 })],
+    'a second pake': [PAKE_LINE, PAKE_LINE],
+    'a line after the confirm': [PAKE_LINE, JSON.stringify({ t: 'confirm', confirm: 'AAAA' }), JSON.stringify({ t: 'confirm', confirm: 'AAAA' })]
+  };
+  for (const [what, lines] of Object.entries(cases)) {
+    clock.advance(1000);
+    const before = seen.messages.length;
+    const raw = rawClient(ports.tcpPort);
+    await raw.opened;
+    for (const line of lines) raw.socket.write(`${line}\n`);
+    await waitFor(`${what} to close it`, () => raw.closed);
+    // Everything up to the line that broke the rule arrives, and nothing after.
+    assert.equal(seen.messages.length - before, lines.length - 1, what);
+  }
+  // The right two lines keep it open.
+  clock.advance(1000);
+  const good = rawClient(ports.tcpPort);
+  await good.opened;
+  good.socket.write(`${PAKE_LINE}\n${JSON.stringify({ t: 'confirm', confirm: 'AAAA' })}\n`);
+  await sleep(150);
+  assert.equal(good.closed, false);
+});
+
+test('a connection that sends no pake within five seconds is closed', async (t) => {
+  const clock = fakeClock();
+  const { ports, seen } = await startListener(t, { clock });
+  const silent = rawClient(ports.tcpPort);
+  await silent.opened;
+  await waitFor('the connection to be seen', () => clock.pending() > 0);
+  clock.advance(4999);
+  await sleep(100);
+  assert.equal(silent.closed, false);
+  clock.advance(1);
+  await waitFor('the silent connection to close', () => silent.closed);
+
+  // A pake in time keeps it.
+  clock.advance(1000);
+  const prompt = rawClient(ports.tcpPort);
+  await prompt.opened;
+  prompt.socket.write(`${PAKE_LINE}\n`);
+  await waitFor('the pake', () => seen.messages.length === 1);
+  clock.advance(10000);
+  await sleep(100);
+  assert.equal(prompt.closed, false);
 });
 
 test('a line that is not a JSON object closes the connection', async (t) => {
@@ -511,14 +584,14 @@ test('a line that is not a JSON object closes the connection', async (t) => {
   assert.equal(seen.messages.length, 0);
 });
 
-test('thirty seconds without a line closes the connection', async (t) => {
+test('thirty seconds without a line after the pake closes the connection', async (t) => {
   const clock = fakeClock();
   const { ports, seen } = await startListener(t, { clock });
   const raw = rawClient(ports.tcpPort);
   await raw.opened;
   await waitFor('the connection to be seen', () => clock.pending() > 0);
-  clock.advance(20000);
-  raw.socket.write(`${JSON.stringify({ t: 'pake' })}\n`);
+  clock.advance(3000);
+  raw.socket.write(`${PAKE_LINE}\n`);
   await waitFor('the line', () => seen.messages.length === 1);
   // A line starts the thirty seconds again.
   clock.advance(29999);
@@ -575,15 +648,19 @@ test('home takes one new connection a second', async (t) => {
   assert.equal(first.closed, false);
 });
 
-test('home holds at most two connections at once', async (t) => {
+test('home holds at most two connections that have sent a pake, and turns a third away', async (t) => {
   const clock = fakeClock();
-  const { ports } = await startListener(t, { clock });
+  const { ports, seen } = await startListener(t, { clock });
   const clients = [];
   for (let i = 0; i < 3; i++) {
     clock.advance(1000);
     const raw = rawClient(ports.tcpPort);
     clients.push(raw);
     await raw.opened;
+    if (i < 2) {
+      raw.socket.write(`${PAKE_LINE}\n`);
+      await waitFor('its pake', () => seen.messages.length === i + 1);
+    }
     await sleep(80);
   }
   await waitFor('the third to be closed', () => clients[2].closed);
@@ -592,12 +669,43 @@ test('home holds at most two connections at once', async (t) => {
 
   // One going makes room.
   clients[0].socket.destroy();
+  await waitFor('home to see it go', () => seen.closed.length === 1);
   await sleep(100);
   clock.advance(1000);
   const next = rawClient(ports.tcpPort);
   await next.opened;
   await sleep(150);
   assert.equal(next.closed, false);
+});
+
+test('a new connection pushes out the oldest that hasn\'t sent a pake, so silence can\'t hold the slots', async (t) => {
+  const clock = fakeClock();
+  const { ports, seen } = await startListener(t, { clock });
+  const first = rawClient(ports.tcpPort);
+  await first.opened;
+  await sleep(80);
+  clock.advance(1000);
+  const second = rawClient(ports.tcpPort);
+  await second.opened;
+  await sleep(80);
+  second.socket.write(`${PAKE_LINE}\n`);
+  await waitFor('the second one\'s pake', () => seen.messages.length === 1);
+  clock.advance(1000);
+  const third = rawClient(ports.tcpPort);
+  await third.opened;
+  await waitFor('the silent first to be pushed out', () => first.closed);
+  await sleep(100);
+  assert.equal(second.closed, false, 'the one with a pake stays');
+  assert.equal(third.closed, false);
+
+  // Silent ones push each other out in turn, oldest first.
+  clock.advance(1000);
+  const fourth = rawClient(ports.tcpPort);
+  await fourth.opened;
+  await waitFor('the third to be pushed out', () => third.closed);
+  await sleep(100);
+  assert.equal(second.closed, false);
+  assert.equal(fourth.closed, false);
 });
 
 test('closing the listener frees both ports, ends its connections, and answers no more probes', async (t) => {
@@ -618,7 +726,7 @@ test('closing the listener frees both ports, ends its connections, and answers n
 test('closing before the sockets have bound still frees them', async (t) => {
   const discoveryPort = await freeUdpPort();
   const pairing = createLocalPairing({ loopback: true, discoveryPort });
-  const listener = pairing.listen({ name: 'Home', onMessage() {}, onClose() {} });
+  const listener = pairing.listen({ onMessage() {}, onClose() {} });
   const closing = listener.close();
   assert.equal(await listener.ready, null);
   await closing;
@@ -638,7 +746,7 @@ test('closing with flush lets what was sent arrive first', async (t) => {
   const client = connectLocalPairing({
     address: LOOPBACK,
     port: started.ports.tcpPort,
-    onOpen: () => client.send({ t: 'confirm' }),
+    onOpen: () => client.send({ t: 'pake', pake: 'AAAA' }),
     onMessage: (msg) => got.push(msg),
     onClose() {}
   });
@@ -652,9 +760,99 @@ test('a discovery port already in use leaves the listener unbound, and it says s
   await new Promise((resolve) => holder.bind({ address: LOOPBACK, port: discoveryPort, exclusive: true }, resolve));
   t.after(() => holder.close());
   const pairing = createLocalPairing({ loopback: true, discoveryPort });
-  const listener = pairing.listen({ name: 'Home', onMessage() {}, onClose() {} });
+  const listener = pairing.listen({ onMessage() {}, onClose() {} });
   assert.equal(await listener.ready, null);
   await listener.close();
+});
+
+test('a listener made right after one that is closing waits for it, and still binds', async () => {
+  const discoveryPort = await freeUdpPort();
+  const pairing = createLocalPairing({ loopback: true, discoveryPort });
+  // As when a code replaces one that hadn't finished binding: closed, not waited for.
+  const first = pairing.listen({ onMessage() {}, onClose() {} });
+  first.close();
+  const second = pairing.listen({ onMessage() {}, onClose() {} });
+  assert.equal(await first.ready, null);
+  const ports = await second.ready;
+  assert.ok(ports, 'the new one bound');
+  assert.equal(ports.udpPort, discoveryPort);
+  await second.close();
+
+  // And after one that had bound.
+  const third = pairing.listen({ onMessage() {}, onClose() {} });
+  assert.ok(await third.ready);
+  third.close();
+  const fourth = pairing.listen({ onMessage() {}, onClose() {} });
+  assert.ok(await fourth.ready);
+  await fourth.close();
+});
+
+// Replies a second, from each source and in all.
+test('home answers at most two probes a second from one address, and ten in all', async (t) => {
+  const clock = fakeClock();
+  const { ports } = await startListener(t, { clock });
+  const probers = [];
+  const answers = new Map();
+  for (let i = 1; i <= 7; i++) {
+    const prober = dgram.createSocket('udp4');
+    const address = `127.0.0.${i}`;
+    answers.set(address, 0);
+    prober.on('message', () => answers.set(address, answers.get(address) + 1));
+    await new Promise((resolve) => prober.bind({ address, port: 0 }, resolve));
+    probers.push(prober);
+  }
+  t.after(() => {
+    for (const prober of probers) prober.close();
+  });
+  const send = (prober) => new Promise((resolve) => prober.send(probeBytes(), ports.udpPort, LOOPBACK, resolve));
+
+  // One address, five probes: two answers.
+  for (let i = 0; i < 5; i++) await send(probers[0]);
+  await sleep(200);
+  assert.equal(answers.get('127.0.0.1'), 2);
+
+  // A second later, each of seven addresses asks twice: ten answers in all.
+  clock.advance(1000);
+  for (const prober of probers) {
+    await send(prober);
+    await send(prober);
+  }
+  await sleep(300);
+  const total = [...answers.values()].reduce((a, b) => a + b, 0) - 2;
+  assert.equal(total, 10);
+  for (const count of answers.values()) assert.ok(count <= 4);
+
+  // And the next second, a fresh allowance.
+  const before = answers.get('127.0.0.7');
+  clock.advance(1000);
+  await send(probers[6]);
+  await sleep(150);
+  assert.equal(answers.get('127.0.0.7'), before + 1);
+});
+
+// ---- A second guard, from the environment ----
+
+// Run in a process of its own without the test runner's variable, so only SANCTUM_LOOPBACK_ONLY
+// can be what refuses. It only calls the check, and never binds anything.
+test('SANCTUM_LOOPBACK_ONLY refuses any host but loopback, even outside the test runner', () => {
+  const { execFileSync } = require('node:child_process');
+  const script = `
+    const { checkBindHost } = require(${JSON.stringify(path.join(__dirname, '..', 'lib', 'remote', 'local-pairing.js'))});
+    const out = {};
+    for (const host of ['0.0.0.0', '192.168.1.5', '127.0.0.1', '::1']) {
+      try { checkBindHost(host); out[host] = 'allowed'; } catch { out[host] = 'refused'; }
+    }
+    process.stdout.write(JSON.stringify(out));
+  `;
+  const run = (extra) => {
+    const env = { ...process.env, ...extra };
+    delete env.NODE_TEST_CONTEXT;
+    if (!('SANCTUM_LOOPBACK_ONLY' in extra)) delete env.SANCTUM_LOOPBACK_ONLY;
+    return JSON.parse(execFileSync(process.execPath, ['-e', script], { env, encoding: 'utf8' }));
+  };
+  assert.deepEqual(run({ SANCTUM_LOOPBACK_ONLY: '1' }), { '0.0.0.0': 'refused', '192.168.1.5': 'refused', '127.0.0.1': 'allowed', '::1': 'allowed' });
+  // Without either, the app's own choice stands.
+  assert.deepEqual(run({}), { '0.0.0.0': 'allowed', '192.168.1.5': 'allowed', '127.0.0.1': 'allowed', '::1': 'allowed' });
 });
 
 // ---- The Mac's permission ----

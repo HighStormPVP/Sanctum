@@ -1011,6 +1011,8 @@ function startRemoteControl() {
     keystore,
     relay: remoteRelayClient,
     local: nearbyPairing(),
+    // A test's Worker is plain ws on this machine. Anywhere else a sealed address has to be wss.
+    acceptPlainLoopbackAddress: nearbyLoopback,
     addressStore: remoteAddressStore(path.join(userData, 'remote-service.json')),
     autoUnlock: { ...remoteAutoUnlockFile(path.join(userData, 'remote-autounlock.bin')), protect, unprotect },
     deviceName: os.hostname(),
