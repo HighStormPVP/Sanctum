@@ -2,7 +2,7 @@
 
 A private, local-first AI workspace. Electron desktop app. Chat, vision, code, video analysis, and agentic tasks — everything runs on the user's own machine via Ollama, with optional cloud models (Claude, Gemini) when the user supplies an API key.
 
-Current version: **v0.5.1**. Repo: `HighStormPVP/Sanctum`.
+Current version: **v0.5.2**. Repo: `HighStormPVP/Sanctum`.
 
 ## Running it
 
