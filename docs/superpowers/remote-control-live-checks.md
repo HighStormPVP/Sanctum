@@ -23,6 +23,7 @@ These use a throwaway pair of device keys made for the check, not a real device'
 
 ## Networks
 
+- [ ] **Same Wi-Fi.** Put both machines on the same home network. Pass: Settings > Devices says **Direct** within a minute. The hidden connection window offers only masked `.local` addresses on the home network, so this depends on the two PCs finding each other by name. If it says Through relay here, allowing the `media` permission check (not requests) on the transport session in `guardPermissions` brings back plain home-network addresses.
 - [ ] **Phone hotspot.** Put the laptop on a phone's hotspot and the home PC on its usual network. Pass: Settings > Devices shows the home PC connected, and says Direct or Through relay, matching what's really in use. A shared chat works either way.
 - [ ] **A network that blocks direct connections.** Use a network that blocks peer-to-peer traffic, such as some office, hotel, or school Wi-Fi. Pass: Settings > Devices says **Through relay**, and chat, streaming, and tools all still work.
 - [ ] **Signaling retries where direct is blocked.** On that network, leave both connected and idle for 30 minutes, and count the relay requests in the Cloudflare dashboard. Pass: the count is near the estimate of about 20 messages a minute for the direct attempts, and doesn't grow over time.

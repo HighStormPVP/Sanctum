@@ -664,7 +664,7 @@ let trayMenu = null;
 let trayNoteDue = false;
 let trayFailed = false;
 const STILL_RUNNING_TITLE = 'Sanctum is still running';
-const STILL_RUNNING_TEXT = 'Sanctum keeps running in the tray, so a paired laptop can still reach this PC. Quit it from there.';
+const STILL_RUNNING_TEXT = 'Sanctum keeps running in the tray, so your other devices can still reach this PC. Quit it from there.';
 const START_AT_LOGIN_UNPACKAGED = 'Starting when you log in works in the installed app.';
 
 // For the tests in e2e/ only. `peek` shows them what's going on here, and keeps the note off the

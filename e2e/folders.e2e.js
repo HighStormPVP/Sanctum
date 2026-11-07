@@ -21,7 +21,7 @@ const ROOT = path.join(__dirname, '..');
 
 const FLAGS = 'log,no-stun,peek';
 const KEEP_AWAKE = 'Keep this PC awake while a chat is shared';
-const STILL_RUNNING = 'Sanctum keeps running in the tray, so a paired laptop can still reach this PC. Quit it from there.';
+const STILL_RUNNING = 'Sanctum keeps running in the tray, so your other devices can still reach this PC. Quit it from there.';
 const START_AT_LOGIN = 'Start Sanctum when I log in';
 const PROFILE_REFUSED = "That is Sanctum's own data folder. A project can't use it.";
 const LISTING_REFUSED = "The home PC's answer wasn't a folder listing, so it isn't shown.";
