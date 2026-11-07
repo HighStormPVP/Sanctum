@@ -67,7 +67,10 @@
       ],
       "hardenedRuntime": false,
       "gatekeeperAssess": false,
-      "identity": null
+      "identity": null,
+      "extendInfo": {
+        "NSLocalNetworkUsageDescription": "Sanctum looks for your home PC on this network when you pair with a code."
+      }
     },
     "dmg": {
       "title": "Sanctum ${version}"

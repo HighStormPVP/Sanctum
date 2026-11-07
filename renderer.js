@@ -6936,12 +6936,20 @@ function paintRemoteDevices() {
   if (!note.classList.contains('remote-note-error')) {
     note.textContent = on
       ? 'Remote Control is set up on this device. Paste a new address to replace it.'
-      : "Remote Control stays off until a private service address is set here. If you don't have one, you can ignore this.";
+      : 'Your home PC needs this once. A laptop on the same Wi-Fi gets it when it pairs with a code.';
   }
   $('#remote-address').placeholder = on ? 'Saved' : 'Paste the address';
+  // With no address, the field waits under a fold below Connect to a home PC, since a laptop on
+  // the same Wi-Fi gets the address when it pairs. Once there is one, it reads as it always has.
+  const fold = $('#remote-address-fold');
+  fold.classList.toggle('is-set', on);
+  if (on) fold.open = true;
+  else if (remoteUi.addressWasSet) fold.open = false;
+  remoteUi.addressWasSet = on;
   $('#remote-reset-notice').hidden = !(state.remoteKeysReset && !remoteDevices().length);
   $('#remote-panel-lock').hidden = !lockedOut;
-  body.hidden = !on || lockedOut;
+  body.hidden = lockedOut;
+  $('#remote-add-device').hidden = !on;
 
   // Off can always be reached, because it must never wait for the PIN. On needs a home PC to
   // mean anything, and the PIN.
@@ -6949,7 +6957,13 @@ function paintRemoteDevices() {
   const control = $('#remote-control-wrap');
   control.hidden = !on || !(lockedOut ? status.controlAllowed === true : remoteHomes().length > 0);
   $('#remote-control-switch').setAttribute('aria-checked', status.controlAllowed === true ? 'true' : 'false');
-  if (body.hidden) { $('#remote-device-list').replaceChildren(); return; }
+  if (body.hidden || !on) {
+    $('#remote-device-list').replaceChildren();
+    $('#remote-device-list').hidden = true;
+    $('#remote-own-fingerprint').hidden = true;
+    $('#remote-fingerprint-help').hidden = true;
+    return;
+  }
 
   const list = $('#remote-device-list');
   list.replaceChildren(...remoteDevices().map(renderRemoteDevice));
@@ -7101,6 +7115,8 @@ function paintCodeDialog() {
   hint.textContent = REMOTE_CODE_HINT;
   const expiry = $('#remote-code-expiry');
   expiry.hidden = !showing;
+  // A laptop on the same Wi-Fi looks for this PC while the code shows, and Windows may ask first.
+  $('#remote-code-firewall').hidden = !(showing && window.api?.platform === 'win32');
   expiry.textContent = showing ? `Expires in ${RemoteRules.codeTimeLeft(ui.expiresAt, Date.now()) || '0:00'}` : '';
   const message = $('#remote-code-message');
   message.textContent = ui.message;
@@ -7136,6 +7152,9 @@ function openConnectDialog() {
   $('#remote-connect-submit').textContent = 'Connect';
   // The first home PC is what makes this device need one.
   $('#remote-connect-pin-fields').hidden = remoteStatusNow().hasPin === true;
+  // With no address, this device finds its home PC on the network it's on.
+  $('#remote-connect-nearby').hidden = remoteStatusNow().enabled === true;
+  $('#remote-connect-looking').hidden = true;
   $('#remote-connect-code').focus();
 }
 
@@ -7162,9 +7181,14 @@ async function submitConnect() {
   submit.disabled = true;
   submit.textContent = 'Connecting…';
   remoteUi.pairing = true;
+  const searching = remoteStatusNow().enabled !== true;
+  $('#remote-connect-looking').hidden = !searching;
   const answer = await window.api.remote.pair(code, remoteStatusNow().name, pin)
     .catch(() => ({ ok: false, error: "Couldn't connect. Try again." }));
   remoteUi.pairing = false;
+  $('#remote-connect-looking').hidden = true;
+  // Nothing found here, so the other way in is opened, ready below Connect to a home PC.
+  if (searching && !answer.ok) $('#remote-address-fold').open = true;
   remoteStatusRefresh();
   // Still happened if the dialog has been closed since, and worth saying so.
   if (answer.ok) showToast(`Connected to ${answer.device?.name || 'your home PC'}`, 'ok');

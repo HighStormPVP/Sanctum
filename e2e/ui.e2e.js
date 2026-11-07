@@ -21,7 +21,8 @@ const isVisible = (device, selector) =>
     const el = document.querySelector(s);
     if (!el) return false;
     const box = el.getBoundingClientRect();
-    return box.width > 0 && box.height > 0 && getComputedStyle(el).visibility !== 'hidden';
+    // checkVisibility, since what a closed fold holds still has a size.
+    return box.width > 0 && box.height > 0 && getComputedStyle(el).visibility !== 'hidden' && el.checkVisibility();
   }, selector);
 
 const textOf = (device, selector) => device.page.evaluate((s) => document.querySelector(s)?.textContent?.trim() ?? null, selector);
@@ -46,12 +47,19 @@ const said = (device, selector, text, ms = 5000) => waitFor(`${device.name} to s
 async function openDevices(device) {
   await click(device, '#open-settings');
   await click(device, '.set-nav-btn[data-panel="devices"]');
+  await appeared(device, '#remote-address-fold');
+}
+
+// With no address yet, the field is folded away below Connect to a home PC.
+async function showAddressField(device) {
+  if (!(await isVisible(device, '#remote-address'))) await click(device, '#remote-address-summary');
   await appeared(device, '#remote-address');
 }
 
 const closeSettings = (device) => click(device, '#settings-close');
 
 async function saveAddress(device, address) {
+  await showAddressField(device);
   await fill(device, '#remote-address', address);
   await click(device, '#remote-address-save');
   await waitFor(`${device.name}'s address to take`, async () => (await status(device)).enabled === true);
@@ -179,7 +187,7 @@ test('with no address', async (t) => {
   });
   await newChat(device, { modality: 'chat', title: 'A plain chat', webEnabled: false });
 
-  await t.test('no Remote Control UI exists anywhere but the place to paste the address, and nothing connects', async () => {
+  await t.test('no Remote Control UI exists anywhere but Connect to a home PC and the folded address, and nothing connects', async () => {
     assert.equal((await status(device)).enabled, false);
 
     await click(device, '#tools-menu-btn');
@@ -200,9 +208,11 @@ test('with no address', async (t) => {
     assert.equal(await count(device, '.remote-indicator'), 0);
 
     await openDevices(device);
-    for (const selector of ['#remote-add-device', '#remote-connect-home', '#remote-device-list', '#remote-own-fingerprint', '#remote-control-wrap']) {
+    for (const selector of ['#remote-add-device', '#remote-device-list', '#remote-own-fingerprint', '#remote-control-wrap', '#availability-wrap', '#remote-address']) {
       assert.equal(await isVisible(device, selector), false, selector);
     }
+    assert.equal(await isVisible(device, '#remote-connect-home'), true);
+    assert.equal(await isVisible(device, '#remote-address-summary'), true);
     await closeSettings(device);
 
     await sleep(1500);
@@ -236,6 +246,7 @@ test('with no address', async (t) => {
 
   await t.test('a bad address is refused where it was typed', async () => {
     await openDevices(device);
+    await showAddressField(device);
     await fill(device, '#remote-address', 'not an address');
     await click(device, '#remote-address-save');
     await said(device, '#remote-address-note', "That doesn't look like a Remote Control address.");

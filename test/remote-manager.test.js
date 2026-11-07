@@ -203,6 +203,117 @@ function fakeRelay() {
   return relay;
 }
 
+// Pairing on the same network, the way lib/remote/local-pairing.js behaves: home listens while a
+// code shows, a search finds every home that's listening, and a connection carries JSON both ways.
+// Nothing arrives until pump() runs. A test can add homes nobody's listening for with `extraHomes`.
+function fakeLocal() {
+  const queue = [];
+  let nextPort = 50000;
+  const local = {
+    listeners: [],
+    searches: [],
+    connects: [],
+    // Every message, from whichever end, as it was sent.
+    wire: [],
+    extraHomes: [],
+    pump() {
+      while (queue.length) queue.shift()();
+    },
+    open: () => local.listeners.filter((l) => !l.closed),
+    listen(opts) {
+      const port = nextPort++;
+      const listener = {
+        opts,
+        port,
+        closed: false,
+        closeOptions: undefined,
+        channels: new Set(),
+        ready: Promise.resolve({ udpPort: 47613, tcpPort: port }),
+        close(options) {
+          if (!listener.closed) listener.closeOptions = options;
+          listener.closed = true;
+          for (const channel of [...listener.channels]) channel.close(options);
+          return Promise.resolve();
+        }
+      };
+      local.listeners.push(listener);
+      return listener;
+    },
+    discover() {
+      const homes = [
+        ...local.open().map((l, i) => ({ address: `192.168.1.${10 + i}`, port: l.port, name: l.opts.name })),
+        ...local.extraHomes
+      ];
+      const search = { homes, cancelled: false };
+      local.searches.push(search);
+      return {
+        result: Promise.resolve(homes),
+        cancel() {
+          search.cancelled = true;
+        }
+      };
+    },
+    connect(opts) {
+      const listener = local.listeners.find((l) => l.port === opts.port);
+      const client = { opts, closed: false };
+      const channel = {
+        closed: false,
+        send(data) {
+          if (channel.closed) return false;
+          local.wire.push({ from: 'home', data });
+          const text = JSON.stringify(data);
+          queue.push(() => {
+            if (!client.closed) client.opts.onMessage(JSON.parse(text));
+          });
+          return true;
+        },
+        close() {
+          if (channel.closed) return;
+          channel.closed = true;
+          listener.channels.delete(channel);
+          queue.push(() => {
+            if (client.closed) return;
+            client.closed = true;
+            client.opts.onClose();
+          });
+        }
+      };
+      client.send = (data) => {
+        if (client.closed) return false;
+        local.wire.push({ from: 'laptop', data });
+        const text = JSON.stringify(data);
+        queue.push(() => {
+          if (!channel.closed) listener.opts.onMessage(channel, JSON.parse(text));
+        });
+        return true;
+      };
+      client.close = () => {
+        if (client.closed) return;
+        client.closed = true;
+        queue.push(() => {
+          if (channel.closed || !listener) return;
+          channel.closed = true;
+          listener.channels.delete(channel);
+          listener.opts.onClose(channel);
+        });
+      };
+      local.connects.push(client);
+      queue.push(() => {
+        if (client.closed) return;
+        if (!listener || listener.closed) {
+          client.closed = true;
+          opts.onClose();
+          return;
+        }
+        listener.channels.add(channel);
+        opts.onOpen();
+      });
+      return client;
+    }
+  };
+  return local;
+}
+
 // The secret's file, in memory, with sealing that visibly changes the bytes.
 function fakeAutoUnlock() {
   const store = { bytes: null, writes: 0, reads: 0, failProtect: false, failUnprotect: false, failRead: false, garble: false };
@@ -248,7 +359,7 @@ async function until(what, check) {
 
 function newWorld(t) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sanctum-manager-'));
-  const world = { clock: fakeClock(), relay: fakeRelay(), devices: [], keystoreOffset: 0 };
+  const world = { clock: fakeClock(), relay: fakeRelay(), local: fakeLocal(), devices: [], keystoreOffset: 0 };
   t.after(() => {
     for (const device of world.devices) device.manager?.shutdown();
     fs.rmSync(dir, { recursive: true, force: true });
@@ -264,9 +375,9 @@ function newWorld(t) {
       now: () => Date.now() + world.keystoreOffset
     });
   // A device with a PIN set, whose manager isn't running yet, so a test can seed peers.
-  world.device = async (name, { pin = true, address = ADDRESS, file = world.newFile(), keystore = world.keystore(file) } = {}) => {
+  world.device = async (name, { pin = true, address = ADDRESS, file = world.newFile(), keystore = world.keystore(file), local = false } = {}) => {
     if (pin) assert.deepEqual(await keystore.setPin(PIN), { ok: true });
-    const device = { name, keystore, file, autoUnlock: fakeAutoUnlock(), frames: [], statuses: [], refusals: [], address };
+    const device = { name, keystore, file, autoUnlock: fakeAutoUnlock(), frames: [], statuses: [], refusals: [], address, saves: [], local: local ? world.local : null };
     device.identity = () => keystore.getIdentity();
     device.id = pin ? deviceIdFromPublicKey(keystore.getIdentity().publicKey) : null;
     device.start = () => {
@@ -276,10 +387,12 @@ function newWorld(t) {
         addressStore: {
           load: () => device.address,
           save: (url) => {
+            device.saves.push(url);
             device.address = url;
           }
         },
         autoUnlock: device.autoUnlock,
+        local: device.local,
         clock: world.clock,
         deviceName: name,
         createDirect: device.createDirect,
@@ -314,7 +427,10 @@ function newWorld(t) {
     world.devices.push(device);
     return device;
   };
-  world.run = (ms) => world.clock.advance(ms, () => world.relay.pump());
+  world.run = (ms) => world.clock.advance(ms, () => {
+    world.relay.pump();
+    world.local.pump();
+  });
   return world;
 }
 
@@ -4672,4 +4788,433 @@ test("status says this device's own id, the one the other end knows it by", asyn
   assert.equal(laptop.manager.status().deviceId, laptop.id);
   assert.equal(home.manager.status().deviceId, home.id);
   assert.ok(home.entry(laptop.id), 'and it is the id home lists that laptop under');
+});
+
+// ---- Pairing on the same network ----
+
+const NOT_FOUND_HERE = "Couldn't find a home PC showing a code on this network. Check both are on the same Wi-Fi, or paste the service address below.";
+
+// Runs both fakes and lets promises settle until `promise` has its answer.
+async function settleWith(world, promise) {
+  let done = false;
+  let value;
+  promise.then((v) => {
+    done = true;
+    value = v;
+  });
+  for (let i = 0; i < 500 && !done; i++) {
+    world.relay.pump();
+    world.local.pump();
+    await tick();
+  }
+  assert.ok(done, 'it settled');
+  return value;
+}
+
+// A laptop's end over the local network, not backed by a manager.
+function rawLocalGuest(local, port, { code, identity = newIdentity(), name = 'Guest' }) {
+  const guest = createPairingGuest({ code, identity, name });
+  const raw = { guest, identity, received: [], closed: false };
+  raw.client = local.connect({
+    address: '192.168.1.50',
+    port,
+    onOpen: () => raw.client.send(guest.first),
+    onMessage: (data) => raw.received.push(data),
+    onClose: () => {
+      raw.closed = true;
+    }
+  });
+  return raw;
+}
+
+// A home PC listening on the local network, not backed by a manager, that seals `address`.
+function rawLocalHost(local, { code, identity = newIdentity(), name = 'Other home', address }) {
+  const host = createPairingHost({ code, identity, name });
+  const raw = { host, identity, peers: [] };
+  raw.listener = local.listen({
+    name,
+    onMessage: (channel, data) => {
+      const result = host.handle(data, address === undefined ? undefined : { address });
+      if (result.peer) raw.peers.push(result.peer);
+      if (result.reply) channel.send(result.reply);
+    },
+    onClose() {}
+  });
+  return raw;
+}
+
+const otherCode = (code) => (code === '222222' ? '333333' : '222222');
+
+test('same network: a laptop with no address pairs with only the code, gets the address sealed, and connects through the relay', async (t) => {
+  const world = newWorld(t);
+  const home = await world.device('Home', { local: true });
+  const laptop = await world.device('Laptop', { address: null, local: true });
+  home.start();
+  laptop.start();
+  assert.equal(laptop.manager.status().enabled, false);
+
+  const { code } = await home.manager.createCode();
+  world.relay.pump();
+  assert.equal(world.local.open().length, 1, 'home listens while the code shows');
+  assert.equal(world.local.listeners[0].opts.name, 'Home');
+
+  const answer = await settleWith(world, laptop.manager.pair(code.toLowerCase(), 'My laptop'));
+  assert.equal(answer.ok, true, answer.error);
+  assert.equal(answer.device.id, home.id);
+  assert.equal(answer.device.role, 'home');
+  assert.deepEqual(laptop.saves, [ADDRESS], 'saved the way setAddress saves it');
+  assert.equal(laptop.manager.status().enabled, true);
+  assert.equal(world.relay.pairConnects.filter((c) => c.role === 'guest').length, 0, 'none of it went by the relay');
+  assert.equal(world.local.open().length, 0, 'home stopped listening');
+  assert.deepEqual(world.local.listeners[0].closeOptions, { flush: true });
+  assert.equal(home.manager.status().codePending, false);
+
+  // From here it's the relay, as for any pair.
+  world.run(1000);
+  assert.equal(laptop.entry(home.id).connected, true);
+  assert.equal(home.entry(laptop.id).connected, true);
+  assert.equal(home.entry(laptop.id).name, 'My laptop');
+  assert.ok(world.relay.deviceConnects.some((c) => c.deviceId === laptop.id && c.opts.address === ADDRESS));
+  assert.equal(laptop.manager.send(home.id, { hello: 'home' }), true);
+  world.relay.pump();
+  assert.deepEqual(home.frames, [{ id: laptop.id, frame: { hello: 'home' } }]);
+
+  // Neither the address nor the code crossed readably.
+  const wire = JSON.stringify(world.local.wire);
+  assert.deepEqual(world.local.wire.map((w) => [w.from, w.data.t]), [
+    ['laptop', 'pake'], ['home', 'pake-reply'], ['laptop', 'confirm'], ['home', 'identity']
+  ]);
+  for (const needle of ['secret-part-of-the-address', 'relay.example', code, code.toLowerCase()]) assert.ok(!wire.includes(needle), needle);
+});
+
+test('same network: a first pairing this way sets the PIN as usual, and asks for it before searching', async (t) => {
+  const world = newWorld(t);
+  const home = await world.device('Home', { local: true });
+  const laptop = await world.device('Laptop', { address: null, local: true, pin: false });
+  home.start();
+  laptop.start();
+  const { code } = await home.manager.createCode();
+  world.relay.pump();
+
+  const noPin = await settleWith(world, laptop.manager.pair(code, 'Laptop'));
+  assert.equal(noPin.ok, false);
+  assert.match(noPin.error, /PIN/);
+  assert.equal(world.local.searches.length, 0);
+
+  const answer = await settleWith(world, laptop.manager.pair(code, 'Laptop', '654321'));
+  assert.equal(answer.ok, true, answer.error);
+  await until('the PIN', () => laptop.manager.status().hasPin === true);
+  assert.equal(laptop.manager.status().needsPin, false);
+  assert.deepEqual(laptop.saves, [ADDRESS]);
+});
+
+test('same network: a device with an address pairs through the relay exactly as before, and never searches', async (t) => {
+  const world = newWorld(t);
+  const home = await world.device('Home', { local: true });
+  const laptop = await world.device('Laptop', { local: true });
+  home.start();
+  laptop.start();
+  const { code } = await home.manager.createCode();
+  world.relay.pump();
+  const answer = await settleWith(world, laptop.manager.pair(code, 'Laptop'));
+  assert.equal(answer.ok, true, answer.error);
+  assert.equal(world.local.searches.length, 0);
+  assert.equal(world.local.connects.length, 0);
+  assert.equal(world.local.open().length, 0, 'and home stopped listening when it paired');
+  assert.deepEqual(laptop.saves, []);
+});
+
+test('same network: a relay pairing never carries the address, and a local one does', async (t) => {
+  const world = newWorld(t);
+  const home = await world.device('Home', { local: true });
+  home.start();
+
+  const first = await home.manager.createCode();
+  world.relay.pump();
+  const viaRelay = rawGuest(world.relay, { code: first.code });
+  world.relay.pump();
+  viaRelay.client.send(viaRelay.guest.handle(viaRelay.received[0]).reply);
+  world.relay.pump();
+  const relayDone = viaRelay.guest.handle(viaRelay.received[1]);
+  assert.ok(relayDone.peer);
+  assert.ok(!('address' in relayDone));
+
+  const second = await home.manager.createCode();
+  world.relay.pump();
+  const viaLocal = rawLocalGuest(world.local, world.local.open()[0].port, { code: second.code });
+  world.local.pump();
+  viaLocal.client.send(viaLocal.guest.handle(viaLocal.received[0]).reply);
+  world.local.pump();
+  const localDone = viaLocal.guest.handle(viaLocal.received[1]);
+  assert.ok(localDone.peer);
+  assert.equal(localDone.address, ADDRESS);
+});
+
+test('same network: a wrong code gets the pake reply and nothing else, and no address in any form', async (t) => {
+  const world = newWorld(t);
+  const home = await world.device('Home', { local: true });
+  home.start();
+  const { code } = await home.manager.createCode();
+  world.relay.pump();
+  const raw = rawLocalGuest(world.local, world.local.open()[0].port, { code: otherCode(code) });
+  world.local.pump();
+  assert.equal(raw.received.length, 1);
+  assert.deepEqual(Object.keys(raw.received[0]).sort(), ['confirm', 'pake', 't']);
+  assert.ok(raw.guest.handle(raw.received[0]).failed);
+  // A guess at the confirmation anyway gets nothing back.
+  raw.client.send({ t: 'confirm', confirm: raw.received[0].confirm, nonce: 'AAAA', box: 'AAAA' });
+  world.local.pump();
+  assert.equal(raw.received.length, 1);
+  const wire = JSON.stringify(world.local.wire);
+  for (const needle of ['secret-part-of-the-address', 'relay.example', Buffer.from(ADDRESS).toString('base64').slice(0, 16)]) {
+    assert.ok(!wire.includes(needle), needle);
+  }
+  assert.deepEqual(home.manager.status().devices, []);
+});
+
+test('same network: one budget across both ways in, so five wrong guesses, either way, cancel the code', async (t) => {
+  const world = newWorld(t);
+  const home = await world.device('Home', { local: true });
+  home.start();
+  const { code } = await home.manager.createCode();
+  world.relay.pump();
+  const wrong = otherCode(code);
+  const port = world.local.open()[0].port;
+
+  for (let i = 0; i < 4; i++) {
+    rawGuest(world.relay, { code: wrong });
+    world.relay.pump();
+  }
+  assert.equal(home.manager.status().codePending, true);
+  const fifth = rawLocalGuest(world.local, port, { code: wrong });
+  world.local.pump();
+  assert.equal(fifth.received.length, 1, 'the fifth guess is answered');
+  // The connection ending is that guess over, so there's no need to wait for it.
+  fifth.client.close();
+  world.local.pump();
+  assert.equal(home.manager.status().codePending, false);
+  assert.equal(world.local.open().length, 0);
+  assert.equal(world.relay.pairConnects[0].closed, true);
+
+  // And the other way round: local guesses use up what the relay may have.
+  const again = await home.manager.createCode();
+  world.relay.pump();
+  const nextPort = world.local.open()[0].port;
+  for (let i = 0; i < 5; i++) {
+    const raw = rawLocalGuest(world.local, nextPort, { code: otherCode(again.code) });
+    world.local.pump();
+    raw.client.close();
+    world.local.pump();
+  }
+  assert.equal(home.manager.status().codePending, false);
+  const late = rawGuest(world.relay, { code: again.code });
+  world.relay.pump();
+  assert.equal(late.none, true);
+});
+
+test('same network: the fifth attempt over the local network can still pair', async (t) => {
+  const world = newWorld(t);
+  const home = await world.device('Home', { local: true });
+  const laptop = await world.device('Laptop', { address: null, local: true });
+  home.start();
+  laptop.start();
+  const { code } = await home.manager.createCode();
+  world.relay.pump();
+  for (let i = 0; i < 4; i++) {
+    rawGuest(world.relay, { code: otherCode(code) });
+    world.relay.pump();
+  }
+  const answer = await settleWith(world, laptop.manager.pair(code, 'Laptop'));
+  assert.equal(answer.ok, true, answer.error);
+});
+
+test('same network: the listener goes with the code, however the code ends', async (t) => {
+  const world = newWorld(t);
+  const home = await world.device('Home', { local: true });
+  home.start();
+  const latest = () => world.local.listeners[world.local.listeners.length - 1];
+  const fresh = async () => {
+    const before = world.local.listeners.length;
+    assert.ok((await home.manager.createCode()).code);
+    world.relay.pump();
+    assert.equal(world.local.listeners.length, before + 1);
+    assert.equal(latest().closed, false);
+    return latest();
+  };
+
+  let listener = await fresh();
+  home.manager.cancelCode();
+  assert.equal(listener.closed, true, 'cancelled');
+
+  listener = await fresh();
+  world.run(10 * MINUTES);
+  assert.equal(listener.closed, true, 'expired');
+
+  listener = await fresh();
+  const replacement = await fresh();
+  assert.equal(listener.closed, true, 'replaced');
+  assert.equal(replacement.closed, false);
+
+  world.relay.pairConnects[world.relay.pairConnects.length - 1].opts.onClose();
+  assert.equal(replacement.closed, true, 'the relay slot ended');
+
+  listener = await fresh();
+  home.manager.lock();
+  assert.equal(listener.closed, true, 'locked');
+  assert.equal((await home.manager.unlock(PIN)).ok, true);
+
+  listener = await fresh();
+  assert.deepEqual(home.manager.setAddress(''), { ok: true });
+  assert.equal(listener.closed, true, 'Remote Control turned off');
+  assert.deepEqual(home.manager.setAddress(ADDRESS), { ok: true });
+
+  listener = await fresh();
+  home.manager.shutdown();
+  assert.equal(listener.closed, true, 'shut down');
+  assert.equal(world.local.open().length, 0);
+});
+
+test('same network: with no home showing a code it says so, and the code can be tried again', async (t) => {
+  const world = newWorld(t);
+  const laptop = await world.device('Laptop', { address: null, local: true });
+  laptop.start();
+  const answer = await settleWith(world, laptop.manager.pair('ABCDEF', 'Laptop'));
+  assert.deepEqual(answer, { ok: false, error: NOT_FOUND_HERE });
+  const again = await settleWith(world, laptop.manager.pair('ABCDEF', 'Laptop'));
+  assert.deepEqual(again, { ok: false, error: NOT_FOUND_HERE });
+  assert.equal(world.local.searches.length, 2);
+  assert.equal(world.relay.pairConnects.length, 0);
+  assert.equal(world.relay.deviceConnects.length, 0);
+  assert.deepEqual(laptop.saves, []);
+});
+
+test('same network: with no address and no way to search, it is not set up, as before', async (t) => {
+  const world = newWorld(t);
+  const laptop = await world.device('Laptop', { address: null });
+  laptop.start();
+  const answer = await laptop.manager.pair('ABCDEF', 'Laptop');
+  assert.deepEqual(answer, { ok: false, error: "Remote Control isn't set up on this device yet." });
+});
+
+test('same network: the laptop tries each home in turn, and a wrong one costs that home one attempt', async (t) => {
+  const world = newWorld(t);
+  const home = await world.device('Home', { local: true });
+  const laptop = await world.device('Laptop', { address: null, local: true });
+  home.start();
+  laptop.start();
+  const { code } = await home.manager.createCode();
+  world.relay.pump();
+  const stranger = rawLocalHost(world.local, { code: otherCode(code), address: 'wss://stranger.example/abc' });
+  const realPort = world.local.listeners[0].port;
+  // The stranger is found first.
+  world.local.discover = () => ({
+    result: Promise.resolve([
+      { address: '192.168.1.66', port: stranger.listener.port, name: 'Other home' },
+      { address: '192.168.1.10', port: realPort, name: 'Home' }
+    ]),
+    cancel() {}
+  });
+
+  const answer = await settleWith(world, laptop.manager.pair(code, 'Laptop'));
+  assert.equal(answer.ok, true, answer.error);
+  assert.equal(answer.device.id, home.id);
+  assert.equal(stranger.host.attemptsLeft, 4);
+  assert.deepEqual(stranger.peers, []);
+  assert.deepEqual(laptop.saves, [ADDRESS]);
+  assert.ok(world.local.connects[0].closed, 'it left the stranger');
+});
+
+test('same network: every home wrong is a wrong code, and that code is then refused without asking again', async (t) => {
+  const world = newWorld(t);
+  const laptop = await world.device('Laptop', { address: null, local: true });
+  laptop.start();
+  const stranger = rawLocalHost(world.local, { code: '222222', address: ADDRESS });
+  const first = await settleWith(world, laptop.manager.pair('333333', 'Laptop'));
+  assert.deepEqual(first, { ok: false, error: WRONG_CODE_RETRY });
+  const second = await settleWith(world, laptop.manager.pair('333333', 'Laptop'));
+  assert.deepEqual(second, { ok: false, error: WRONG_CODE_FINAL });
+  assert.equal(stranger.host.attemptsLeft, 4);
+});
+
+test('same network: the laptop refuses an address that is not a relay address, or none, and keeps nothing', async (t) => {
+  for (const address of ['http://evil.example/abc', 'wss://evil.example/a/b', 'ws://evil.example/abc', '', undefined]) {
+    const world = newWorld(t);
+    const laptop = await world.device('Laptop', { address: null, local: true });
+    laptop.start();
+    const host = rawLocalHost(world.local, { code: 'ABCDEF', name: 'Home', address });
+    const answer = await settleWith(world, laptop.manager.pair('ABCDEF', 'Laptop'));
+    assert.equal(answer.ok, false, String(address));
+    assert.ok(answer.error && !answer.error.includes('evil'), answer.error);
+    assert.equal(host.peers.length, 1, 'home had paired');
+    assert.deepEqual(laptop.saves, []);
+    assert.deepEqual(laptop.keystore.listPeers(), []);
+    assert.equal(laptop.manager.status().enabled, false);
+    assert.deepEqual(laptop.manager.status().devices, []);
+  }
+});
+
+test('same network: a laptop that has an address keeps it, whatever a home seals', async (t) => {
+  const world = newWorld(t);
+  const laptop = await world.device('Laptop', { local: true });
+  laptop.start();
+  // A home that seals an address even over the relay, which a real one never does.
+  const host = createPairingHost({ code: 'ABCDEF', identity: newIdentity(), name: 'Pushy home' });
+  const client = world.relay.connectPairing({
+    role: 'host',
+    onOpen() {},
+    onNone() {},
+    onClose() {},
+    onMessage: (data) => {
+      const result = host.handle(data, { address: 'wss://other.example/not-mine' });
+      if (result.reply) client.send(result.reply);
+    }
+  });
+  world.relay.pump();
+  const answer = await settleWith(world, laptop.manager.pair('ABCDEF', 'Laptop'));
+  assert.equal(answer.ok, true, answer.error);
+  assert.deepEqual(laptop.saves, []);
+  assert.equal(laptop.address, ADDRESS);
+  world.run(1000);
+  assert.ok(world.relay.deviceConnects.every((c) => c.opts.address === ADDRESS));
+});
+
+test('same network: locking while it searches ends the search', async (t) => {
+  const world = newWorld(t);
+  const laptop = await world.device('Laptop', { address: null, local: true });
+  laptop.start();
+  const pairing = laptop.manager.pair('ABCDEF', 'Laptop');
+  laptop.manager.lock();
+  const answer = await settleWith(world, pairing);
+  assert.deepEqual(answer, { ok: false, error: 'Remote Control is locked. Enter the PIN first.' });
+  assert.equal(world.local.searches.length, 1);
+  assert.equal(world.local.searches[0].cancelled, true);
+  assert.equal(world.local.connects.length, 0);
+});
+
+test('same network: a home that never answers is left after a while, and the next one tried', async (t) => {
+  const world = newWorld(t);
+  const home = await world.device('Home', { local: true });
+  const laptop = await world.device('Laptop', { address: null, local: true });
+  home.start();
+  laptop.start();
+  const { code } = await home.manager.createCode();
+  world.relay.pump();
+  const silent = world.local.listen({ name: 'Silent', onMessage() {}, onClose() {} });
+  const realPort = world.local.listeners[0].port;
+  world.local.discover = () => ({
+    result: Promise.resolve([
+      { address: '192.168.1.77', port: silent.port, name: 'Silent' },
+      { address: '192.168.1.10', port: realPort, name: 'Home' }
+    ]),
+    cancel() {}
+  });
+  const pairing = laptop.manager.pair(code, 'Laptop');
+  for (let i = 0; i < 20; i++) {
+    world.local.pump();
+    await tick();
+  }
+  assert.equal(world.local.connects.length, 1);
+  world.run(10 * 1000);
+  const answer = await settleWith(world, pairing);
+  assert.equal(answer.ok, true, answer.error);
 });

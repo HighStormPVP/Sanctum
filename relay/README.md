@@ -91,9 +91,11 @@ You need the Cloudflare account on the Workers Paid plan, Node 22 or later, and 
 
 ## Giving Sanctum the address
 
-On each device, open **Settings > Devices**, paste the address into **Service address**, and choose **Save**. Sanctum hides it once it's saved. Do this once on every device, home PCs and laptops alike. Then pair as usual with **Add a device** and **Connect to a home PC**.
+On the home PC, open **Settings > Devices**, open **Service address**, paste the address, and choose **Save**. Sanctum hides it once it's saved. Then choose **Add a device**.
 
-Sanctum has no way to build the address in, so it's pasted on each device.
+If the laptop is on the same Wi-Fi as the home PC when you pair, that's all: choose **Connect to a home PC** on the laptop and type the code. The laptop finds the home PC on the network, and gets the address inside the encrypted pairing. After that it reaches the home PC from anywhere.
+
+Pairing from another network, the laptop needs the address pasted the same way first. Sanctum has no way to build the address in, so it comes either by pasting or by pairing on the same Wi-Fi.
 
 ## Logs: leave them off
 

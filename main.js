@@ -26,6 +26,7 @@ const { createKeystore, retryTransient } = require('./lib/remote/keystore');
 const { createManager: createRemoteManager } = require('./lib/remote/manager');
 const remoteRelayClient = require('./lib/remote/relay-client');
 const { createDirectPath } = require('./lib/remote/direct-path');
+const { createLocalPairing } = require('./lib/remote/local-pairing');
 const RemoteRules = require('./lib/remote-rules');
 
 // Only this app's own page may use anything registered on ipcMain. The hidden transport window
@@ -1009,6 +1010,7 @@ function startRemoteControl() {
   remoteManager = createRemoteManager({
     keystore,
     relay: remoteRelayClient,
+    local: nearbyPairing(),
     addressStore: remoteAddressStore(path.join(userData, 'remote-service.json')),
     autoUnlock: { ...remoteAutoUnlockFile(path.join(userData, 'remote-autounlock.bin')), protect, unprotect },
     deviceName: os.hostname(),
@@ -1033,6 +1035,47 @@ function startRemoteControl() {
   });
   // So closing the window knows from the start whether a laptop is paired with this PC.
   remoteManager.refreshStatus();
+}
+
+// Pairing on the same network, so a laptop needs only the code. Home listens on every IPv4
+// interface while a code shows, which is when Windows may ask about its firewall. A run a test
+// started keeps to loopback, whatever its flags, because that prompt would land on the screen
+// of whoever is at this machine. A packaged app never reads the variable.
+const nearbyLoopback = !app.isPackaged && process.env.SANCTUM_REMOTE_TEST !== undefined;
+const nearbyWire = [];
+const nearbyListeners = [];
+
+function nearbyPairing() {
+  let pairing;
+  try {
+    pairing = createLocalPairing({
+      loopback: nearbyLoopback,
+      // `peek` keeps what crosses, for e2e/nearby.e2e.js to search. Never in a packaged app.
+      onWire: remoteTestFlags.has('peek') ? (entry) => nearbyWire.push({ from: entry.from, bytes: entry.bytes.toString('base64') }) : null
+    });
+  } catch {
+    return null; // pairing still works through the relay, with an address
+  }
+  if (!remoteTestFlags.has('peek')) return pairing;
+  globalThis.__sanctumNearby = {
+    loopback: nearbyLoopback,
+    wire: () => nearbyWire.slice(),
+    // Where the latest listener bound, and whether it's still there.
+    listener: async () => {
+      const latest = nearbyListeners[nearbyListeners.length - 1];
+      if (!latest) return null;
+      const ports = await latest.ready;
+      return { ports, bound: latest.boundAddresses() };
+    }
+  };
+  return {
+    ...pairing,
+    listen(options) {
+      const listener = pairing.listen(options);
+      nearbyListeners.push(listener);
+      return listener;
+    }
+  };
 }
 
 // No page here to do what a laptop asked, as when the window has gone on a Mac. The laptop would

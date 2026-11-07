@@ -20,6 +20,11 @@ These use a throwaway pair of device keys made for the check, not a real device'
 
 - [ ] **Windows home PC, Mac laptop.** Paste the address on both, choose Add a device at home, and enter the code on the Mac. Pass: both list each other under Settings > Devices with matching fingerprints, and a shared chat appears on the Mac.
 - [ ] **Mac home PC, Windows laptop.** The same with the roles swapped. Pass: as above.
+- [ ] **Pair a Mac on the same Wi-Fi with only the code.** Paste the address on the Windows home PC only, leaving the Mac with none, and put both on the same Wi-Fi. On the Mac, Settings > Devices shows only Connect to a home PC. Choose Add a device at home, then Connect to a home PC on the Mac and type the code and a PIN. Pass, each separately:
+  - The Mac asks for Local Network permission for Sanctum. Allow it. If it never asks and nothing is found, check System Settings > Privacy & Security > Local Network.
+  - Windows may ask whether to allow Sanctum on private networks. Allow it on private networks only. Note whether it asked.
+  - Pairing works: the Mac says Looking for your home PC on this network…, then both list each other with matching fingerprints.
+  - The Mac then connects from a different network: move it to a phone hotspot. It shows the home PC connected, and a shared chat works.
 
 ## Networks
 

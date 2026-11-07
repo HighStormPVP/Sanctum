@@ -54,6 +54,7 @@ Remote Control's connection lives in `lib/remote/`, also free of Electron:
 | `lib/remote/session.js` | Fresh keys per connection from the long-term keys, then encrypts and decrypts every frame |
 | `lib/remote/link.js` | Ordered, exactly-once delivery over the relay and the direct path, so a switch loses nothing |
 | `lib/remote/relay-client.js` | The WebSocket to the relay Worker, for a device's mailbox or the pairing slot |
+| `lib/remote/local-pairing.js` | Pairing on the same network: home's listener while a code shows, the laptop's search, and the pairing messages over TCP. Only private addresses, and only loopback in tests |
 | `lib/remote/direct-path.js` | WebRTC data channels per device, run in the hidden window, beside the relay |
 | `lib/remote/keystore.js` | This device's identity, paired devices, PIN, and control switch, sealed with `safeStorage` |
 | `lib/remote/manager.js` | Ties those together into "these devices can talk", and decides which tool calls get past the main process |
@@ -68,7 +69,7 @@ npm run test:relay          # the relay Worker in Miniflare; needs `npm ci --pre
 node e2e/mirror.e2e.js      # one end-to-end suite
 ```
 
-`npm test` doesn't run `e2e/`. Each file there is run on its own with `node`: `actions`, `approvals`, `direct`, `folders`, `mirror`, `preload-surface`, `tools`, and `ui`. They start real Electron instances on temp profiles against the relay in Miniflare and a fake Ollama, so they need `npm ci` and `npm ci --prefix relay`, and Node 22 or later. They never load a real model. `e2e/harness.js` has what they share, and `SANCTUM_REMOTE_TEST` holds test-only flags that a packaged build ignores. Never launch Electron on the default profile from a test: the single-instance lock would hand over to a Sanctum that's already running.
+`npm test` doesn't run `e2e/`. Each file there is run on its own with `node`: `actions`, `approvals`, `direct`, `folders`, `mirror`, `nearby`, `preload-surface`, `tools`, and `ui`. They start real Electron instances on temp profiles against the relay in Miniflare and a fake Ollama, so they need `npm ci` and `npm ci --prefix relay`, and Node 22 or later. They never load a real model. `e2e/harness.js` has what they share, and `SANCTUM_REMOTE_TEST` holds test-only flags that a packaged build ignores. Never launch Electron on the default profile from a test: the single-instance lock would hand over to a Sanctum that's already running.
 
 The renderer's sandboxed preload can't read the disk, so anything it needs from the system comes through IPC.
 
@@ -180,7 +181,8 @@ Everything writes to an audit log (`window.api.audit.log`). Each device also kee
 A laptop mirrors and drives chats running on a home PC, and the home model can use tools on the laptop. The design is `docs/superpowers/specs/2026-11-04-remote-control-design.md`.
 
 - **Roles.** In each pairing, one device is the home PC and the other the laptop. One install can be home to some devices and a laptop to others. The home PC holds the chats, keys, and models, and runs the chat loop. The laptop keeps no chat data on disk. A chat is shared while its `remoteControl` is on, from the message box menu. On the laptop it's `remote:<homeId>:<chatId>` with a `c.remote`, and every control on it sends an `action` home instead of changing anything locally.
-- **Off until set up.** Nothing shows and nothing connects until a service address is pasted in Settings > Devices. It holds the relay's secret, so it's never logged and never in the repo (`test/no-relay-address.test.js`).
+- **Off until set up.** Until a service address is set, Settings > Devices shows only Connect to a home PC, with the paste field folded below it, and nothing connects. The address holds the relay's secret, so it's never logged and never in the repo (`test/no-relay-address.test.js`).
+- **Same Wi-Fi.** A laptop with no address finds a home PC showing a code on its network and pairs with only the code, getting the address sealed inside the pairing (`lib/remote/local-pairing.js`). Home listens only while a code shows. Any run with `SANCTUM_REMOTE_TEST` set, and every test, keeps those sockets on 127.0.0.1, because a socket bound wider pops a Windows Firewall prompt.
 - **The switch.** "Let my home PC control this laptop" lives only on the laptop and is off by default. The laptop's main process enforces it (`lib/remote/manager.js`, then `admitToolCall()` in `main.js`) and never trusts home to. Turning it off ends commands in progress. On Windows, a backgrounded child of a laptop command (`x &`) can outlive the switch going off, because the process tree can't always be found.
 - **Staying reachable.** While a chat is shared, or Remote Control is on and a laptop is paired with this PC as its home, closing the window hides it to the tray on every platform (`RemoteRules.closeHidesWindow`). With no laptop paired, closing quits as it always has. If an action reaches home with no window to do it, `main.js` refuses it at once rather than leaving the laptop to time out.
 - **The PIN.** A laptop sets a PIN of at least 6 digits when it first pairs, and it seals the Remote Control keys. It's asked at start and after 15 minutes idle. Ten wrong in a row delete the keys. A PIN-locked laptop still runs home's commands if its switch is on.

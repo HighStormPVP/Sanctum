@@ -3714,6 +3714,23 @@ textarea:focus-visible, input:focus-visible { outline: none; }
   color: var(--text-1);
 }
 #remote-address-form { margin: 10px 0 0; }
+/* With no address yet, the field waits under a fold, below the one thing to do. Once there's an
+   address, the fold stays open and its summary goes, so the field reads as it always has. */
+.remote-address-fold { margin-top: 14px; }
+.remote-address-fold.is-set { margin-top: 24px; }
+.remote-address-fold > summary {
+  width: fit-content;
+  font-size: 13px;
+  color: var(--text-3);
+  cursor: pointer;
+  user-select: none;
+  border-radius: var(--r-sm);
+}
+.remote-address-fold > summary:hover { color: var(--text-2); }
+.remote-address-fold > summary:focus-visible { outline: 2px solid var(--accent-1); outline-offset: 2px; }
+.remote-address-fold:not(.is-set) #remote-address-form > label { display: none; }
+.remote-address-fold.is-set > summary { display: none; }
+.remote-address-fold.is-set #remote-address-form { margin-top: 0; }
 .remote-address-row { display: flex; align-items: stretch; gap: 8px; }
 .remote-address-row .api-key-input { flex: 1; min-width: 0; }
 .remote-address-row .ghost-btn { flex-shrink: 0; }
@@ -3767,6 +3784,8 @@ textarea:focus-visible, input:focus-visible { outline: none; }
 }
 .remote-code-asking { font-size: 14px; color: var(--text-3); }
 .remote-code-expiry { margin-top: 8px; font-size: 13px; font-variant-numeric: tabular-nums; color: var(--text-3); }
+.remote-dialog-note { margin-top: 10px; font-size: 12.5px; line-height: 1.5; color: var(--text-3); }
+.remote-connect-looking { margin-top: 14px; font-size: 13px; line-height: 1.45; color: var(--text-2); }
 .remote-field-label { display: block; margin-bottom: 6px; font-size: 12px; font-weight: 600; color: var(--text-2); }
 .remote-connect-code {
   display: block;

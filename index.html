@@ -549,16 +549,6 @@
         <section class="setting-group">
           <h3>Devices</h3>
           <div class="remote-notice" id="remote-reset-notice" hidden>This device's Remote Control keys were reset, so it has to be paired again. On your other devices, open Settings &gt; Devices and Remove this device. Then connect it again with a new code.</div>
-          <form class="api-key-row" id="remote-address-form">
-            <label for="remote-address">Service address</label>
-            <div class="remote-address-row">
-              <div class="api-key-input">
-                <input type="password" id="remote-address" autocomplete="off" spellcheck="false" />
-              </div>
-              <button type="submit" class="ghost-btn" id="remote-address-save">Save</button>
-            </div>
-            <small class="setting-help" id="remote-address-note"></small>
-          </form>
           <div class="remote-panel-lock" id="remote-panel-lock" hidden>
             <span>Remote Control is locked.</span>
             <button type="button" class="ghost-btn" id="remote-panel-unlock">Enter PIN</button>
@@ -575,6 +565,21 @@
             </div>
           </section>
         </div>
+        <section class="setting-group">
+          <details class="remote-address-fold" id="remote-address-fold">
+            <summary id="remote-address-summary">Service address</summary>
+            <form class="api-key-row" id="remote-address-form">
+              <label for="remote-address">Service address</label>
+              <div class="remote-address-row">
+                <div class="api-key-input">
+                  <input type="password" id="remote-address" autocomplete="off" spellcheck="false" />
+                </div>
+                <button type="submit" class="ghost-btn" id="remote-address-save">Save</button>
+              </div>
+              <small class="setting-help" id="remote-address-note"></small>
+            </form>
+          </details>
+        </section>
         <section class="setting-group" id="remote-control-wrap" hidden>
           <button type="button" class="tools-menu-item remote-control-switch" id="remote-control-switch" role="switch" aria-checked="false">
             <span class="tools-menu-label">
@@ -650,6 +655,7 @@
         <div class="remote-code-value" id="remote-code-value" hidden></div>
         <p class="remote-dialog-text" id="remote-code-hint" hidden></p>
         <p class="remote-code-expiry" id="remote-code-expiry" hidden></p>
+        <p class="remote-dialog-note" id="remote-code-firewall" hidden>If Windows asks, allow Sanctum on private networks so your laptop can find this PC.</p>
         <p class="remote-dialog-text" id="remote-code-message" role="status" hidden></p>
         <div class="remote-suggest" id="remote-suggest" hidden>
           <p class="remote-dialog-text">Your laptop can reach this PC only while Sanctum is running here. These help with that:</p>
@@ -678,6 +684,7 @@
       <div class="modal-body">
         <label class="remote-field-label" for="remote-connect-code">Code from your home PC</label>
         <input class="remote-connect-code" id="remote-connect-code" maxlength="6" autocomplete="off" spellcheck="false" />
+        <p class="remote-dialog-note" id="remote-connect-nearby" hidden>For this first pairing, both devices need to be on the same Wi-Fi.</p>
         <div id="remote-connect-pin-fields">
           <p class="remote-dialog-text">Choose a PIN for this device. Use at least 6 digits. Sanctum asks for it when it starts, and after 15 minutes idle. If you forget it, you connect again with a new code.</p>
           <div class="remote-field-pair">
@@ -691,6 +698,7 @@
             </div>
           </div>
         </div>
+        <p class="remote-connect-looking" id="remote-connect-looking" role="status" hidden>Looking for your home PC on this network…</p>
         <p class="remote-error" id="remote-connect-error" role="alert"></p>
       </div>
       <footer class="approval-footer">

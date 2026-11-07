@@ -894,3 +894,109 @@ test('the sides expose no key material', () => {
   assert.deepStrictEqual(Object.keys(host.side).sort(), ['attemptsLeft', 'handle']);
   assert.deepStrictEqual(Object.keys(guest.side).sort(), ['first', 'handle']);
 });
+
+// ---------------------------------------------------------------------------
+// The service address, sealed into the home PC's identity for a pairing that came
+// over the local network, so a laptop with only the code learns it
+// ---------------------------------------------------------------------------
+const SERVICE_ADDRESS = 'wss://relay.example/marker-secret-segment';
+
+// As run(), with options for the host on every message, as the manager passes them
+// for a message that arrived over the local network.
+function runLocal(host, guest, { pake, confirm } = {}, tamperAt = -1, tamper = (msg) => msg) {
+  const messages = [];
+  let current = guest.first;
+  let toHost = true;
+  let hostResult = null;
+  let guestResult = null;
+  while (current) {
+    let sent = wire(current);
+    if (messages.length === tamperAt) sent = wire(tamper(sent));
+    messages.push(sent);
+    let result;
+    if (toHost) result = host.handle(sent, sent.t === 'pake' ? pake : confirm);
+    else result = guest.handle(sent);
+    if (toHost) hostResult = result;
+    else guestResult = result;
+    current = result.reply;
+    toHost = !toHost;
+  }
+  return { messages, hostResult, guestResult };
+}
+
+const local = { address: SERVICE_ADDRESS };
+
+test('an attempt over the local network seals the address into the identity, and the guest gets it beside the peer', () => {
+  const host = makeHost();
+  const guest = makeGuest();
+  const { hostResult, guestResult } = runLocal(host.side, guest.side, { pake: local, confirm: local });
+  assertPeer(guestResult.peer, host);
+  assert.strictEqual(guestResult.address, SERVICE_ADDRESS);
+  // The host's own record of the laptop never carries one.
+  assertPeer(hostResult.peer, guest);
+});
+
+test('without the local option no address is sealed, and the result has no address at all', () => {
+  const { guestResult } = run(makeHost().side, makeGuest().side);
+  assert.ok(guestResult.peer);
+  assert.ok(!('address' in guestResult));
+});
+
+test('the address goes only when both the pake and the confirmation came over the local network', () => {
+  for (const options of [{ pake: local }, { confirm: local }]) {
+    const { guestResult } = runLocal(makeHost().side, makeGuest().side, options);
+    assert.ok(guestResult.peer);
+    assert.ok(!('address' in guestResult), JSON.stringify(Object.keys(options)));
+  }
+});
+
+test('the address is never readable on the wire, and a wrong code never gets a sealed one', () => {
+  const right = runLocal(makeHost().side, makeGuest().side, { pake: local, confirm: local });
+  const wrong = runLocal(makeHost().side, makeGuest(WRONG_CODE).side, { pake: local, confirm: local });
+  assert.strictEqual(wrong.messages.length, 2, 'the wrong code stops after the reply');
+  assert.ok(!wrong.messages.some((m) => m.t === 'identity'));
+  for (const { messages } of [right, wrong]) {
+    const text = JSON.stringify(messages);
+    assert.ok(!text.includes(SERVICE_ADDRESS));
+    assert.ok(!text.includes('marker-secret-segment'));
+    assert.ok(!text.includes(toB64(Buffer.from(SERVICE_ADDRESS))));
+  }
+});
+
+test('a tampered identity carrying the address fails the seal on the guest', () => {
+  for (const index of [0, 40, 80]) {
+    const { guestResult } = runLocal(makeHost().side, makeGuest().side, { pake: local, confirm: local }, 3, flipField('box', index));
+    assertFailed(guestResult);
+    assert.ok(!('address' in guestResult));
+  }
+});
+
+test('an identity sealed with an address that is not a string fails, and a string one passes', () => {
+  const home = newIdentity();
+  const build = (address) => (ctx) => identityMessage(ctx, home, {
+    plaintext: JSON.stringify({
+      publicKey: toB64(home.publicKey),
+      name: 'Home',
+      signature: toB64(sign(home.secretKey, identityProof(ctx.role, ctx.homePake, ctx.laptopPake))),
+      address
+    })
+  });
+  for (const bad of [42, null, {}, ['wss://relay.example/x'], true]) assertFailed(homeAttack(makeGuest().side, build(bad)));
+  const good = homeAttack(makeGuest().side, build(SERVICE_ADDRESS));
+  assert.strictEqual(good.address, SERVICE_ADDRESS);
+  assert.strictEqual(toB64(good.peer.publicKey), toB64(home.publicKey));
+});
+
+test('a host ignores an address in the laptop identity', () => {
+  const attacker = newIdentity();
+  const result = laptopAttack(makeHost().side, (ctx) => identityMessage(ctx, attacker, {
+    plaintext: JSON.stringify({
+      publicKey: toB64(attacker.publicKey),
+      name: 'Laptop',
+      signature: toB64(sign(attacker.secretKey, identityProof(ctx.role, ctx.homePake, ctx.laptopPake))),
+      address: SERVICE_ADDRESS
+    })
+  }));
+  assert.deepStrictEqual(Object.keys(result.peer).sort(), ['deviceId', 'name', 'publicKey']);
+  assert.ok(!('address' in result));
+});

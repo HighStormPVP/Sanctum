@@ -91,8 +91,8 @@ How it works:
 **Keeping it to the owner (Call)**
 
 - The service address contains a long random secret. It's never in the repo or a public build.
-- Remote Control stays hidden and does nothing until that address is set. On each device, it's pasted once into Settings, or it can be supplied at build time for the owner's own builds.
-- This does add one paste per device on top of the code, because public installers can't carry the address and a 6-character code is too short to carry it.
+- Until that address is set, a device shows only **Connect to a home PC** in Settings > Devices, with the paste field folded away below it, and makes no connection to the service. Everything else stays hidden until an address arrives. The home PC has it pasted once, or it can be supplied at build time for the owner's own builds.
+- A laptop doesn't need the paste if it first pairs on the same Wi-Fi as the home PC: it gets the address inside the encrypted pairing (see Pairing). Elsewhere, the address is pasted on that device too, because public installers can't carry it and a 6-character code is too short to carry it.
 - The relay refuses anything without the secret, and applies simple rate limits.
 - Cost, from Cloudflare's published pricing: the paid plan includes 1 million Durable Object requests a month, and incoming WebSocket messages count at 20:1. Billable duration doesn't accrue during hibernation. At 25 tokens/s, an hour of streaming is 90,000 messages unbatched, or 4,500 billable requests. Batching chunks keeps this far lower, so normal use should stay inside the included amount, and direct connections use it far less.
 
@@ -101,6 +101,7 @@ How it works:
 - The code is 6 characters from an unambiguous alphabet (no `0/O`, `1/I/L`), not case-sensitive, works once, and expires after 10 minutes (Call).
 - Five wrong attempts cancel the code (Call).
 - Only one code can be pending at a time across the owner's devices, and a new one replaces the old. With one owner, this is how the laptop finds the right home PC using only the code, without the relay learning it (Call).
+- **On the same Wi-Fi (Owner).** A laptop with no address pairs on the local network instead of through the relay, and the code is all it types. While a code shows, the home PC listens on the local network: UDP port 47613 answers a probe with a TCP port, and the same pairing messages cross that TCP connection. It stops listening when the code ends, however it ends. It answers only private, link-local, and loopback addresses, takes at most two connections at once and one a second, and drops any message that isn't exactly the expected shape. The laptop broadcasts a probe up to three times over four seconds, and tries each home PC that answered in turn. A wrong guess costs one of the same five attempts, whichever way it arrives. Only on this path, and only after both sides have proved the code, the home PC seals its service address into the last pairing message, and the laptop keeps it only if it has none. From then on the laptop connects through the relay from anywhere. Windows may ask to allow Sanctum on private networks, and a Mac asks for Local Network permission.
 - Pairing uses a password-authenticated key exchange (PAKE). The relay can pass the messages but can't learn the code or impersonate either device, and can't test guesses offline. This is why a short code is safe. Without PAKE, the code would be too short.
 - After pairing, each device holds its own long-term keys, kept with Electron's `safeStorage`. No code is needed again.
 
@@ -229,6 +230,7 @@ Automated, against a local copy of the relay:
 - Removing a device from either end ends access at once.
 - With two home PCs and two laptops, each laptop sees the right chats under the right home PC, and a tool call reaches only the device it names.
 - Without the service address, Remote Control is hidden and no network connection is attempted. A wrong secret is refused.
+- On the same network, a laptop with no address pairs with only the code, ends up with the home PC's address, and then connects through the relay. Nothing on the local network carries the address or the code readably, a wrong code there uses one of the five attempts, and the home PC stops listening when the code ends.
 - The repo and a public build contain no service address (checked by a test).
 - The PIN is required at start and after idle. Wrong attempts delay, then delete the keys. After a restart, no connection starts until the PIN is entered.
 
