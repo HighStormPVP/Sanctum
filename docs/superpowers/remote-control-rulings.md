@@ -87,3 +87,13 @@ Every decision the build controller made on the owner's behalf while building Re
 83. laptop sends carry a client message id, and home drops repeats of the last 200 per chat — a late-OK resend on a bad link could start a second run with tool actions — if wrong, a repeat after a home restart still runs twice.
 84. x & on Windows is documented in CLAUDE.md, not fixed — no Job Objects — if wrong, a backgrounded child outlives the switch.
 85. keep the transport session denying every permission check; same-LAN direct relies on mDNS, and a new live check says how to restore plain addresses if it shows the relay — controller probe: allowing the media check restores LAN addresses but also exposes device labels and reports mic and camera as granted (capture still refused) — if wrong, same-Wi-Fi traffic goes through the relay.
+
+## v0.5.1: pairing on the same Wi-Fi
+
+86. a device with no address shows only Connect to a home PC — the spec hid Remote Control until an address was set — if wrong, a laptop-only screen shows before setup.
+87. home listens on UDP 47613 and an OS-picked TCP port only while a code is showing, private peers only; tests bind 127.0.0.1 only — a test on 0.0.0.0 pops a Firewall prompt on the owner's screen — if wrong, a firewall prompt during tests.
+88. the address travels only in the sealed identity of a local pairing, after both confirmations — a device without the code never sees it — if wrong, a laptop with an address still pairs through the relay.
+89. anyone on the same Wi-Fi can burn a showing code's 5 tries, accepted and written into the spec — a try is charged before the guess is checked — if wrong, the owner makes a new code.
+90. drop the home name from pair-here — unused, and visible to anyone on the LAN — if wrong, the laptop can't show which home it found.
+91. a sealed address must be wss outside unpackaged test runs — if wrong, none for real relays.
+92. the shared 1-a-second connection limit stays, and a LAN flood at that rate can keep a laptop out while a code shows — the same class as burning the five tries, already accepted, and TCP sources can't be forged — if wrong, pairing on a hostile Wi-Fi needs the pasted address.
