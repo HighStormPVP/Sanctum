@@ -291,8 +291,9 @@
         </section>
         <section class="setting-group">
           <h3>Context window</h3>
-          <p class="setting-help">How many tokens of conversation the model can remember. <strong>Bigger uses more memory.</strong><br><br><strong>4096</strong> — tightest, ~10 GB total for Qwen3<br><strong>8192</strong> — safe default for 32 GB systems<br><strong>16384</strong> — good for ~48 GB systems<br><strong>32768</strong> — Qwen3's native max, needs ~36 GB</p>
-          <input type="number" id="agent-opts-ctx" min="2048" max="131072" step="1024" value="8192" class="agent-opts-num">
+          <p class="setting-help">How many tokens of conversation the model can remember in this chat. Bigger uses more memory.</p>
+          <input type="number" id="agent-opts-ctx" min="2048" max="131072" step="1024" class="agent-opts-num agent-opts-ctx">
+          <p class="setting-help agent-opts-ctx-help" id="agent-opts-ctx-help">Leave empty to use Settings &gt; Context Windows.</p>
         </section>
         <section class="setting-group">
           <h3>Activity log</h3>

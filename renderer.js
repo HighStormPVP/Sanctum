@@ -51,6 +51,7 @@ const state = {
   try { state.downloadCatalog = await window.api.downloadCatalog(); } catch {}
   loadFromStorage();
   loadSettings();
+  migrateContextDefault();
   applyTheme(state.settings.theme || 'sanctum');
 
   await detectOllama();
@@ -256,6 +257,25 @@ function loadSettings() {
     if (raw) keepUnreadableStore(SETTINGS_KEY, raw);
   }
 }
+// Until v0.5.2 every new project chat got contextWindow 8192, and a chat's own size beats
+// Settings > Context Windows, so Settings never applied to them. Nobody chose that 8192, so it
+// goes, once. A chat someone deliberately set to 8K goes back to Settings too: there's no telling
+// the two apart.
+function migrateContextDefault() {
+  state.settings.migrations = state.settings.migrations || {};
+  if (state.settings.migrations.ctxDefault8k) return;
+  let changed = false;
+  for (const c of Object.values(state.chats)) {
+    if (c && c.contextWindow === 8192) {
+      delete c.contextWindow;
+      changed = true;
+    }
+  }
+  state.settings.migrations.ctxDefault8k = true;
+  if (changed) saveToStorage();
+  saveSettings();
+}
+
 function saveSettings() {
   try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(state.settings)); }
   catch (e) {
@@ -354,8 +374,9 @@ function agenticChatFields() {
     noFetch: false,
     pathAllowlist: [],
     commandAllowlist: [],
-    maxSteps: 5,
-    contextWindow: 8192         // 8K — safe for 32 GB systems running Qwen3 30B
+    maxSteps: 5
+    // No contextWindow: a chat takes Settings > Context Windows unless someone
+    // sets its own in the chat options.
   };
 }
 
@@ -1893,7 +1914,9 @@ async function openAgentOpts() {
   $('#agent-opts-paths').value = (c.pathAllowlist || []).join('\n');
   $('#agent-opts-cmds').value = (c.commandAllowlist || []).join('\n');
   $('#agent-opts-steps').value = c.maxSteps || 5;
-  $('#agent-opts-ctx').value = c.contextWindow || 8192;
+  // Empty unless this chat has its own size. The placeholder is what Settings would give it.
+  $('#agent-opts-ctx').value = c.contextWindow || '';
+  $('#agent-opts-ctx').placeholder = `Settings: ${fmtCtx(contextWindowFor(c.model))}`;
   try { $('#agent-opts-log-path').textContent = await window.api.audit.path(); }
   catch { $('#agent-opts-log-path').textContent = '(could not resolve path)'; }
   $('#agent-opts-overlay').hidden = false;
@@ -1913,7 +1936,8 @@ function saveAgentOpts() {
   const steps = parseInt($('#agent-opts-steps').value, 10);
   c.maxSteps = (Number.isFinite(steps) && steps > 0) ? Math.min(steps, 50) : 5;
   const ctx = parseInt($('#agent-opts-ctx').value, 10);
-  c.contextWindow = (Number.isFinite(ctx) && ctx >= 2048) ? Math.min(ctx, 131072) : 8192;
+  if (Number.isFinite(ctx)) c.contextWindow = Math.min(Math.max(ctx, 2048), 131072);
+  else delete c.contextWindow;
   saveToStorage();
 }
 

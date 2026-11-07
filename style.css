@@ -490,6 +490,10 @@ button { font-family: inherit; }
   outline: none;
 }
 .agent-opts-num:focus { border-color: var(--accent-1); box-shadow: none; }
+/* Wide enough for its placeholder, "Settings: 128K". */
+.agent-opts-num.agent-opts-ctx { width: 148px; }
+.agent-opts-num.agent-opts-ctx::placeholder { color: var(--text-3); }
+.agent-opts-ctx-help { margin-top: 8px; font-size: 12.5px; }
 .setting-help code {
   font-family: var(--font-mono);
   background: var(--surface-2);
@@ -2339,7 +2343,7 @@ button { font-family: inherit; }
   max-width: 420px;
   padding: 10px 16px;
   font-size: 13px; color: var(--text-1);
-  background: var(--surface-3);
+  background: var(--bg-2);
   border: 1px solid var(--border-2); border-radius: 10px;
   box-shadow: 0 8px 30px rgba(0,0,0,0.35);
   opacity: 0; transform: translateY(8px); transition: opacity .2s, transform .2s;
@@ -2396,7 +2400,8 @@ button { font-family: inherit; }
 .sel-menu {
   position: absolute; z-index: 60;
   top: calc(100% + 5px); left: 0; right: 0;
-  background: var(--surface-1);
+  /* Opaque: it floats over the rows below it. */
+  background: var(--bg-2);
   border: 1px solid var(--border-2);
   border-radius: 9px;
   padding: 4px;
