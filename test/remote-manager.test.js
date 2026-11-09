@@ -5662,3 +5662,25 @@ test('relay words: a new address starts with nothing said about it', async (t) =
   assert.deepEqual(laptop.manager.setAddress('wss://relay.example/another-one'), { ok: true });
   assert.strictEqual(laptop.manager.status().relayProblem, null);
 });
+
+test('on a Mac, keys that cannot be opened point at the Keychain, and say to quit and reopen', async (t) => {
+  // An unsigned app is a new app to the Keychain after each update, and macOS may not ask
+  // again until Sanctum restarts, so "try again in a moment" never helps there.
+  for (const [platform, expected] of [['darwin', /Keychain[\s\S]*Quit Sanctum[\s\S]*Always Allow/], ['win32', /Try again in a moment\./]]) {
+    const world = newWorld(t);
+    const keystore = createKeystore({
+      file: path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'sanctum-manager-keychain-')), 'keys.json'),
+      protect: (bytes) => bytes,
+      unprotect: (bytes) => bytes,
+      kdfCost: FAST,
+      isProtectionAvailable: () => false
+    });
+    const device = await world.device('Device', { pin: false, keystore, platform });
+    device.start();
+    const created = await device.manager.createCode();
+    assert.match(created.error, expected, platform);
+    const paired = await device.manager.pair('ABC234', 'Laptop');
+    assert.match(paired.error, expected, platform);
+    if (platform === 'win32') assert.doesNotMatch(created.error, /Keychain/);
+  }
+});

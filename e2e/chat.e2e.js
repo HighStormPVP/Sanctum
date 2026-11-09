@@ -76,7 +76,12 @@ async function startOllama() {
   return Object.assign(fake, {
     url: `http://127.0.0.1:${port}`,
     next: (ms = 20000) => new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error('no chat request reached the fake Ollama')), ms);
+      // A wait that gave up leaves the queue, so it can't swallow the next request.
+      const timer = setTimeout(() => {
+        const at = waiters.indexOf(got);
+        if (at !== -1) waiters.splice(at, 1);
+        reject(new Error('no chat request reached the fake Ollama'));
+      }, ms);
       const got = (reply) => { clearTimeout(timer); resolve(reply); };
       if (pending.length) got(pending.shift());
       else waiters.push(got);
@@ -415,6 +420,109 @@ test('one home PC and a fake Ollama', async (t) => {
       assert.match(text, /Anthropic API error/);
       assert.doesNotMatch(text, /Ollama/);
       await home.page.evaluate(() => { delete state.settings.apiKeys.anthropic; });
+    });
+  });
+
+  await t.test('a tool call the model announced and never made is asked for again', async (s) => {
+    const lastEvents = (id) => home.page.evaluate((chatId) => (latestAssistant(state.chats[chatId])?.toolEvents || []).map((e) => e.name), id);
+    const userMessages = (reply) => reply.body.messages.filter((m) => m.role === 'user').map((m) => m.content);
+    const NUDGE = /ended without the tool call/;
+
+    await s.test('with tools, a local model is sent no repetition penalties', async () => {
+      const id = await newProject();
+      await send(id, 'Hello');
+      const reply = await ollama.next();
+      assert.ok(reply.body.tools?.length > 0, 'the chat offers tools');
+      assert.equal(reply.body.options.repeat_penalty, 1);
+      assert.equal(reply.body.options.presence_penalty, 0);
+      reply.say('Hi.');
+      reply.finish();
+      await stopped(id);
+    });
+
+    await s.test('without tools, the mild repeat penalty stays and presence is left to the model', async () => {
+      const id = await plainChat();
+      await send(id, 'Hello');
+      const reply = await ollama.next();
+      assert.ok(!reply.body.tools?.length, 'a plain chat offers no tools');
+      assert.equal(reply.body.options.repeat_penalty, 1.1);
+      assert.equal('presence_penalty' in reply.body.options, false);
+      reply.say('Hi.');
+      reply.finish();
+      await stopped(id);
+    });
+
+    await s.test('a reply that ends on "Let me ...:" with no call is asked once more, and the answer shows', async () => {
+      const id = await newProject();
+      await send(id, 'Build the game');
+      const first = await ollama.next();
+      first.say('Let me write the complete game:');
+      first.finish();
+      const second = await ollama.next();
+      const asked = userMessages(second);
+      assert.match(asked[asked.length - 1], NUDGE);
+      assert.ok(second.body.messages.some((m) => m.role === 'assistant' && m.content === 'Let me write the complete game:'), 'what it said stays in its history');
+      second.say('All done.');
+      second.finish();
+      await stopped(id);
+      assert.equal(await lastReply(id), 'Let me write the complete game:\n\nAll done.', 'what it said before it was asked again stays');
+      assert.ok((await lastEvents(id)).includes('__retry'), 'the retry is marked in the reply');
+      await shot(home, 'tool-call-retry');
+    });
+
+    await s.test("Ollama failing to read the tool call is asked again, not shown as Ollama's error", async () => {
+      const id = await newProject();
+      await send(id, 'Model it in Blender');
+      const first = await ollama.next();
+      first.line({ error: 'XML syntax error on line 3: invalid characters between </parameter and >' });
+      first.finish();
+      const second = await ollama.next();
+      const asked = userMessages(second);
+      assert.match(asked[asked.length - 1], /couldn't be read/);
+      second.say('Done.');
+      second.finish();
+      await stopped(id);
+      const text = await lastReply(id);
+      assert.equal(text, 'Done.');
+    });
+
+    await s.test('after two retries it stops and says so, instead of ending without a word', async () => {
+      const id = await newProject();
+      await send(id, 'Build it');
+      for (let i = 0; i < 3; i++) {
+        const reply = await ollama.next();
+        reply.say('Let me build it:');
+        reply.finish();
+      }
+      await stopped(id);
+      await assert.rejects(ollama.next(1500), /no chat request/, 'no fourth request');
+      assert.match(await lastReply(id), /didn't make the tool call/);
+    });
+
+    await s.test('a round with nothing in it after a tool ran is the model finishing, not a miss', async () => {
+      const id = await newProject();
+      await send(id, 'List the folder');
+      const first = await ollama.next();
+      first.say('I will list the folder.');
+      first.call(['list_dir', { path: folder }]);
+      first.finish();
+      const second = await ollama.next();
+      assert.ok(second.body.messages.some((m) => m.role === 'tool'), 'the tool ran');
+      second.finish();
+      await stopped(id);
+      await assert.rejects(ollama.next(1500), /no chat request/, 'not asked again');
+      assert.equal(await lastReply(id), 'I will list the folder.');
+    });
+
+    await s.test('an ordinary answer in a project chat is not asked again', async () => {
+      const id = await newProject();
+      await send(id, 'What is in the folder?');
+      const reply = await ollama.next();
+      reply.say('Nothing yet.');
+      reply.finish();
+      await stopped(id);
+      await assert.rejects(ollama.next(1500), /no chat request/);
+      assert.equal(await lastReply(id), 'Nothing yet.');
     });
   });
 });

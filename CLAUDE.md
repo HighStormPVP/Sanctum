@@ -39,6 +39,7 @@ Rules that decide what's allowed live in `lib/`, free of Electron, so `npm test`
 | `lib/grep-runner.js` | Agent grep in a worker with a time limit |
 | `lib/cloud-params.js` | Per-model thinking, effort, fallback, and image rules |
 | `lib/text-rules.js` | Repetition guard, output line splitting, Windows argument quoting |
+| `lib/tool-rounds.js` | A local model with tools gets no repetition penalties (they garble long tool calls), and a round that announced a tool call and never made one is asked again, at most twice a reply. Loaded by the renderer as `ToolRounds` |
 | `lib/kill-tree.js` | Stops a process and everything it started |
 | `lib/window-rules.js` | What a window may offer by how the app runs: no DevTools and no debug switches in a packaged build |
 | `lib/remote-rules.js` | Remote Control's checks on hostile input: laptop actions, tool calls, devices, folders, PIN prompts, audit lines. Loaded by the renderer as `RemoteRules` |

@@ -3988,6 +3988,7 @@ function renderToolEvent(ev) {
   // pill chip anywhere.
   if (ev.name === '__think') return renderThinkEvent(ev);
   if (ev.name === 'web_search') return renderSearchEvent(ev);
+  if (ev.name === '__retry') return renderRetryEvent(ev);
   if (ev.name === 'run_command' || ev.name === 'run_command_async') {
     return renderShellToolEvent(ev);
   }
@@ -4013,6 +4014,19 @@ function renderSearchEvent(ev) {
     <span class="search-label">${escapeHtml(label)}</span>
     ${ev.argSummary ? `<span class="search-q">${escapeHtml(ev.argSummary)}</span>` : ''}
     ${running ? '<span class="think-dots"><span></span><span></span><span></span></span>' : ''}
+  `;
+  return el;
+}
+
+// Where the model said it would use a tool and the call never came, so Sanctum asked again.
+// A quiet past-tense marker, like the search row, so a retry is never invisible.
+function renderRetryEvent(ev) {
+  const el = document.createElement('div');
+  el.className = 'search-row retry-row';
+  const label = ToolRounds.retryLabel(ev.resultSummary);
+  el.innerHTML = `
+    <svg class="search-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 0 1 15.5-6.2L21 8"/><path d="M21 3v5h-5"/></svg>
+    <span class="search-label">${escapeHtml(label)}</span>
   `;
   return el;
 }
@@ -5313,6 +5327,13 @@ ollama pull qwen2.5vl:7b
   let aborted = false;
   let lastContent = '';
   let finishedNormally = false;
+  // Times this reply has asked the model again for a tool call it announced and never made.
+  let nudges = 0;
+  // The text of rounds that were asked again, kept until a tool call comes through.
+  let nudgedText = '';
+  // Tools run so far in this reply. After some, a round with nothing in it is the model finishing.
+  let toolsRan = 0;
+  const toolsOffered = Array.isArray(tools) && tools.length > 0;
 
   while (round < MAX_ROUNDS && !aborted) {
     round++;
@@ -5353,14 +5374,12 @@ ollama pull qwen2.5vl:7b
       // a 30B model is several GB on its own.
       payload.options = {
         num_ctx: c.contextWindow || contextWindowFor(effectiveModel),
-        // Loop insurance. Local models — abliterated ones especially — can fall
-        // into repetition death-spirals on long code, emitting the same fragment
-        // thousands of times until they poison the whole chat. A mild
-        // repeat_penalty makes that far less likely, and num_predict caps a
-        // runaway so it can't burn tens of thousands of tokens. Generous enough
-        // (16K) never to truncate a legitimately long script; the stream-side
-        // loop guard in main.js is what actually catches a spiral early.
-        repeat_penalty: 1.1,
+        // Repetition penalties: none when the model has tools, since they garble and
+        // lose its tool calls; a mild one otherwise (see lib/tool-rounds.js). num_predict
+        // caps a runaway so it can't burn tens of thousands of tokens, and is generous
+        // enough (16K) never to truncate a legitimately long script. The stream-side loop
+        // guard in main.js is what actually catches a spiral early.
+        ...ToolRounds.localSampling({ toolsOffered }),
         num_predict: 16384
       };
       // Native Ollama thinking switch — only for models that actually have a
@@ -5375,6 +5394,11 @@ ollama pull qwen2.5vl:7b
     let acc = '';
     let roundText = '';   // acc resets when a stream ends; this keeps the round's text
     let collectedToolCalls = [];
+    // For telling a lost tool call from a finished answer: the reasoning that arrived, the
+    // final chunk's counts, and Ollama saying it couldn't read a tool call.
+    let roundThinkingChars = 0;
+    let roundDone = null;
+    let roundStreamError = null;
     // The in-flight "Thinking…" row, if this round has one. Closed out by
     // endThinking() when reasoning finishes, which stamps the elapsed time so
     // the row becomes a permanent "Thought for Ns".
@@ -5458,6 +5482,13 @@ ollama pull qwen2.5vl:7b
         aborted = true;
         return;
       }
+      // Ollama couldn't read the tool call the model wrote. That's worth asking again, not a
+      // failure to show; the round's end decides.
+      if (chunk.error && !isCloud && !chunk.done
+          && ToolRounds.missedToolCall({ toolsOffered, streamError: chunk.error }) === 'malformed') {
+        roundStreamError = chunk.error;
+        return;
+      }
       if (chunk.error) {
         // Surface the actual provider error so the user can see WHY it failed. Only a call that
         // WAS to Ollama gets Ollama's words: see lib/chat-errors.js.
@@ -5508,8 +5539,14 @@ ollama pull qwen2.5vl:7b
         }
       }
       // Accumulate streamed reasoning text for the live token count.
-      if (typeof chunk.message?.thinking === 'string') addThinkingText(chunk.message.thinking);
-      if (typeof chunk.thinking?.text === 'string') addThinkingText(chunk.thinking.text);
+      if (typeof chunk.message?.thinking === 'string') {
+        roundThinkingChars += chunk.message.thinking.length;
+        addThinkingText(chunk.message.thinking);
+      }
+      if (typeof chunk.thinking?.text === 'string') {
+        roundThinkingChars += chunk.thinking.text.length;
+        addThinkingText(chunk.thinking.text);
+      }
 
       if (chunk.thinking?.phase === 'end') endThinking();
       // Ollama has no explicit end signal — the first real content token after
@@ -5528,6 +5565,7 @@ ollama pull qwen2.5vl:7b
       // tool loops we want the SUM across rounds, not just the last round —
       // so accumulate per round here and lock in the exact figure.
       if (chunk.done) {
+        if (chunk.eval_count !== undefined || chunk.done_reason !== undefined) roundDone = chunk;
         const prev = assistantMsg.tokenStats || {};
         const exactCompletion = (prev._exactCompletion || 0) + (chunk.eval_count || 0);
         assistantMsg.tokenStats = {
@@ -5577,7 +5615,54 @@ ollama pull qwen2.5vl:7b
     if (aborted) break;
     if (roundText) lastContent = roundText;
 
-    if (!collectedToolCalls.length) { finishedNormally = true; break; }
+    // A local model that said it would use a tool and didn't, or whose call never arrived
+    // whole, is asked once more rather than left to end the reply without a word.
+    const missed = isCloud ? null : ToolRounds.missedToolCall({
+      toolsOffered,
+      toolCalls: collectedToolCalls.length,
+      text: roundText,
+      thinkingChars: roundThinkingChars,
+      evalCount: roundDone?.eval_count,
+      doneReason: roundDone?.done_reason,
+      streamError: roundStreamError,
+      toolsRan
+    });
+    // What the model said before it was asked again, and after: both stay in the reply, so a
+    // retry never takes away an answer that was on screen.
+    const keptText = () => [nudgedText, roundText.trim()].filter((t, i, all) => t && all.indexOf(t) === i).join('\n\n');
+    if (missed && nudges < ToolRounds.MAX_NUDGES) {
+      nudges++;
+      if (roundText.trim()) {
+        history.push({ role: 'assistant', content: roundText });
+        nudgedText = keptText();
+      }
+      history.push({ role: 'user', content: ToolRounds.nudgeFor(missed) });
+      // argSummary is for a laptop on an older version, which draws this as a plain tool row.
+      assistantMsg.toolEvents.push({ name: '__retry', resultSummary: missed, argSummary: 'asked the model again', status: 'done' });
+      patchLastMessage(assistantMsg);
+      round--; // a retry isn't a tool step
+      continue;
+    }
+    if (missed) {
+      const said = keptText() || (lastContent || '').trim();
+      assistantMsg.content = `${said ? said + '\n\n' : ''}${ToolRounds.giveUpNote(missed, roundStreamError)}`;
+      patchLastMessageContent(assistantMsg);
+      lastContent = assistantMsg.content;
+      finishedNormally = true;
+      break;
+    }
+
+    if (!collectedToolCalls.length) {
+      if (nudgedText) {
+        assistantMsg.content = keptText();
+        patchLastMessageContent(assistantMsg);
+        lastContent = assistantMsg.content;
+      }
+      finishedNormally = true;
+      break;
+    }
+    // Calls came through, so this reply carries on as tool rounds always do.
+    nudgedText = '';
 
     // Record assistant turn in history (for tool feedback loop)
     history.push({ role: 'assistant', content: roundText, tool_calls: collectedToolCalls });
@@ -5608,6 +5693,7 @@ ollama pull qwen2.5vl:7b
       patchLastMessage(assistantMsg);
 
       const { result, summary, ok } = await executeTool(name, args, c, tools);
+      toolsRan++;
       ev.status = ok ? 'done' : 'error';
       ev.resultSummary = summary;
       // Stash shell output (stdout/stderr) on the event so the OUT box can

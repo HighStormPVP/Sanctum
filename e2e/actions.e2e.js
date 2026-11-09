@@ -808,6 +808,7 @@ test('acting from a laptop', async (t) => {
     assert.equal(first.body.messages.at(-1).content, 'Slow but sure');
     await waitFor('the box to empty', async () => (await box(laptop)) === '', 3000);
     await toastSays(laptop, 'Your message did go through');
+    first.say('Done.');
     first.finish();
     await waitFor('the run to end', async () => !(await isRunning(home, id)), 5000);
 
@@ -819,6 +820,7 @@ test('acting from a laptop', async (t) => {
     assert.equal(second.body.messages.at(-1).content, 'Slow again');
     await toastSays(laptop, 'Your message did go through');
     assert.equal(await box(laptop), 'Slow again, and more I typed');
+    second.say('Done.');
     second.finish();
     await waitFor('the run to end', async () => !(await isRunning(home, id)), 5000);
     await setBox(laptop, '');
@@ -878,6 +880,7 @@ test('acting from a laptop', async (t) => {
     assert.equal(ollama.poll(), null, 'no second run');
     assert.deepEqual(await userTurns(), ['Only once']);
     assert.equal(await box(laptop), '', 'and nothing comes back to the box');
+    first.say('Done.');
     first.finish();
     await waitFor('the run to end', async () => !(await isRunning(home, id)), 5000);
 
@@ -892,9 +895,11 @@ test('acting from a laptop', async (t) => {
     const second = await ollama.next();
     assert.equal(second.body.messages.at(-1).content, 'Edit me');
     await waitFor('the edited words to be answered', () => answered(d.id), 20000);
+    second.say('Done.');
     second.finish();
     const third = await ollama.next();
     assert.equal(third.body.messages.at(-1).content, 'Edit me, edited');
+    third.say('Done.');
     third.finish();
     await waitFor('the run to end', async () => !(await isRunning(home, id)), 5000);
     assert.deepEqual(await userTurns(), ['Only once', 'Edit me', 'Edit me, edited']);
@@ -920,6 +925,7 @@ test('acting from a laptop', async (t) => {
     assert.equal((await ask(laptop, 'send', id, { text: SECRET_WORDS, attachments: [{ kind: 'text', name: 'a.txt', text: SECRET_FILE, ext: 'txt', size: 28 }] })).ok, true);
     const reply = await ollama.next();
     assert.ok(reply.body.messages.at(-1).content.includes(SECRET_WORDS), 'the words did reach the model');
+    reply.say('Done.');
     reply.finish();
     assert.equal((await ask(laptop, 'set-mode', privateId, { mode: 'noApproval' })).ok, false);
     assert.equal((await ask(laptop, 'read-api-keys', id)).ok, false);
