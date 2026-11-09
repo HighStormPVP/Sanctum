@@ -184,9 +184,44 @@ test('a wrong secret gets nowhere', async (t) => {
   const world = await startWorld(t);
   const laptop = await world.device('Laptop', `ws://${world.host}/not-the-secret`);
   const answer = await laptop.manager.pair('ABCDEF', 'Laptop');
-  assert.equal(answer.ok, false);
-  assert.match(answer.error, /Couldn't reach/);
-  assert.ok(!answer.error.includes('not-the-secret'));
+  // The Worker answers a wrong secret with a 404, and the real relay client passes that on.
+  assert.deepEqual(answer, {
+    ok: false,
+    error: 'The relay refused this address. Copy the whole service address again: the long part after the last / has to be exact.'
+  });
+  const status = laptop.manager.status();
+  assert.equal(status.relayProblem, answer.error);
+  for (const text of [answer.error, JSON.stringify(status)]) {
+    assert.ok(!text.includes('not-the-secret') && !text.includes(world.host), 'neither the secret nor the host is shown');
+  }
+});
+
+test('the real relay client gives the Worker\'s 404 for a wrong secret, on both kinds of channel', async (t) => {
+  const world = await startWorld(t);
+  const clock = { now: Date.now, setTimeout, clearTimeout, setInterval, clearInterval };
+  const address = `ws://${world.host}/not-the-secret`;
+  const reasons = await Promise.all([
+    new Promise((resolve) => relayClient.connectPairing({
+      address, role: 'guest', clock, onOpen() {}, onNone() {}, onMessage() {}, onClose: resolve
+    })),
+    new Promise((resolve) => relayClient.connectDevice({
+      address, identity: newIdentity(), clock, onReady() {}, onMessage() {}, onOffline() {}, onClose: resolve
+    }))
+  ]);
+  assert.deepEqual(reasons, [404, 404]);
+});
+
+test('the real relay client gives ECONNREFUSED when nothing is listening', async () => {
+  // A port that was free a moment ago, on loopback.
+  const server = net.createServer();
+  await new Promise((resolve) => server.listen({ host: '127.0.0.1', port: 0 }, resolve));
+  const { port } = server.address();
+  await new Promise((resolve) => server.close(resolve));
+  const clock = { now: Date.now, setTimeout, clearTimeout, setInterval, clearInterval };
+  const reason = await new Promise((resolve) => relayClient.connectPairing({
+    address: `ws://127.0.0.1:${port}/anything`, role: 'guest', clock, onOpen() {}, onNone() {}, onMessage() {}, onClose: resolve
+  }));
+  assert.equal(reason, 'ECONNREFUSED');
 });
 
 test('the Worker answers pings on both kinds of socket, as the relay client relies on', async (t) => {

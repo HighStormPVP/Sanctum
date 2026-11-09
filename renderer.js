@@ -6952,9 +6952,13 @@ function paintRemoteDevices() {
   const lockedOut = RemoteRules.pinPrompt(status) === 'enter' || (!on && status.locked === true && status.hasPin === true);
   const note = $('#remote-address-note');
   if (!note.classList.contains('remote-note-error')) {
-    note.textContent = on
+    // Why the relay couldn't be reached at the saved address, if a try has failed since it was saved.
+    // The manager's words, which never hold the address.
+    const problem = on && typeof status.relayProblem === 'string' ? status.relayProblem : '';
+    note.textContent = problem || (on
       ? 'Remote Control is set up on this device. Paste a new address to replace it.'
-      : 'Your home PC needs this once. A laptop on the same Wi-Fi gets it when it pairs with a code.';
+      : 'Your home PC needs this once. A laptop on the same Wi-Fi gets it when it pairs with a code.');
+    note.classList.toggle('remote-note-problem', Boolean(problem));
   }
   $('#remote-address').placeholder = on ? 'Saved' : 'Paste the address';
   // With no address, the field waits under a fold below Connect to a home PC, since a laptop on

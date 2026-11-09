@@ -89,7 +89,10 @@ function fakeRelay() {
     pairLog: [],
     deviceConnects: [],
     pairConnects: [],
+    // true, or a reason for onClose, as the real client gives one: an HTTP status or an error code.
     refuse: false,
+    // A reason the pairing slot closes with before it opens, or null for it to open.
+    refusePairing: null,
     drop: () => false,
     dropPair: () => false,
     pump() {
@@ -136,7 +139,7 @@ function fakeRelay() {
         if (client.closed) return;
         if (relay.refuse) {
           client.closed = true;
-          opts.onClose();
+          opts.onClose(relay.refuse === true ? 'closed' : relay.refuse);
           return;
         }
         const previous = devices.get(deviceId);
@@ -183,6 +186,11 @@ function fakeRelay() {
       relay.pairConnects.push(client);
       queue.push(() => {
         if (client.closed) return;
+        if (relay.refusePairing !== null) {
+          client.closed = true;
+          opts.onClose(relay.refusePairing);
+          return;
+        }
         if (role === 'host') {
           if (slot.host) retire(slot.host);
           if (slot.guest) retire(slot.guest);
@@ -216,6 +224,9 @@ function fakeLocal() {
     // Every message, from whichever end, as it was sent.
     wire: [],
     extraHomes: [],
+    // What a search says went wrong, and the networks it looked on, as discover's outcome has them.
+    problem: null,
+    networks: [],
     pump() {
       while (queue.length) queue.shift()();
     },
@@ -248,6 +259,7 @@ function fakeLocal() {
       local.searches.push(search);
       return {
         result: Promise.resolve(homes),
+        outcome: Promise.resolve({ homes, problem: local.problem, networks: local.networks }),
         cancel() {
           search.cancelled = true;
         }
@@ -375,7 +387,7 @@ function newWorld(t) {
       now: () => Date.now() + world.keystoreOffset
     });
   // A device with a PIN set, whose manager isn't running yet, so a test can seed peers.
-  world.device = async (name, { pin = true, address = ADDRESS, file = world.newFile(), keystore = world.keystore(file), local = false, acceptPlainLoopbackAddress = false, failSave = false } = {}) => {
+  world.device = async (name, { pin = true, address = ADDRESS, file = world.newFile(), keystore = world.keystore(file), local = false, acceptPlainLoopbackAddress = false, failSave = false, platform = 'win32' } = {}) => {
     if (pin) assert.deepEqual(await keystore.setPin(PIN), { ok: true });
     const device = { name, keystore, file, autoUnlock: fakeAutoUnlock(), frames: [], statuses: [], refusals: [], address, saves: [], local: local ? world.local : null, acceptPlainLoopbackAddress, failSave };
     device.identity = () => keystore.getIdentity();
@@ -395,6 +407,7 @@ function newWorld(t) {
         autoUnlock: device.autoUnlock,
         local: device.local,
         acceptPlainLoopbackAddress: device.acceptPlainLoopbackAddress,
+        platform,
         clock: world.clock,
         deviceName: name,
         createDirect: device.createDirect,
@@ -3835,6 +3848,63 @@ test('relay client: the pairing channel opens on the right path and wraps its me
   assert.equal(events.closed, 1);
 });
 
+// What each kind of channel tells onClose about why it ended.
+function closeReasons(connect) {
+  FakeSocket.instances.length = 0;
+  const reasons = [];
+  const common = { address: 'wss://relay.example/secret-part-of-the-address', clock: fakeClock(), WebSocketImpl: FakeSocket, onMessage() {}, onClose: (...args) => reasons.push(args) };
+  const client = connect === 'device'
+    ? connectDevice({ ...common, identity: newIdentity(), onReady() {}, onOffline() {} })
+    : connectPairing({ ...common, role: 'guest', onOpen() {}, onNone() {} });
+  return { client, reasons, socket: FakeSocket.instances[0] };
+}
+
+test('relay client: an HTTP answer instead of a WebSocket is its status, once, and the socket is ended', () => {
+  for (const kind of ['device', 'pairing']) {
+    const { reasons, socket } = closeReasons(kind);
+    socket.emit('unexpected-response', {}, { statusCode: 404 });
+    assert.equal(socket.terminated, true, kind);
+    socket.emit('error', new Error('Unexpected server response: 404'));
+    socket.emit('close', 1006, Buffer.alloc(0));
+    assert.deepEqual(reasons, [[404]], kind);
+  }
+});
+
+test('relay client: an error before opening gives its code, and a handshake timeout is ETIMEDOUT', () => {
+  for (const kind of ['device', 'pairing']) {
+    for (const [err, reason] of [
+      [Object.assign(new Error('getaddrinfo ENOTFOUND relay.example'), { code: 'ENOTFOUND' }), 'ENOTFOUND'],
+      [Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' }), 'ECONNREFUSED'],
+      [Object.assign(new Error('certificate has expired'), { code: 'CERT_HAS_EXPIRED' }), 'CERT_HAS_EXPIRED'],
+      [new Error('Opening handshake has timed out'), 'ETIMEDOUT'],
+      [new Error('something else'), 'closed'],
+      // A code is only ever passed on as a plain code, never as text that could hold the address.
+      [Object.assign(new Error('x'), { code: 'wss://relay.example/secret-part-of-the-address' }), 'closed']
+    ]) {
+      const { reasons, socket } = closeReasons(kind);
+      socket.emit('error', err);
+      socket.emit('close', 1006, Buffer.alloc(0));
+      assert.deepEqual(reasons, [[reason]], `${kind}: ${err.message}`);
+    }
+  }
+});
+
+test('relay client: a close without an error, or after opening, is closed', () => {
+  const plain = closeReasons('pairing');
+  plain.socket.emit('close', 1006, Buffer.alloc(0));
+  assert.deepEqual(plain.reasons, [['closed']]);
+
+  const opened = closeReasons('device');
+  opened.socket.open();
+  opened.socket._receiver.emit('conclude', 1000, Buffer.from('replaced'));
+  assert.deepEqual(opened.reasons, [['closed']]);
+
+  const quiet = closeReasons('device');
+  quiet.client.close();
+  quiet.socket.emit('unexpected-response', {}, { statusCode: 404 });
+  assert.deepEqual(quiet.reasons, [], 'closed by its owner, so nothing is said');
+});
+
 // ---- Direct connections, with a fake direct path ----
 
 // Stands in for lib/remote/direct-path.js on one device, and records what the manager asks.
@@ -5423,4 +5493,172 @@ test('same network: a sealed address has to be wss, unless a test run says it ma
       assert.deepEqual(laptop.saves, [address]);
     }
   }
+});
+
+// ---- Saying why a search or the relay failed ----
+
+const MAC_LOCAL_NETWORK = "macOS didn't let Sanctum look on your local network. Turn Sanctum on in System Settings > Privacy & Security > Local Network, then quit and reopen Sanctum.";
+const NO_HOME_NETWORK = "This computer isn't on a home network right now. Join the same Wi-Fi as your home PC, or paste the service address.";
+const RELAY_REFUSED = 'The relay refused this address. Copy the whole service address again: the long part after the last / has to be exact.';
+const RELAY_UNREACHABLE = "Couldn't reach the relay from this computer. Check the internet connection, and whether a firewall, VPN, or security app is blocking Sanctum.";
+const RELAY_INSECURE = "Couldn't make a secure connection to the relay. A VPN, proxy, or security app may be intercepting it.";
+const COULD_NOT_REACH = "Couldn't reach the Remote Control service. Check your connection, and try again.";
+
+async function searchSays(t, { platform = 'win32', problem = null, networks = [] }) {
+  const world = newWorld(t);
+  const laptop = await world.device('Laptop', { address: null, local: true, platform });
+  laptop.start();
+  world.local.problem = problem;
+  world.local.networks = networks;
+  return settleWith(world, laptop.manager.pair('ABCDEF', 'Laptop'));
+}
+
+test('search words: on a Mac, every send refused by the system is the Local Network permission', async (t) => {
+  for (const code of ['EHOSTUNREACH', 'EPERM', 'EACCES']) {
+    const answer = await searchSays(t, { platform: 'darwin', problem: { kind: 'send', code, every: true }, networks: ['192.168.0'] });
+    assert.deepEqual(answer, { ok: false, error: MAC_LOCAL_NETWORK, notFound: true }, code);
+  }
+});
+
+test('search words: the Local Network words are only for a Mac, only when every send was refused, and only for those codes', async (t) => {
+  const searched = `${NOT_FOUND_HERE} Searched 192.168.0.x.`;
+  for (const [platform, problem] of [
+    ['darwin', { kind: 'send', code: 'EHOSTUNREACH', every: false }],
+    ['darwin', { kind: 'broadcast', code: 'EPERM' }],
+    ['win32', { kind: 'send', code: 'EHOSTUNREACH', every: false }],
+    ['linux', { kind: 'send', code: 'EHOSTDOWN', every: false }]
+  ]) {
+    const answer = await searchSays(t, { platform, problem, networks: ['192.168.0'] });
+    assert.deepEqual(answer, { ok: false, error: searched, notFound: true }, `${platform} ${JSON.stringify(problem)}`);
+  }
+  // Nothing got out, but not for the Mac's reason: it says so, with the code alone.
+  for (const [platform, problem] of [
+    ['win32', { kind: 'send', code: 'EPERM', every: true }],
+    ['darwin', { kind: 'send', code: 'ENETDOWN', every: true }],
+    ['darwin', { kind: 'socket', code: 'EADDRINUSE' }]
+  ]) {
+    const answer = await searchSays(t, { platform, problem, networks: ['192.168.0'] });
+    assert.equal(answer.notFound, true);
+    assert.equal(answer.ok, false);
+    assert.notEqual(answer.error, MAC_LOCAL_NETWORK);
+    assert.ok(answer.error.includes(`(${problem.code})`), answer.error);
+    assert.ok(answer.error.includes('paste the service address'), answer.error);
+  }
+});
+
+test('search words: no private network interface says to join the Wi-Fi, on any system', async (t) => {
+  for (const platform of ['darwin', 'win32']) {
+    const answer = await searchSays(t, { platform, problem: { kind: 'no-network' } });
+    assert.deepEqual(answer, { ok: false, error: NO_HOME_NETWORK, notFound: true });
+  }
+});
+
+test('search words: nobody answered says which networks were searched, by their first three octets', async (t) => {
+  assert.deepEqual(await searchSays(t, { networks: ['192.168.0'] }), { ok: false, error: `${NOT_FOUND_HERE} Searched 192.168.0.x.`, notFound: true });
+  assert.deepEqual(await searchSays(t, { networks: ['192.168.0', '10.0.5'] }), { ok: false, error: `${NOT_FOUND_HERE} Searched 192.168.0.x and 10.0.5.x.`, notFound: true });
+  assert.deepEqual(await searchSays(t, { networks: ['192.168.0', '10.0.5', '172.16.1'] }), { ok: false, error: `${NOT_FOUND_HERE} Searched 192.168.0.x, 10.0.5.x and 172.16.1.x.`, notFound: true });
+  // Anything that isn't three octets isn't shown.
+  assert.deepEqual(await searchSays(t, { networks: ['192.168.0.21', 'wss://relay.example/y', 7] }), { ok: false, error: NOT_FOUND_HERE, notFound: true });
+});
+
+async function relayPairSays(t, reason) {
+  const world = newWorld(t);
+  const laptop = await world.device('Laptop');
+  laptop.start();
+  world.relay.refusePairing = reason;
+  const answer = await settleWith(world, laptop.manager.pair('ABCDEF', 'Laptop'));
+  return { answer, status: laptop.manager.status(), laptop, world };
+}
+
+test('relay words: a 404 is the relay refusing the address, in the answer and in status, without the address', async (t) => {
+  const { answer, status } = await relayPairSays(t, 404);
+  assert.deepEqual(answer, { ok: false, error: RELAY_REFUSED });
+  assert.equal(status.relayProblem, RELAY_REFUSED);
+  const secret = ADDRESS.split('/').pop();
+  for (const text of [answer.error, JSON.stringify(status)]) {
+    assert.ok(!text.includes(ADDRESS) && !text.includes(secret), 'the address and its secret are never shown');
+  }
+});
+
+test('relay words: each reason the relay client gives has its words', async (t) => {
+  for (const [reason, words] of [
+    ['ENOTFOUND', RELAY_UNREACHABLE],
+    ['EAI_AGAIN', RELAY_UNREACHABLE],
+    ['ECONNREFUSED', RELAY_UNREACHABLE],
+    ['ETIMEDOUT', RELAY_UNREACHABLE],
+    ['CERT_HAS_EXPIRED', RELAY_INSECURE],
+    ['UNABLE_TO_VERIFY_LEAF_SIGNATURE', RELAY_INSECURE],
+    ['UNABLE_TO_GET_ISSUER_CERT_LOCALLY', RELAY_INSECURE],
+    ['SELF_SIGNED_CERT_IN_CHAIN', RELAY_INSECURE],
+    ['DEPTH_ZERO_SELF_SIGNED_CERT', RELAY_INSECURE],
+    ['ERR_TLS_CERT_ALTNAME_INVALID', RELAY_INSECURE],
+    ['ECONNRESET', COULD_NOT_REACH],
+    ['closed', COULD_NOT_REACH],
+    [403, COULD_NOT_REACH],
+    [500, COULD_NOT_REACH],
+    [undefined, COULD_NOT_REACH],
+    ['wss://relay.example/secret-part-of-the-address', COULD_NOT_REACH]
+  ]) {
+    const { answer, status } = await relayPairSays(t, reason);
+    assert.deepEqual(answer, { ok: false, error: words }, String(reason));
+    assert.equal(status.relayProblem, words, String(reason));
+  }
+});
+
+test('relay words: reaching the pairing slot clears what status said about the address', async (t) => {
+  const { world, laptop } = await relayPairSays(t, 404);
+  assert.equal(laptop.manager.status().relayProblem, RELAY_REFUSED);
+  world.relay.refusePairing = null;
+  const home = await world.device('Home');
+  home.start();
+  await home.manager.createCode();
+  world.relay.pump();
+  // The laptop's next try opens the slot, and whatever the code does, the address was fine.
+  await settleWith(world, laptop.manager.pair('ZZZZZZ', 'Laptop'));
+  assert.strictEqual(laptop.manager.status().relayProblem, null);
+});
+
+test('relay words: a home PC whose relay refuses its address shows that in status, and loses the code', async (t) => {
+  const world = newWorld(t);
+  const home = await world.device('Home');
+  home.start();
+  world.relay.refusePairing = 404;
+  const created = await home.manager.createCode();
+  assert.ok(created.code);
+  world.relay.pump();
+  const status = home.manager.status();
+  assert.equal(status.relayProblem, RELAY_REFUSED);
+  assert.equal(status.codePending, false);
+});
+
+test('relay words: a device connection refused before it is ready says why in status, until it connects', async (t) => {
+  const world = newWorld(t);
+  const home = await world.device('Home');
+  const laptop = await world.device('Laptop');
+  seedPair(home, laptop);
+  world.relay.refuse = 404;
+  laptop.start();
+  world.relay.pump();
+  assert.equal(laptop.manager.status().relayProblem, RELAY_REFUSED);
+  assert.equal(laptop.statuses.at(-1).relayProblem, RELAY_REFUSED, 'and a status event says so');
+  world.relay.refuse = 'ENOTFOUND';
+  world.run(60 * 1000);
+  assert.equal(laptop.manager.status().relayProblem, RELAY_UNREACHABLE);
+  world.relay.refuse = false;
+  home.start();
+  world.run(5 * MINUTES);
+  assert.equal(laptop.entry(home.id).connected, true);
+  assert.strictEqual(laptop.manager.status().relayProblem, null);
+});
+
+test('relay words: a connection that was ready and then dropped is not a problem with the address', async (t) => {
+  const { world, laptop } = await connected(t);
+  world.relay.kill(laptop.id);
+  assert.strictEqual(laptop.manager.status().relayProblem, null);
+});
+
+test('relay words: a new address starts with nothing said about it', async (t) => {
+  const { laptop } = await relayPairSays(t, 404);
+  assert.deepEqual(laptop.manager.setAddress('wss://relay.example/another-one'), { ok: true });
+  assert.strictEqual(laptop.manager.status().relayProblem, null);
 });

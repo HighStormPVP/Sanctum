@@ -12,8 +12,9 @@ const path = require('node:path');
 const local = require(path.join(__dirname, '..', 'lib', 'remote', 'local-pairing.js'));
 const {
   DISCOVERY_PORT, isPrivateAddress, probeBytes, isProbe, replyBytes, parseReply, createHomeList,
-  broadcastAddresses, createLocalPairing, connectLocalPairing
+  broadcastAddresses, probeTargets, createLocalPairing, connectLocalPairing
 } = local;
+const { EventEmitter } = require('node:events');
 
 const LOOPBACK = '127.0.0.1';
 const PAKE_LINE = JSON.stringify({ t: 'pake', pake: 'AAAA' });
@@ -263,6 +264,78 @@ test('broadcastAddresses is the limited broadcast and each private interface\'s 
   assert.deepEqual(broadcastAddresses(null), ['255.255.255.255']);
 });
 
+// ---- Asking each address directly ----
+
+const iface = (address, netmask, extra = {}) => ({ address, netmask, family: 'IPv4', internal: false, ...extra });
+
+test('probeTargets: a /24 gives its 253 other hosts, besides the broadcasts', () => {
+  const targets = probeTargets({ 'Wi-Fi': [iface('192.168.0.21', '255.255.255.0')] });
+  assert.deepEqual(targets.broadcasts, ['255.255.255.255', '192.168.0.255']);
+  assert.equal(targets.unicast.length, 253);
+  assert.equal(targets.unicast[0], '192.168.0.1');
+  assert.equal(targets.unicast[targets.unicast.length - 1], '192.168.0.254');
+  assert.ok(!targets.unicast.includes('192.168.0.0'), 'not the network address');
+  assert.ok(!targets.unicast.includes('192.168.0.255'), 'not the broadcast address');
+  assert.ok(!targets.unicast.includes('192.168.0.21'), 'not this machine');
+  assert.equal(new Set(targets.unicast).size, 253);
+  assert.deepEqual(targets.networks, ['192.168.0']);
+});
+
+test('probeTargets: a network wider than /22 is only broadcast to', () => {
+  const sixteen = probeTargets({ Ethernet: [iface('10.20.30.40', '255.255.0.0')] });
+  assert.deepEqual(sixteen.unicast, []);
+  assert.deepEqual(sixteen.broadcasts, ['255.255.255.255', '10.20.255.255']);
+  assert.deepEqual(sixteen.networks, ['10.20.30']);
+  const twentyThree = probeTargets({ Ethernet: [iface('10.0.0.5', '255.255.254.0')] });
+  assert.equal(twentyThree.unicast.length, 509);
+  const twentyTwo = probeTargets({ Ethernet: [iface('10.0.0.5', '255.255.252.0')] });
+  assert.equal(twentyTwo.unicast.length, 1021);
+  const twentyOne = probeTargets({ Ethernet: [iface('10.0.0.5', '255.255.248.0')] });
+  assert.deepEqual(twentyOne.unicast, []);
+});
+
+test('probeTargets: none of this machine\'s own addresses, on any interface, is a target', () => {
+  const targets = probeTargets({
+    'Wi-Fi': [iface('192.168.0.21', '255.255.255.0')],
+    Ethernet: [iface('192.168.0.40', '255.255.255.0')],
+    Loopback: [{ address: '127.0.0.1', netmask: '255.0.0.0', family: 'IPv4', internal: true }]
+  });
+  assert.ok(!targets.unicast.includes('192.168.0.21'));
+  assert.ok(!targets.unicast.includes('192.168.0.40'));
+  assert.equal(targets.unicast.length, 252, 'and the shared network is listed once');
+  assert.ok(!targets.unicast.some((a) => a.startsWith('127.')), 'internal interfaces are not searched');
+  assert.deepEqual(targets.networks, ['192.168.0']);
+});
+
+test('probeTargets: at most 1024 addresses are asked directly, across every interface', () => {
+  const targets = probeTargets({
+    A: [iface('10.0.0.5', '255.255.252.0')],
+    B: [iface('10.1.0.5', '255.255.252.0')],
+    C: [iface('192.168.7.9', '255.255.255.0')]
+  });
+  assert.equal(targets.unicast.length, 1024);
+  assert.equal(new Set(targets.unicast).size, 1024);
+  // The first network is whole before the next starts.
+  assert.equal(targets.unicast.filter((a) => a.startsWith('10.0.')).length, 1021);
+  assert.deepEqual(targets.broadcasts, ['255.255.255.255', '10.0.3.255', '10.1.3.255', '192.168.7.255']);
+});
+
+test('probeTargets: public, point-to-point, broken and IPv6 entries add nothing, and loopback-only gives nothing', () => {
+  const targets = probeTargets({
+    Public: [iface('203.0.113.9', '255.255.255.0')],
+    'Point to point': [iface('10.9.9.9', '255.255.255.255')],
+    Pair: [iface('10.9.9.8', '255.255.255.254')],
+    Holes: [iface('192.168.3.3', '255.255.0.255')],
+    Broken: [iface('192.168.7.1', 'nonsense')],
+    Six: [{ address: 'fe80::1', netmask: 'ffff:ffff:ffff:ffff::', family: 'IPv6', internal: false }]
+  });
+  assert.deepEqual(targets.unicast, []);
+  assert.deepEqual(probeTargets({}), { broadcasts: ['255.255.255.255'], unicast: [], networks: [] });
+  assert.deepEqual(probeTargets(null), { broadcasts: ['255.255.255.255'], unicast: [], networks: [] });
+  const thirty = probeTargets({ Tiny: [iface('172.20.1.1', '255.255.255.252')] });
+  assert.deepEqual(thirty.unicast, ['172.20.1.2']);
+});
+
 // ---- Never off this machine in a test ----
 
 test('outside loopback is refused under the test runner, so no test can ask the firewall', () => {
@@ -395,6 +468,195 @@ test('cancelling a search ends it at once with nothing', async () => {
   search.cancel();
   assert.deepEqual(await search.result, []);
   assert.equal(clock.pending(), 0);
+});
+
+test('on loopback the search still sends to 127.0.0.1 alone, and its outcome has no problem', async (t) => {
+  const { pairing, ports } = await startListener(t);
+  const clock = fakeClock();
+  const search = pairing.discover({ clock });
+  await sleep(200);
+  clock.advance(4000);
+  assert.deepEqual(await search.outcome, { homes: [{ address: LOOPBACK, port: ports.tcpPort }], problem: null, networks: [] });
+});
+
+// ---- Searching where broadcasts don't arrive ----
+
+// A fake /29 on loopback: this machine is 127.0.0.1, and 127.0.0.2 to .6 are the other hosts.
+const LOOPBACK_29 = () => ({ 'Wi-Fi': [iface('127.0.0.1', '255.255.255.248')] });
+
+test('the bind host may only be loopback, and loopback: false is still refused under the test runner without it', () => {
+  for (const bindHost of ['0.0.0.0', '192.168.1.5', '::', '', 7]) {
+    assert.throws(() => createLocalPairing({ loopback: false, bindHost }), /loopback/, String(bindHost));
+  }
+  assert.throws(() => createLocalPairing({ loopback: false }), /loopback/);
+  assert.doesNotThrow(() => createLocalPairing({ loopback: false, bindHost: LOOPBACK, networkInterfaces: LOOPBACK_29 }));
+});
+
+test('a home that only a direct probe reaches is found: unicast to each host of a /29 on 127.0.0.x', async (t) => {
+  // Bound to 127.0.0.2 alone, so only a probe addressed to 127.0.0.2 reaches it. No broadcast does.
+  const home = dgram.createSocket('udp4');
+  const probesFrom = [];
+  home.on('message', (msg, rinfo) => {
+    if (!isProbe(msg)) return;
+    probesFrom.push(rinfo.address);
+    home.send(replyBytes({ port: 42424 }), rinfo.port, rinfo.address);
+  });
+  await new Promise((resolve) => home.bind({ address: '127.0.0.2', port: 0 }, resolve));
+  t.after(() => home.close());
+  const discoveryPort = home.address().port;
+
+  const pairing = createLocalPairing({ loopback: false, bindHost: LOOPBACK, discoveryPort, networkInterfaces: LOOPBACK_29 });
+  const clock = fakeClock();
+  const search = pairing.discover({ clock });
+  t.after(() => search.cancel());
+  await waitFor('the home to be probed', () => probesFrom.length >= 1);
+  await sleep(100);
+  clock.advance(4000);
+  const outcome = await search.outcome;
+  assert.deepEqual(outcome.homes, [{ address: '127.0.0.2', port: 42424 }]);
+  assert.equal(outcome.problem, null);
+  assert.deepEqual(outcome.networks, ['127.0.0']);
+  assert.deepEqual(await search.result, outcome.homes, 'result is still the homes alone');
+  assert.ok(probesFrom.every((address) => address === LOOPBACK), 'the search was bound to 127.0.0.1');
+});
+
+// Stands in for a UDP socket, for what a real one on loopback can't be made to do: refuse to send.
+function fakeUdp({ sendError = () => null, broadcastError = null } = {}) {
+  const made = [];
+  const create = (type) => {
+    const socket = new EventEmitter();
+    socket.type = type;
+    socket.sent = [];
+    // Sends made in one turn of the event loop, so a test can see how a round is paced.
+    socket.turns = [];
+    let turn = null;
+    socket.bind = (options, cb) => {
+      socket.boundTo = options;
+      setImmediate(cb);
+    };
+    socket.setBroadcast = () => {
+      if (broadcastError) throw broadcastError;
+      socket.broadcast = true;
+    };
+    socket.send = (bytes, port, address, cb) => {
+      if (!turn) {
+        turn = [];
+        socket.turns.push(turn);
+        process.nextTick(() => {
+          turn = null;
+        });
+      }
+      turn.push(address);
+      socket.sent.push({ address, port, text: bytes.toString('utf8') });
+      const err = sendError(address);
+      setImmediate(() => cb(err));
+    };
+    socket.close = () => {
+      socket.closed = true;
+    };
+    made.push(socket);
+    return socket;
+  };
+  return { create, made };
+}
+
+const withCode = (code) => Object.assign(new Error('nope'), { code });
+
+async function fakeSearch({ interfaces = LOOPBACK_29, udp = fakeUdp(), rounds = 3 } = {}) {
+  const pairing = createLocalPairing({ loopback: false, bindHost: LOOPBACK, discoveryPort: 47613, networkInterfaces: interfaces, createUdpSocket: udp.create });
+  const clock = fakeClock();
+  const search = pairing.discover({ clock });
+  const socket = udp.made[0];
+  await waitFor('the socket to bind', () => socket.boundTo);
+  await sleep(20);
+  for (let i = 1; i < rounds; i++) {
+    clock.advance(1000);
+    await sleep(20);
+  }
+  clock.advance(4000 - (rounds - 1) * 1000);
+  return { outcome: await search.outcome, socket };
+}
+
+test('a search bound to loopback sends only to loopback, whatever networks this machine is on', async () => {
+  const { socket } = await fakeSearch({
+    interfaces: () => ({ 'Wi-Fi': [iface('192.168.1.37', '255.255.255.0')], Fake: [iface('127.0.0.1', '255.255.255.248')] })
+  });
+  assert.deepEqual(socket.boundTo, { address: LOOPBACK, port: 0 });
+  assert.ok(socket.sent.length > 0);
+  assert.ok(socket.sent.every((s) => s.address.startsWith('127.')), 'nothing left the machine');
+});
+
+test('each round sends the broadcasts, then every host directly, to the discovery port', async () => {
+  const { socket, outcome } = await fakeSearch();
+  const round = ['127.0.0.7', '127.0.0.2', '127.0.0.3', '127.0.0.4', '127.0.0.5', '127.0.0.6'];
+  assert.deepEqual(socket.sent.map((s) => s.address), [...round, ...round, ...round]);
+  assert.ok(socket.sent.every((s) => s.port === 47613 && s.text === '{"sanctum":"pair-probe","v":1}'));
+  assert.equal(socket.broadcast, true);
+  assert.equal(socket.closed, true);
+  assert.deepEqual(outcome, { homes: [], problem: null, networks: ['127.0.0'] });
+});
+
+test('a round over a /22 goes out 64 sends at a time, not all at once', async (t) => {
+  const udp = fakeUdp();
+  const pairing = createLocalPairing({
+    loopback: false, bindHost: LOOPBACK, networkInterfaces: () => ({ Wide: [iface('127.0.0.1', '255.255.252.0')] }), createUdpSocket: udp.create
+  });
+  const clock = fakeClock();
+  const search = pairing.discover({ clock });
+  t.after(() => search.cancel());
+  // 1021 hosts and the directed broadcast; the limited one isn't loopback.
+  await waitFor('the first round', () => udp.made[0].sent.length === 1022);
+  const { turns } = udp.made[0];
+  assert.ok(turns.length >= 16, `${turns.length} turns`);
+  assert.ok(turns.every((turn) => turn.length <= 64), 'no turn sends more than 64');
+  search.cancel();
+  assert.deepEqual((await search.outcome).homes, []);
+});
+
+test('every send refused is a problem with the first code, and says it was every one', async () => {
+  const udp = fakeUdp({ sendError: () => withCode('EHOSTUNREACH') });
+  const { outcome } = await fakeSearch({ udp });
+  assert.deepEqual(outcome, { homes: [], problem: { kind: 'send', code: 'EHOSTUNREACH', every: true }, networks: ['127.0.0'] });
+});
+
+test('some sends refused is a problem too, but not every one', async () => {
+  const udp = fakeUdp({ sendError: (address) => (address === '127.0.0.4' ? withCode('EHOSTDOWN') : null) });
+  const { outcome } = await fakeSearch({ udp });
+  assert.deepEqual(outcome.problem, { kind: 'send', code: 'EHOSTDOWN', every: false });
+});
+
+test('a socket error ends the search and is the problem', async () => {
+  const udp = fakeUdp();
+  const pairing = createLocalPairing({ loopback: false, bindHost: LOOPBACK, networkInterfaces: LOOPBACK_29, createUdpSocket: udp.create });
+  const search = pairing.discover({ clock: fakeClock() });
+  udp.made[0].emit('error', withCode('EACCES'));
+  assert.deepEqual(await search.outcome, { homes: [], problem: { kind: 'socket', code: 'EACCES' }, networks: ['127.0.0'] });
+  assert.deepEqual(await search.result, []);
+});
+
+test('broadcast refused still asks each host directly, and says broadcasting failed', async () => {
+  const udp = fakeUdp({ broadcastError: withCode('EPERM') });
+  const { outcome, socket } = await fakeSearch({ udp });
+  assert.deepEqual(socket.sent.map((s) => s.address).slice(0, 5), ['127.0.0.2', '127.0.0.3', '127.0.0.4', '127.0.0.5', '127.0.0.6']);
+  assert.ok(!socket.sent.some((s) => s.address === '127.0.0.7'), 'no broadcasts');
+  assert.equal(socket.sent.length, 15);
+  assert.deepEqual(outcome.problem, { kind: 'broadcast', code: 'EPERM' });
+});
+
+test('no private network at all is the problem, whatever else happens', async () => {
+  const udp = fakeUdp({ sendError: () => withCode('ENETUNREACH') });
+  const { outcome } = await fakeSearch({ udp, interfaces: () => ({ Public: [iface('203.0.113.9', '255.255.255.0')] }) });
+  assert.deepEqual(outcome, { homes: [], problem: { kind: 'no-network' }, networks: [] });
+  const throwing = await fakeSearch({ interfaces: () => {
+    throw new Error('no interfaces');
+  } });
+  assert.deepEqual(throwing.outcome.problem, { kind: 'no-network' });
+});
+
+test('a code that is not a plain error code is not passed on', async () => {
+  const udp = fakeUdp({ sendError: () => withCode('wss://relay.example/secret') });
+  const { outcome } = await fakeSearch({ udp });
+  assert.deepEqual(outcome.problem, { kind: 'send', code: 'UNKNOWN', every: true });
 });
 
 test('a listener on IPv6 loopback ignores probes from it, since ::1 is not one of the ranges', async (t) => {

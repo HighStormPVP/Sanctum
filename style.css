@@ -3739,7 +3739,8 @@ textarea:focus-visible, input:focus-visible { outline: none; }
 .remote-address-row { display: flex; align-items: stretch; gap: 8px; }
 .remote-address-row .api-key-input { flex: 1; min-width: 0; }
 .remote-address-row .ghost-btn { flex-shrink: 0; }
-.remote-note-error { color: var(--err); }
+.remote-note-error,
+.remote-note-problem { color: var(--err); }
 .remote-panel-lock { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 14px; font-size: 13px; color: var(--text-2); }
 
 #remote-devices { margin-top: 18px; }
