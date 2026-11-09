@@ -315,9 +315,22 @@ test('probeTargets: at most 1024 addresses are asked directly, across every inte
   });
   assert.equal(targets.unicast.length, 1024);
   assert.equal(new Set(targets.unicast).size, 1024);
-  // The first network is whole before the next starts.
-  assert.equal(targets.unicast.filter((a) => a.startsWith('10.0.')).length, 1021);
+  // Smallest network first, then each network whole before the next starts.
+  assert.equal(targets.unicast.filter((a) => a.startsWith('192.168.7.')).length, 253);
+  assert.equal(targets.unicast.filter((a) => a.startsWith('10.0.')).length, 1024 - 253);
+  assert.equal(targets.unicast.filter((a) => a.startsWith('10.1.')).length, 0);
   assert.deepEqual(targets.broadcasts, ['255.255.255.255', '10.0.3.255', '10.1.3.255', '192.168.7.255']);
+});
+
+test('probeTargets: the smallest network is asked first, so a wide one listed earlier can not use up the cap', () => {
+  const { unicast } = probeTargets({
+    Vpn: [iface('10.8.0.5', '255.255.252.0')],
+    'Wi-Fi': [iface('192.168.0.21', '255.255.255.0')]
+  });
+  assert.equal(unicast.length, 1024);
+  const home = unicast.filter((address) => address.startsWith('192.168.0.'));
+  assert.equal(home.length, 253, 'every other host on the Wi-Fi');
+  assert.equal(unicast[0], '192.168.0.1');
 });
 
 test('probeTargets: public, point-to-point, broken and IPv6 entries add nothing, and loopback-only gives nothing', () => {
@@ -492,7 +505,8 @@ test('the bind host may only be loopback, and loopback: false is still refused u
   assert.doesNotThrow(() => createLocalPairing({ loopback: false, bindHost: LOOPBACK, networkInterfaces: LOOPBACK_29 }));
 });
 
-test('a home that only a direct probe reaches is found: unicast to each host of a /29 on 127.0.0.x', async (t) => {
+// macOS puts only 127.0.0.1 on loopback, so 127.0.0.2 can't be bound there.
+test('a home that only a direct probe reaches is found: unicast to each host of a /29 on 127.0.0.x', { skip: process.platform === 'darwin' }, async (t) => {
   // Bound to 127.0.0.2 alone, so only a probe addressed to 127.0.0.2 reaches it. No broadcast does.
   const home = dgram.createSocket('udp4');
   const probesFrom = [];
@@ -541,6 +555,7 @@ function fakeUdp({ sendError = () => null, broadcastError = null } = {}) {
     socket.send = (bytes, port, address, cb) => {
       if (!turn) {
         turn = [];
+        turn.at = performance.now();
         socket.turns.push(turn);
         process.nextTick(() => {
           turn = null;
@@ -609,6 +624,9 @@ test('a round over a /22 goes out 64 sends at a time, not all at once', async (t
   const { turns } = udp.made[0];
   assert.ok(turns.length >= 16, `${turns.length} turns`);
   assert.ok(turns.every((turn) => turn.length <= 64), 'no turn sends more than 64');
+  // Spaced a few milliseconds apart, so the sends and their address lookups don't all land at once.
+  const first = turns.slice(0, 16);
+  assert.ok(first[15].at - first[0].at >= 15 * 4, `16 batches in ${Math.round(first[15].at - first[0].at)} ms`);
   search.cancel();
   assert.deepEqual((await search.outcome).homes, []);
 });
@@ -623,6 +641,20 @@ test('some sends refused is a problem too, but not every one', async () => {
   const udp = fakeUdp({ sendError: (address) => (address === '127.0.0.4' ? withCode('EHOSTDOWN') : null) });
   const { outcome } = await fakeSearch({ udp });
   assert.deepEqual(outcome.problem, { kind: 'send', code: 'EHOSTDOWN', every: false });
+});
+
+test('every direct probe refused is every one, even when a broadcast got out', async () => {
+  // macOS may let a broadcast through while Local Network access is off. The direct probes decide.
+  const udp = fakeUdp({ sendError: (address) => (address === '127.0.0.7' ? null : withCode('EHOSTUNREACH')) });
+  const { outcome } = await fakeSearch({ udp });
+  assert.deepEqual(outcome.problem, { kind: 'send', code: 'EHOSTUNREACH', every: true });
+});
+
+test('broadcast refused on a network too wide to ask directly means nothing was sent', async () => {
+  const udp = fakeUdp({ broadcastError: withCode('EPERM') });
+  const { outcome, socket } = await fakeSearch({ udp, interfaces: () => ({ Wide: [iface('127.0.0.1', '255.255.0.0')] }) });
+  assert.equal(socket.sent.length, 0);
+  assert.deepEqual(outcome.problem, { kind: 'send', code: 'EPERM', every: true });
 });
 
 test('a socket error ends the search and is the problem', async () => {
