@@ -165,7 +165,14 @@ const EXCEPTIONS = [
   // In pieces, or this file would hold it too.
   { file: 'e2e/direct.e2e.js', text: ['CANARY', 'chat-text-that-must-only-cross-sealed'].join('-') }
 ];
-const excused = (rel, f) => EXCEPTIONS.some((e) => e.file === rel && f.kind === 'a 32-byte secret' && e.text.includes(f.value));
+// The TLS test fixtures are base64 throughout, so every line looks random. A file there is
+// excused from the secret rule only while it is nothing but PEM blocks: a certificate or a key,
+// armour and base64, with no room for an address or a stray line. Addresses are still checked.
+const PEM_FIXTURE = /^test\/fixtures\/tls\/[\w-]+\.pem$/;
+const ONLY_PEM = /^(?:-----BEGIN (CERTIFICATE|PRIVATE KEY)-----\r?\n(?:[A-Za-z0-9+/]{1,64}={0,2}\r?\n)+-----END \1-----\r?\n?)+$/;
+const onlyPem = (rel) => PEM_FIXTURE.test(rel) && ONLY_PEM.test(fs.readFileSync(path.join(ROOT, rel), 'utf8'));
+const excused = (rel, f) => (f.kind === 'a 32-byte secret' && onlyPem(rel))
+  || EXCEPTIONS.some((e) => e.file === rel && f.kind === 'a 32-byte secret' && e.text.includes(f.value));
 
 function scan(files) {
   const problems = [];
@@ -382,4 +389,15 @@ test('no file in the repo, tracked or about to be, holds a relay address or secr
 
 test('nothing a build would pack holds a relay address or secret', () => {
   assert.deepEqual(scan(packedFiles()), []);
+});
+
+test('the TLS fixtures are excused only while they are nothing but certificate and key blocks', () => {
+  const fixtures = fs.readdirSync(path.join(ROOT, 'test', 'fixtures', 'tls')).map((name) => `test/fixtures/tls/${name}`);
+  assert.deepEqual(fixtures.sort(), ['test/fixtures/tls/ca.pem', 'test/fixtures/tls/server-key.pem', 'test/fixtures/tls/server.pem']);
+  for (const rel of fixtures) assert.ok(onlyPem(rel), rel);
+  // A line added to one of them, or the same text anywhere else, isn't excused.
+  const pem = fs.readFileSync(path.join(ROOT, 'test/fixtures/tls/ca.pem'), 'utf8');
+  assert.equal(ONLY_PEM.test(`${pem}secret: ${crypto.randomBytes(32).toString('base64url')}\n`), false);
+  assert.equal(PEM_FIXTURE.test('lib/remote/ca.pem'), false);
+  assert.equal(PEM_FIXTURE.test('test/fixtures/tls/../../x.pem'), false);
 });

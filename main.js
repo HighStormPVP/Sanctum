@@ -25,6 +25,17 @@ if (debugSwitch) {
 const { createKeystore, retryTransient } = require('./lib/remote/keystore');
 const { createManager: createRemoteManager } = require('./lib/remote/manager');
 const remoteRelayClient = require('./lib/remote/relay-client');
+const { systemCertificates } = require('./lib/remote/system-ca');
+
+// On a Mac, the relay connection trusts what the Keychain trusts, so a school's or company's
+// filter that re-signs secure traffic doesn't stop it any more than it stops Safari. Read once,
+// at the first connection, so start-up doesn't wait on it. Elsewhere this is null and changes
+// nothing.
+let relayTrust;
+const relayCertificates = () => {
+  if (relayTrust === undefined) relayTrust = systemCertificates();
+  return relayTrust;
+};
 const { createDirectPath } = require('./lib/remote/direct-path');
 const { createLocalPairing } = require('./lib/remote/local-pairing');
 const RemoteRules = require('./lib/remote-rules');
@@ -1009,7 +1020,7 @@ function startRemoteControl() {
   }
   remoteManager = createRemoteManager({
     keystore,
-    relay: remoteRelayClient,
+    relay: remoteRelayClient.trusting(relayCertificates),
     local: nearbyPairing(),
     // A test's Worker is plain ws on this machine. Anywhere else a sealed address has to be wss.
     acceptPlainLoopbackAddress: nearbyLoopback,

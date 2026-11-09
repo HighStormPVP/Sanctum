@@ -55,6 +55,7 @@ Remote Control's connection lives in `lib/remote/`, also free of Electron:
 | `lib/remote/session.js` | Fresh keys per connection from the long-term keys, then encrypts and decrypts every frame |
 | `lib/remote/link.js` | Ordered, exactly-once delivery over the relay and the direct path, so a switch loses nothing |
 | `lib/remote/relay-client.js` | The WebSocket to the relay Worker, for a device's mailbox or the pairing slot |
+| `lib/remote/system-ca.js` | On a Mac, the certificates the Keychain trusts, added to the relay connection's built-in list, so a filter that re-signs secure traffic (Zscaler) doesn't block it any more than it blocks Safari |
 | `lib/remote/local-pairing.js` | Pairing on the same network: home's listener while a code shows, the laptop's search, and the pairing messages over TCP. Only private addresses, and only loopback in tests |
 | `lib/remote/direct-path.js` | WebRTC data channels per device, run in the hidden window, beside the relay |
 | `lib/remote/keystore.js` | This device's identity, paired devices, PIN, and control switch, sealed with `safeStorage` |
