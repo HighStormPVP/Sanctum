@@ -166,11 +166,27 @@ const EXCEPTIONS = [
   { file: 'e2e/direct.e2e.js', text: ['CANARY', 'chat-text-that-must-only-cross-sealed'].join('-') }
 ];
 // The TLS test fixtures are base64 throughout, so every line looks random. A file there is
-// excused from the secret rule only while it is nothing but PEM blocks: a certificate or a key,
-// armour and base64, with no room for an address or a stray line. Addresses are still checked.
+// excused from the secret rule only while it is nothing but PEM blocks, and each block is a real
+// certificate or key that parses: a line slipped into one breaks its DER, so it can't hide there.
+// Addresses are still checked.
 const PEM_FIXTURE = /^test\/fixtures\/tls\/[\w-]+\.pem$/;
 const ONLY_PEM = /^(?:-----BEGIN (CERTIFICATE|PRIVATE KEY)-----\r?\n(?:[A-Za-z0-9+/]{1,64}={0,2}\r?\n)+-----END \1-----\r?\n?)+$/;
-const onlyPem = (rel) => PEM_FIXTURE.test(rel) && ONLY_PEM.test(fs.readFileSync(path.join(ROOT, rel), 'utf8'));
+const PEM_BLOCK = /-----BEGIN (CERTIFICATE|PRIVATE KEY)-----[\s\S]+?-----END \1-----/g;
+function pemParses(text) {
+  const blocks = [...text.matchAll(PEM_BLOCK)];
+  if (!blocks.length) return false;
+  try {
+    for (const [block, kind] of blocks) {
+      if (kind === 'CERTIFICATE') new crypto.X509Certificate(block);
+      else crypto.createPrivateKey(block);
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+const pemOnly = (text) => ONLY_PEM.test(text) && pemParses(text);
+const onlyPem = (rel) => PEM_FIXTURE.test(rel) && pemOnly(fs.readFileSync(path.join(ROOT, rel), 'utf8'));
 const excused = (rel, f) => (f.kind === 'a 32-byte secret' && onlyPem(rel))
   || EXCEPTIONS.some((e) => e.file === rel && f.kind === 'a 32-byte secret' && e.text.includes(f.value));
 
@@ -397,7 +413,14 @@ test('the TLS fixtures are excused only while they are nothing but certificate a
   for (const rel of fixtures) assert.ok(onlyPem(rel), rel);
   // A line added to one of them, or the same text anywhere else, isn't excused.
   const pem = fs.readFileSync(path.join(ROOT, 'test/fixtures/tls/ca.pem'), 'utf8');
-  assert.equal(ONLY_PEM.test(`${pem}secret: ${crypto.randomBytes(32).toString('base64url')}\n`), false);
+  assert.equal(pemOnly(`${pem}secret: ${crypto.randomBytes(32).toString('base64url')}\n`), false);
+  // A secret with no - or _ fits a base64 line; slipped inside a block, the block stops parsing.
+  let secret;
+  do secret = crypto.randomBytes(32).toString('base64url'); while (/[-_]/.test(secret));
+  const lines = pem.replace(/\r\n/g, '\n').split('\n');
+  lines.splice(3, 0, secret);
+  assert.equal(ONLY_PEM.test(lines.join('\n')), true, 'the shape alone would let it through');
+  assert.equal(pemOnly(lines.join('\n')), false, 'but it no longer parses');
   assert.equal(PEM_FIXTURE.test('lib/remote/ca.pem'), false);
   assert.equal(PEM_FIXTURE.test('test/fixtures/tls/../../x.pem'), false);
 });

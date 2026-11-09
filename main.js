@@ -27,15 +27,32 @@ const { createManager: createRemoteManager } = require('./lib/remote/manager');
 const remoteRelayClient = require('./lib/remote/relay-client');
 const { systemCertificates } = require('./lib/remote/system-ca');
 
-// On a Mac, the relay connection trusts what the Keychain trusts, so a school's or company's
-// filter that re-signs secure traffic doesn't stop it any more than it stops Safari. Read once,
-// at the first connection, so start-up doesn't wait on it. Elsewhere this is null and changes
-// nothing.
-let relayTrust;
-const relayCertificates = () => {
-  if (relayTrust === undefined) relayTrust = systemCertificates();
-  return relayTrust;
-};
+// On a Mac, the relay connection also trusts the roots in the system keychain, so a school's or
+// company's filter that re-signs secure traffic doesn't stop it any more than it stops Safari.
+// Read in the background from the start, so nothing waits on it; connections opened before it
+// arrives use the built-in list, and the manager's next try picks it up. A read that failed
+// isn't kept, and a connection refused over its certificate reads again, at most once a
+// minute, for a filter whose root arrived after Sanctum started. Elsewhere this is null and
+// changes nothing.
+let relayTrust = null;
+let relayTrustReading = false;
+let relayTrustReadAt = -Infinity;
+function readRelayTrust() {
+  if (process.platform !== 'darwin' || relayTrustReading) return;
+  relayTrustReading = true;
+  relayTrustReadAt = Date.now();
+  systemCertificates()
+    .then(({ list, complete }) => {
+      // An incomplete read keeps what was there before.
+      if (complete) relayTrust = list;
+    })
+    .catch(() => {})
+    .finally(() => { relayTrustReading = false; });
+}
+const relayCertificates = () => relayTrust;
+function relayRefusedCertificate() {
+  if (Date.now() - relayTrustReadAt >= 60000) readRelayTrust();
+}
 const { createDirectPath } = require('./lib/remote/direct-path');
 const { createLocalPairing } = require('./lib/remote/local-pairing');
 const RemoteRules = require('./lib/remote-rules');
@@ -1003,6 +1020,7 @@ function remoteAutoUnlockFile(file) {
 
 function startRemoteControl() {
   serveRemoteTransportPage();
+  readRelayTrust();
   const userData = app.getPath('userData');
   // Both callers hand over text as bytes, and safeStorage takes a string.
   const protect = (bytes) => safeStorage.encryptString(Buffer.from(bytes).toString('utf8'));
@@ -1020,7 +1038,7 @@ function startRemoteControl() {
   }
   remoteManager = createRemoteManager({
     keystore,
-    relay: remoteRelayClient.trusting(relayCertificates),
+    relay: remoteRelayClient.trusting(relayCertificates, { onInsecure: relayRefusedCertificate }),
     local: nearbyPairing(),
     // A test's Worker is plain ws on this machine. Anywhere else a sealed address has to be wss.
     acceptPlainLoopbackAddress: nearbyLoopback,
